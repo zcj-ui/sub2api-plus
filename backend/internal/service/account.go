@@ -1688,18 +1688,30 @@ func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {
 		result[value] = true
 	}
 
+	// 空容器（{} / []）与未配置一致：不限制任何能力。
+	// 避免 OAuth 账号因 API 直写/导入/历史数据遗留的空对象而被调度器静默排除（#5530）。
+	// 注意：非空但全 false / 类型异常的数据仍视为「已配置且不含能力」，保持原行为。
 	switch capabilities := raw.(type) {
 	case []any:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for _, item := range capabilities {
 			if value, ok := item.(string); ok {
 				add(value)
 			}
 		}
 	case []string:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for _, value := range capabilities {
 			add(value)
 		}
 	case map[string]any:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for key, value := range capabilities {
 			enabled, ok := value.(bool)
 			if ok && enabled {
@@ -1707,6 +1719,9 @@ func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {
 			}
 		}
 	case map[string]bool:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for key, enabled := range capabilities {
 			if enabled {
 				add(key)
