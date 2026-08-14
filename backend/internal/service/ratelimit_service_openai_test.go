@@ -150,24 +150,73 @@ func TestCalculateOpenAI429ResetTime_ReversedWindowOrder(t *testing.T) {
 type openAI429SnapshotRepo struct {
 	mockAccountRepoForGemini
 	rateLimitedID      int64
+	rateLimitedCalls   int
 	updatedExtra       map[string]any
+	updatedExtraCalls  int
 	bulkUpdatedIDs     []int64
 	bulkUpdatedPayload AccountBulkUpdate
+	bulkUpdateCalls    int
 }
 
 func (r *openAI429SnapshotRepo) SetRateLimited(_ context.Context, id int64, _ time.Time) error {
 	r.rateLimitedID = id
+	r.rateLimitedCalls++
 	return nil
+}
+
+func TestRateLimitService_OpenAIOAuthRequiresTwoExplicit429Responses(t *testing.T) {
+	repo := &openAI429SnapshotRepo{}
+	svc := NewRateLimitService(repo, nil, nil, nil, nil)
+	account := &Account{ID: 120, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	headers := http.Header{
+		"X-Codex-Primary-Used-Percent":        []string{"100"},
+		"X-Codex-Primary-Reset-After-Seconds": []string{"3600"},
+		"X-Codex-Primary-Window-Minutes":      []string{"300"},
+	}
+
+	svc.HandleUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+	require.Zero(t, repo.rateLimitedCalls, "the first explicit 429 must not freeze the account")
+	require.NotEmpty(t, repo.updatedExtra, "the first 429 may still refresh the quota snapshot")
+
+	svc.HandleUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.Equal(t, account.ID, repo.rateLimitedID)
+}
+
+func TestRateLimitService_OpenAIOAuthNon429ClearsConfirmation(t *testing.T) {
+	repo := &openAI429SnapshotRepo{}
+	svc := NewRateLimitService(repo, nil, nil, nil, nil)
+	account := &Account{ID: 121, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	headers := http.Header{"X-Codex-Primary-Reset-After-Seconds": []string{"3600"}}
+
+	svc.HandleUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+	svc.HandleUpstreamError(context.Background(), account, http.StatusBadRequest, http.Header{}, []byte(`{"error":{"message":"bad input"}}`))
+	svc.HandleUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+
+	require.Zero(t, repo.rateLimitedCalls, "a non-429 response must break the consecutive 429 streak")
+}
+
+func TestRateLimitService_OpenAIAPIKeyKeepsImmediate429Handling(t *testing.T) {
+	repo := &openAI429SnapshotRepo{}
+	svc := NewRateLimitService(repo, nil, nil, nil, nil)
+	account := &Account{ID: 122, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	headers := http.Header{"X-Codex-Primary-Reset-After-Seconds": []string{"3600"}}
+
+	svc.HandleUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+
+	require.Equal(t, 1, repo.rateLimitedCalls)
 }
 
 func (r *openAI429SnapshotRepo) UpdateExtra(_ context.Context, _ int64, updates map[string]any) error {
 	r.updatedExtra = updates
+	r.updatedExtraCalls++
 	return nil
 }
 
 func (r *openAI429SnapshotRepo) BulkUpdate(_ context.Context, ids []int64, updates AccountBulkUpdate) (int64, error) {
 	r.bulkUpdatedIDs = append([]int64(nil), ids...)
 	r.bulkUpdatedPayload = updates
+	r.bulkUpdateCalls++
 	return int64(len(ids)), nil
 }
 

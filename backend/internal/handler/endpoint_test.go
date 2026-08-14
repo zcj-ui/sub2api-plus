@@ -167,6 +167,27 @@ func TestShouldUseAntigravityCompat(t *testing.T) {
 	}
 }
 
+func TestShouldUseNativeAntigravityGeminiTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		account *service.Account
+		want    bool
+	}{
+		{"oauth", &service.Account{Platform: service.PlatformAntigravity, Type: service.AccountTypeOAuth}, true},
+		{"setup token", &service.Account{Platform: service.PlatformAntigravity, Type: service.AccountTypeSetupToken}, true},
+		{"upstream relay", &service.Account{Platform: service.PlatformAntigravity, Type: service.AccountTypeUpstream}, false},
+		{"api key relay", &service.Account{Platform: service.PlatformAntigravity, Type: service.AccountTypeAPIKey}, false},
+		{"other platform", &service.Account{Platform: service.PlatformGemini, Type: service.AccountTypeOAuth}, false},
+		{"nil", nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, shouldUseNativeAntigravityGeminiTransport(tt.account))
+		})
+	}
+}
+
 func TestGetUpstreamEndpointPrefersRuntimeOverride(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)

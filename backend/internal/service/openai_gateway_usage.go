@@ -135,6 +135,9 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if result == nil {
 		return errors.New("openai usage result is nil")
 	}
+	if input.Account != nil && input.Account.IsOpenAIOAuth() && !input.CyberBlocked && result.SucceededForScheduling() {
+		s.clearOpenAIOAuth429Streak(input.Account.ID)
+	}
 	if s.rateLimitService != nil && input.Account != nil && input.Account.Platform == PlatformOpenAI {
 		s.rateLimitService.ResetOpenAI403Counter(ctx, input.Account.ID)
 	}

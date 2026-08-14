@@ -405,7 +405,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			ensureCodexOAuthInstructionsField(decoded)
 			markDecodedModified()
 		} else {
-			codexResult = applyCodexOAuthTransform(decoded, isCodexCLI, isCompactRequest)
+			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
+				IsCodexCLI:           isCodexCLI,
+				IsCompact:            isCompactRequest,
+				Codex429GuardEnabled: account.Codex429GuardEnabled(),
+			})
 		}
 		if codexResult.Modified {
 			markDecodedModified()
@@ -421,7 +425,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if c != nil && c.Request != nil {
 				clientHeaders = c.Request.Header
 			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+			identityBody, _ := marshalOpenAIUpstreamJSON(decoded)
+			fpIDs := resolveCodexFingerprintIDsForRequest(account, clientHeaders, identityBody, apiKeyID)
 			if fpIDs != nil {
 				if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
 					markDecodedModified()
@@ -429,7 +434,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			// 将 fpIDs 存入 gin context，供 buildUpstreamRequest 中头改写使用
 			if c != nil && fpIDs != nil {
-				c.Set("codex_fingerprint_ids", fpIDs)
+				c.Set(codexFingerprintIDsContextKey, fpIDs)
 			}
 		}
 		if codexResult.NormalizedModel != "" {
@@ -834,10 +839,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return nil, err
 		}
 
-		// Get proxy URL
-		proxyURL := ""
-		if account.ProxyID != nil && account.Proxy != nil {
-			proxyURL = account.Proxy.URL()
+		// OpenAI accounts must never fall back to direct egress when their
+		// configured proxy relation is missing or stale.
+		proxyURL, proxyErr := resolveOpenAIAccountProxyURL(account)
+		if proxyErr != nil {
+			if headerGuard != nil {
+				headerGuard.close()
+			}
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, proxyErr, false)
 		}
 
 		// Send request
@@ -1088,8 +1097,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 			}
 		}
 	}
+	compatMessagesBridge := false
 	if account.Type == AccountTypeOAuth {
-		compatMessagesBridge := isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body)
+		compatMessagesBridge = isOpenAICompatMessagesBridgeContext(c) || isOpenAICompatMessagesBridgeBody(body)
 		// 清除客户端透传的 session 头，后续用隔离后的值重新设置，防止跨用户会话碰撞。
 		clientConversationID := strings.TrimSpace(req.Header.Get("conversation_id"))
 		req.Header.Del("conversation_id")
@@ -1139,10 +1149,13 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 
 	// 指纹收敛：使用 Forward() 中预计算的收敛 ID 改写出站头，与请求体使用同一份 IDs。
 	if account.Type == AccountTypeOAuth && c != nil {
-		if fpIDs, ok := c.Get("codex_fingerprint_ids"); ok {
+		if fpIDs, ok := c.Get(codexFingerprintIDsContextKey); ok {
 			if ids, ok := fpIDs.(*codexFingerprintIDs); ok {
 				applyCodexFingerprintHeaders(req.Header, ids)
 			}
+		}
+		if compatMessagesBridge {
+			req.Header.Del("conversation_id")
 		}
 	}
 

@@ -8,8 +8,8 @@
 	}
 }
 
-# 修改为你的域名
-api.sub2api.com {
+# 修改为你的域名。此示例未经生产认证，部署前请完成独立安全审查。
+gateway.example.com {
 	# This baseline assumes clients connect directly to Caddy. When Caddy is
 	# behind a CDN, configure explicit trusted proxy CIDRs and {client_ip} as
 	# documented in EDGE_SECURITY.md; {remote_host} would otherwise be the CDN.

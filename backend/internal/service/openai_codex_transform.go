@@ -1,6 +1,8 @@
 package service
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/tidwall/sjson"
 )
 
 var codexModelMap = map[string]string{
@@ -84,11 +87,20 @@ type codexOAuthTransformOptions struct {
 	SkipDefaultInstructions             bool
 	PreserveToolCallIDs                 bool
 	OmitPromotedSystemMessagesFromInput bool
+	Codex429GuardEnabled                bool
 }
 
 const (
 	codexCallIDMaxLength = 64
 	codexCallIDPrefix    = "fc_"
+)
+
+const (
+	codexSyntheticAgentContextToolName   = "exec"
+	codexSyntheticAgentContextCallPrefix = "call_sub2api_overdraft_"
+	codexSyntheticAgentContextInput      = `const r = await tools.exec_command({"cmd":"true","yield_time_ms":1000,"max_output_tokens":1000}); text(r.output);`
+	codexSyntheticAgentContextOutputText = "Script completed\nWall time 0.0 seconds\nOutput:\n"
+	codexSyntheticAgentContextMaxBody    = 32 << 20
 )
 
 func normalizeCodexCallID(id string) string {
@@ -149,6 +161,7 @@ func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact
 
 func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuthTransformOptions) codexTransformResult {
 	result := codexTransformResult{}
+	compatMessagesBridge := isOpenAICompatMessagesBridgeRequestBody(reqBody)
 	// 工具续链需求会影响存储策略与 input 过滤逻辑。
 	needsToolContinuation := NeedsToolContinuation(reqBody)
 
@@ -303,9 +316,246 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 			reqBody["input"] = []any{}
 		}
 		result.Modified = true
+	} else if inputItem, ok := reqBody["input"].(map[string]any); ok {
+		// Responses also permits a single input item. ChatGPT Codex expects the
+		// history in list form, matching the string-input normalization above.
+		reqBody["input"] = []any{inputItem}
+		result.Modified = true
+	}
+
+	if !opts.IsCompact && !compatMessagesBridge && opts.Codex429GuardEnabled && appendCodexSyntheticAgentContextPair(reqBody) {
+		result.Modified = true
 	}
 
 	return result
+}
+
+func appendCodexSyntheticAgentContextPair(reqBody map[string]any) bool {
+	if reqBody == nil || isOpenAICompatMessagesBridgeRequestBody(reqBody) {
+		return false
+	}
+	input, ok := reqBody["input"].([]any)
+	if !ok || len(input) == 0 || codexInputContainsSyntheticAgentContextCall(input) {
+		return false
+	}
+	last, ok := input[len(input)-1].(map[string]any)
+	if !ok || !codexSyntheticPairEligibleTail(firstNonEmptyString(last["type"]), firstNonEmptyString(last["role"])) {
+		return false
+	}
+
+	callID, ok := newCodexSyntheticAgentContextCallID()
+	if !ok {
+		return false
+	}
+	reqBody["input"] = append(input,
+		map[string]any{
+			"type":    "custom_tool_call",
+			"call_id": callID,
+			"name":    codexSyntheticAgentContextToolName,
+			"input":   codexSyntheticAgentContextInput,
+		},
+		map[string]any{
+			"type":    "custom_tool_call_output",
+			"call_id": callID,
+			"output": []map[string]string{{
+				"type": "input_text",
+				"text": codexSyntheticAgentContextOutputText,
+			}},
+		},
+	)
+	return true
+}
+
+func newCodexSyntheticAgentContextCallID() (string, bool) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", false
+	}
+	return codexSyntheticAgentContextCallPrefix + hex.EncodeToString(random[:]), true
+}
+
+func appendCodexSyntheticAgentContextPairToBody(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || len(body) > codexSyntheticAgentContextMaxBody {
+		return body, false, nil
+	}
+	var document struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &document); err != nil || len(bytes.TrimSpace(document.Input)) == 0 {
+		return body, false, nil
+	}
+	input, ok := normalizeCodexSyntheticPairRawInput(document.Input)
+	if !ok || len(input) == 0 {
+		return body, false, nil
+	}
+	for _, raw := range input {
+		var item struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		}
+		if err := json.Unmarshal(raw, &item); err == nil && item.Type == "custom_tool_call" &&
+			strings.HasPrefix(item.CallID, codexSyntheticAgentContextCallPrefix) {
+			return body, false, nil
+		}
+	}
+	var last struct {
+		Type string `json:"type"`
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(input[len(input)-1], &last); err != nil ||
+		!codexSyntheticPairEligibleTail(last.Type, last.Role) {
+		return body, false, nil
+	}
+	callID, ok := newCodexSyntheticAgentContextCallID()
+	if !ok {
+		return body, false, nil
+	}
+	call, err := json.Marshal(map[string]any{
+		"type":    "custom_tool_call",
+		"call_id": callID,
+		"name":    codexSyntheticAgentContextToolName,
+		"input":   codexSyntheticAgentContextInput,
+	})
+	if err != nil {
+		return body, false, nil
+	}
+	output, err := json.Marshal(map[string]any{
+		"type":    "custom_tool_call_output",
+		"call_id": callID,
+		"output": []map[string]string{{
+			"type": "input_text",
+			"text": codexSyntheticAgentContextOutputText,
+		}},
+	})
+	if err != nil {
+		return body, false, nil
+	}
+	input = append(input, call, output)
+	updatedInput, err := json.Marshal(input)
+	if err != nil {
+		return body, false, nil
+	}
+	updated, err := sjson.SetRawBytes(body, "input", updatedInput)
+	if err != nil || len(updated) > codexSyntheticAgentContextMaxBody {
+		return body, false, nil
+	}
+	return updated, true, nil
+}
+
+func normalizeCodexSyntheticPairRawInput(raw json.RawMessage) ([]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	switch trimmed[0] {
+	case '[':
+		var input []json.RawMessage
+		if err := json.Unmarshal(trimmed, &input); err != nil {
+			return nil, false
+		}
+		return input, true
+	case '{':
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &item); err != nil {
+			return nil, false
+		}
+		return []json.RawMessage{append(json.RawMessage(nil), trimmed...)}, true
+	case '"':
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil || strings.TrimSpace(text) == "" {
+			return nil, false
+		}
+		message, err := json.Marshal(map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": text,
+		})
+		if err != nil {
+			return nil, false
+		}
+		return []json.RawMessage{message}, true
+	default:
+		return nil, false
+	}
+}
+
+func codexSyntheticPairEligibleTail(itemType, role string) bool {
+	itemType = strings.TrimSpace(itemType)
+	role = strings.TrimSpace(role)
+	if role == "user" {
+		return itemType == "" || itemType == "message"
+	}
+	return role == "" && (itemType == "text" || itemType == "input_text")
+}
+
+func codexInputContainsSyntheticAgentContextCall(input []any) bool {
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if ok && firstNonEmptyString(item["type"]) == "custom_tool_call" &&
+			strings.HasPrefix(firstNonEmptyString(item["call_id"]), codexSyntheticAgentContextCallPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexInputEndsWithToolHistory(input []any) bool {
+	if len(input) == 0 {
+		return false
+	}
+	item, ok := input[len(input)-1].(map[string]any)
+	if !ok {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(firstNonEmptyString(item["role"])), "tool") {
+		return true
+	}
+	itemType := strings.TrimSpace(firstNonEmptyString(item["type"]))
+	if isCodexToolCallItemType(itemType) || itemType == "item_reference" {
+		return true
+	}
+	return strings.HasSuffix(itemType, "_call") || strings.HasSuffix(itemType, "_call_output")
+}
+
+func codexInputEndsWithSyntheticAgentContextPair(input []any) bool {
+	if len(input) < 2 {
+		return false
+	}
+	call, callOK := input[len(input)-2].(map[string]any)
+	output, outputOK := input[len(input)-1].(map[string]any)
+	return callOK && outputOK && isCodexSyntheticAgentContextCall(call) && isCodexSyntheticAgentContextOutput(output) &&
+		strings.TrimSpace(firstNonEmptyString(call["call_id"])) == strings.TrimSpace(firstNonEmptyString(output["call_id"]))
+}
+
+func isCodexSyntheticAgentContextCall(item map[string]any) bool {
+	return item != nil && strings.TrimSpace(firstNonEmptyString(item["type"])) == "custom_tool_call" &&
+		strings.TrimSpace(firstNonEmptyString(item["name"])) == codexSyntheticAgentContextToolName &&
+		firstNonEmptyString(item["input"]) == codexSyntheticAgentContextInput &&
+		strings.HasPrefix(strings.TrimSpace(firstNonEmptyString(item["call_id"])), codexSyntheticAgentContextCallPrefix)
+}
+
+func isCodexSyntheticAgentContextOutput(item map[string]any) bool {
+	return item != nil && strings.TrimSpace(firstNonEmptyString(item["type"])) == "custom_tool_call_output" &&
+		codexSyntheticAgentContextOutputMatches(item["output"]) &&
+		strings.HasPrefix(strings.TrimSpace(firstNonEmptyString(item["call_id"])), codexSyntheticAgentContextCallPrefix)
+}
+
+func codexSyntheticAgentContextOutputMatches(raw any) bool {
+	items, ok := raw.([]map[string]string)
+	if ok && len(items) == 1 {
+		return items[0]["type"] == "input_text" && items[0]["text"] == codexSyntheticAgentContextOutputText
+	}
+	values, ok := raw.([]any)
+	if !ok || len(values) != 1 {
+		return false
+	}
+	item, ok := values[0].(map[string]any)
+	return ok && strings.TrimSpace(firstNonEmptyString(item["type"])) == "input_text" &&
+		firstNonEmptyString(item["text"]) == codexSyntheticAgentContextOutputText
+}
+
+func isCodexSyntheticAgentContextItem(item map[string]any) bool {
+	return isCodexSyntheticAgentContextCall(item) || isCodexSyntheticAgentContextOutput(item)
 }
 
 func normalizeCodexToolChoice(reqBody map[string]any) bool {

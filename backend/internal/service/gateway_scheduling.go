@@ -444,7 +444,9 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 
 			if len(routingAvailable) > 0 {
-				// 排序：优先级 > 负载率 > 最后使用时间
+				// Model routing is shared with Claude; retain the established
+				// priority/load/LRU ordering here. OpenAI packing is applied only
+				// by the OpenAI-specific scheduler paths below this shared layer.
 				sort.SliceStable(routingAvailable, func(i, j int) bool {
 					a, b := routingAvailable[i], routingAvailable[j]
 					if a.account.Priority != b.account.Priority {
@@ -708,7 +710,7 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 		}
 
-		// 分层过滤选择：优先级 →（可选）最早重置 → 负载率 → LRU
+		// Shared gateway selection keeps its provider-neutral load-aware behavior.
 		for len(available) > 0 {
 			// 1. 取优先级最小的集合
 			candidates := filterByMinPriority(available)
@@ -1547,6 +1549,76 @@ func filterByMinLoadRate(accounts []accountWithLoad) []accountWithLoad {
 		}
 	}
 	return result
+}
+
+func accountHasImmediateConcurrencySlot(account *Account, load *AccountLoadInfo) bool {
+	if account == nil {
+		return false
+	}
+	if account.Concurrency <= 0 {
+		return true
+	}
+	current := 0
+	if load != nil {
+		current = load.CurrentConcurrency
+		if current == 0 && load.LoadRate >= 100 {
+			return false
+		}
+	}
+	return current < account.Concurrency
+}
+
+func packedAccountLoadClass(account *Account, load *AccountLoadInfo) int {
+	current := 0
+	if load != nil {
+		current = load.CurrentConcurrency
+	}
+	if current > 0 && accountHasImmediateConcurrencySlot(account, load) {
+		return 0
+	}
+	if current == 0 && accountHasImmediateConcurrencySlot(account, load) {
+		return 1
+	}
+	return 2
+}
+
+func packedActiveAccountUtilizationLess(a, b accountWithLoad) bool {
+	aCurrent, bCurrent := a.loadInfo.CurrentConcurrency, b.loadInfo.CurrentConcurrency
+	aCapacity, bCapacity := a.account.Concurrency, b.account.Concurrency
+	if aCapacity > 0 && bCapacity > 0 {
+		left := int64(aCurrent) * int64(bCapacity)
+		right := int64(bCurrent) * int64(aCapacity)
+		if left != right {
+			return left > right
+		}
+	}
+	return aCurrent > bCurrent
+}
+
+func packedAccountWithLoadLess(a, b accountWithLoad, preferOAuth bool) bool {
+	if a.account == nil || b.account == nil {
+		return a.account != nil
+	}
+	if a.account.Priority != b.account.Priority {
+		return a.account.Priority < b.account.Priority
+	}
+	aClass := packedAccountLoadClass(a.account, a.loadInfo)
+	bClass := packedAccountLoadClass(b.account, b.loadInfo)
+	if aClass != bClass {
+		return aClass < bClass
+	}
+	if aClass == 0 {
+		if packedActiveAccountUtilizationLess(a, b) {
+			return true
+		}
+		if packedActiveAccountUtilizationLess(b, a) {
+			return false
+		}
+	}
+	if preferOAuth && a.account.Type != b.account.Type {
+		return a.account.Type == AccountTypeOAuth
+	}
+	return a.account.ID < b.account.ID
 }
 
 // filterBySoonestReset 过滤出「会话窗口最早重置」的账号集合（use-it-or-lose-it）。

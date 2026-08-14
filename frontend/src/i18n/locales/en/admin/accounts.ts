@@ -31,6 +31,8 @@ export default {
       dataImportHint: 'Upload the exported JSON file to import accounts and proxies.',
       dataImportWarning: 'Import will create new accounts/proxies; groups must be bound manually. Ensure existing data does not conflict.',
       dataImportFile: 'Data file',
+      codex429Guard: '429 Guard',
+      codex429GuardHint: 'Applies only to OpenAI/Codex OAuth accounts. Adds a synthetic paired tool checkpoint to ordinary request history to reduce false 429 classification; CC/Claude is unchanged.',
       dataImportButton: 'Start Import',
       dataImporting: 'Importing...',
       dataImportSelectFile: 'Please select a data file',
@@ -131,6 +133,8 @@ export default {
         active: 'Active',
         inactive: 'Inactive',
         error: 'Error',
+        healthDead: 'Health Dead',
+        healthDeadUnknown: 'Health probe failed twice consecutively',
         cooldown: 'Cooldown',
         paused: 'Paused',
         limited: 'Limited',
@@ -230,7 +234,7 @@ export default {
         }
       },
       upstreamBilling: {
-        trustWarning: 'This rate is declared by the upstream site for the current API key. Sub2API cannot verify that it matches actual charges. The upstream site or an intermediary may return forged, stale, or modified data. Verify it against bills, balance changes, and actual usage.',
+        trustWarning: 'This rate is declared by the upstream site for the current API key. Sub2API Plus cannot verify that it matches actual charges. The upstream site or an intermediary may return forged, stale, or modified data. Verify it against bills, balance changes, and actual usage.',
         autoProbe: 'Automatically probe upstream declared rate',
         autoProbeHint: 'Refresh the upstream declared rate on the global interval. This switch alone does not change the account rate.',
         syncRate: 'Sync upstream declared rate',
@@ -418,9 +422,43 @@ export default {
         resetStatus: 'Reset Status',
         refreshToken: 'Refresh Token',
         probeUpstreamBilling: 'Probe Upstream Rate',
+        healthProbe: 'Health Probe',
+        inventory: 'Inventory Selected',
         resetStatusSuccess: 'Successfully reset {count} account(s) status',
         refreshTokenSuccess: 'Successfully refreshed {count} account(s) token',
         partialSuccess: 'Partially completed: {success} succeeded, {failed} failed'
+      },
+      healthProbe: {
+        failurePool: 'Health failure pool ({count})',
+        failurePoolHint: 'OAuth quota/reset-credit queries or API Key connection tests failed twice consecutively.',
+        completed: 'Health probe complete: {healthy} healthy, {skipped} skipped',
+        completedWithFailures: 'Health probe complete: {healthy} healthy, {failed} dead, {skipped} skipped',
+        batchLimit: 'A health probe can include at most 200 accounts',
+        failed: 'Batch health probe failed'
+      },
+      inventory: {
+        title: 'Selected Account Inventory',
+        hint: 'Checks only the selected accounts. OpenAI accounts without a proxy keep direct routing; a configured proxy that becomes invalid fails closed. API Key accounts report connection health without ChatGPT credit data.',
+        account: 'Account',
+        accountType: 'Platform / Type',
+        health: 'Health',
+        healthy: 'Healthy',
+        failed: 'Failed',
+        skipped: 'Skipped',
+        quotaFetched: 'Quota fetched',
+        credits: 'Credits',
+        resetCredits: 'Reset credits',
+        fiveHourUsage: '5h usage',
+        sevenDayUsage: '7d usage',
+        reason: 'Failure / skip reason',
+        unlimited: 'Unlimited',
+        noData: 'No data',
+        apiKeyNoQuota: 'No ChatGPT credit data',
+        empty: 'No inventory results',
+        completed: 'Inventory complete: {healthy} healthy, {skipped} skipped, {quota} quota snapshots fetched',
+        completedWithFailures: 'Inventory complete: {healthy} healthy, {failed} failed, {skipped} skipped, {quota} quota snapshots fetched',
+        batchLimit: 'An inventory can include at most 200 selected accounts',
+        requestFailed: 'Selected account inventory failed'
       },
       bulkEdit: {
         title: 'Bulk Edit Accounts',
@@ -574,11 +612,11 @@ export default {
         codexCLIOnlyAppServerDesc:
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
-        codexFingerprintModeDesc: 'When multiple users share the same OAuth account, converge device/session identifiers to account-level stable values to reduce upstream-visible device and session count. Off = pass through client identifiers as-is.',
+        codexFingerprintModeDesc: 'Recommended mode keeps one stable device per OAuth account, derives a separate stable session for each conversation, and creates a new request ID per request. Full convergence is the only mode that shares one session across the account. Off passes client identifiers through.',
         codexFingerprintOff: 'Off (passthrough)',
         codexFingerprintDevice: 'Device only',
-        codexFingerprintSession: 'Device + Session (recommended)',
-        codexFingerprintFull: 'Full convergence',
+        codexFingerprintSession: 'One device + session per conversation (recommended)',
+        codexFingerprintFull: 'Full convergence (one account session)',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',
@@ -638,8 +676,8 @@ export default {
         searchTestHint:
           'Standalone web_search probe (same as gateway /v1/web_search). Not a free-form chat with tools.',
         ttsTextLabel: 'TTS text',
-        ttsTextPlaceholder: 'Example: Hello from Sub2API connectivity test.',
-        ttsTextDefault: 'Hello from Sub2API account connectivity test.',
+        ttsTextPlaceholder: 'Example: Hello from Sub2API Plus connectivity test.',
+        ttsTextDefault: 'Hello from Sub2API Plus account connectivity test.',
         ttsTestHint: 'Standalone /v1/tts with language=en; success reports audio byte size.',
         sttTestHint: 'Standalone /v1/stt with a synthetic silent WAV; success means the endpoint is reachable.',
         realtimeTestHint:
@@ -869,7 +907,8 @@ export default {
       affinityBufferInfinite: 'Unlimited',
       expired: 'Expired',
       proxy: 'Proxy',
-      noProxy: 'No Proxy',
+    noProxy: 'No Proxy',
+    configuredProxyUnavailable: 'Configured proxy #{id} (unavailable or not loaded)',
       concurrency: 'Concurrency',
       loadFactor: 'Load Factor',
       loadFactorHint: 'Higher load factor increases scheduling frequency',
@@ -888,6 +927,12 @@ export default {
       allowOverages: 'Allow Overages (AI Credits)',
       allowOveragesTooltip:
         'Only use AI Credits after free quota is explicitly exhausted. Ordinary concurrent 429 rate limits will not switch to overages.',
+      allowOveragesConfirm:
+        'Enable AI Credits overages? After free quota is exhausted, paid credits may be consumed and extra charges may apply. This setting is saved only after confirmation.',
+      allowOveragesProConfirm:
+        'This is a Google AI Pro account. Enable overages? AI Credits will continue after free quota exhaustion and may incur charges or consume the balance. Confirm the proxy, budget, and backup plan first.',
+      allowOveragesImportConfirm:
+        'The import contains Antigravity accounts with paid AI Credits overages enabled. Continue importing these paid-spend settings?',
       creating: 'Creating...',
       updating: 'Updating...',
       accountCreated: 'Account created successfully',
@@ -1459,6 +1504,8 @@ export default {
       openaiQuotaReset: {
         count: 'Credits',
         reset: 'Reset',
+        balanceReferenceHint: 'USD is a UI reference calculated as Credit ÷ 25',
+        unlimitedBalance: 'Unlimited',
         countTooltipLoad: 'Click to load the available reset-credit count',
         countTooltipRefresh: 'Click to refresh the available reset-credit count',
         resetTooltipReady: 'Consume 1 reset credit to immediately restore the window',

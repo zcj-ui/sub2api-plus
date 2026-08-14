@@ -464,7 +464,7 @@ func TestWSResponseCreate_IngressFiltersServiceTierBeforeUpstream(t *testing.T) 
 			serverErrCh <- readErr
 			return
 		}
-		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -594,7 +594,7 @@ func TestWSResponseCreate_IngressBlockSendsErrorEventAndSkipsUpstream(t *testing
 			serverErrCh <- readErr
 			return
 		}
-		proxyErr := svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		proxyErr := svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 		// Mirror the production handler (openai_gateway_handler.go:1325-1328):
 		// when the proxy returns an OpenAIWSClientCloseError, surface its
 		// status code to the client via a graceful close handshake. Without

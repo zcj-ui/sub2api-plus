@@ -330,6 +330,74 @@ export async function getBatchUsage(accountIds: number[], force?: boolean): Prom
   return data
 }
 
+export interface AccountHealthProbeResult {
+  account_id: number
+  name: string
+  platform: string
+  type: string
+  healthy: boolean
+  dead: boolean
+  attempts: number
+  mode: 'openai_oauth_quota' | 'openai_apikey_connection' | ''
+  reason?: string
+  health_persisted: boolean
+  snapshot?: {
+    status: 'healthy' | 'failed'
+    mode: 'openai_oauth_quota' | 'openai_apikey_connection'
+    attempts: number
+    checked_at: string
+    reason?: string
+  }
+}
+
+export interface BatchAccountHealthProbeResponse {
+  results: AccountHealthProbeResult[]
+  healthy: number
+  failed: number
+  skipped: number
+}
+
+// A 200-account batch runs with backend concurrency 8. OAuth health checks can
+// make two sequential quota attempts through a slow per-account proxy, so the
+// ordinary 120s admin timeout is too short for a legitimate full inventory.
+const ACCOUNT_BATCH_PROBE_TIMEOUT_MS = 20 * 60_000
+
+export async function batchHealthProbe(accountIds: number[]): Promise<BatchAccountHealthProbeResponse> {
+  const { data } = await apiClient.post<BatchAccountHealthProbeResponse>(
+    '/admin/accounts/batch-health-probe',
+    { account_ids: accountIds },
+    { timeout: ACCOUNT_BATCH_PROBE_TIMEOUT_MS }
+  )
+  return data
+}
+
+export async function listHealthProbeFailures(): Promise<AccountHealthProbeResult[]> {
+  const { data } = await apiClient.get<AccountHealthProbeResult[]>('/admin/accounts/health-probe-failures')
+  return data
+}
+
+export interface AccountInventoryResult extends AccountHealthProbeResult {
+  quota?: OpenAIQuotaUsage | null
+  quota_persisted: boolean
+}
+
+export interface BatchAccountInventoryResponse {
+  results: AccountInventoryResult[]
+  healthy: number
+  failed: number
+  skipped: number
+  quota_fetched: number
+}
+
+export async function batchInventory(accountIds: number[]): Promise<BatchAccountInventoryResponse> {
+  const { data } = await apiClient.post<BatchAccountInventoryResponse>(
+    '/admin/accounts/batch-inventory',
+    { account_ids: accountIds },
+    { timeout: ACCOUNT_BATCH_PROBE_TIMEOUT_MS }
+  )
+  return data
+}
+
 /**
  * Clear account rate limit status
  * @param id - Account ID
@@ -665,10 +733,14 @@ export async function exportData(options?: {
 export async function importData(payload: {
   data: AdminDataPayload
   skip_default_group_bind?: boolean
+  codex_429_guard_enabled?: boolean
+  confirm_overages_risk?: boolean
 }): Promise<AdminDataImportResult> {
   const { data } = await apiClient.post<AdminDataImportResult>('/admin/accounts/data', {
     data: payload.data,
-    skip_default_group_bind: payload.skip_default_group_bind
+    skip_default_group_bind: payload.skip_default_group_bind,
+    codex_429_guard_enabled: payload.codex_429_guard_enabled,
+    confirm_overages_risk: payload.confirm_overages_risk
   })
   return data
 }
@@ -819,7 +891,15 @@ export interface OpenAIRateLimitResetCreditDetail {
 
 export interface OpenAIRateLimitResetCredits {
   available_count: number
+  applicable_available_count?: number
   credits?: OpenAIRateLimitResetCreditDetail[]
+}
+
+export interface OpenAICodexCredits {
+  has_credits: boolean
+  unlimited: boolean
+  overage_limit_reached: boolean
+  balance: string
 }
 
 export interface OpenAIQuotaUsage {
@@ -829,6 +909,7 @@ export interface OpenAIQuotaUsage {
   plan_type?: string
   rate_limit?: OpenAIRateLimit | null
   additional_rate_limits?: OpenAIAdditionalRateLimit[]
+  credits?: OpenAICodexCredits | null
   rate_limit_reset_credits?: OpenAIRateLimitResetCredits | null
   fetched_at: number
 }
@@ -1000,6 +1081,9 @@ export const accountsAPI = {
   clearError,
   getUsage,
   getBatchUsage,
+  batchHealthProbe,
+  listHealthProbeFailures,
+  batchInventory,
   getTodayStats,
   getBatchTodayStats,
   clearRateLimit,

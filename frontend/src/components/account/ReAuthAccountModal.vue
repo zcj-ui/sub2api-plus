@@ -372,14 +372,11 @@ const handleExchangeCode = async () => {
 
     try {
       // Update account with new credentials
-      await adminAPI.accounts.update(props.account.id, {
+      await adminAPI.accounts.applyOAuthCredentials(props.account.id, {
         type: 'oauth', // OpenAI OAuth is always 'oauth' type
         credentials,
         extra
       })
-
-      // Clear error status after successful re-authorization
-      await adminAPI.accounts.clearError(props.account.id)
 
       appStore.showSuccess(t('admin.accounts.reAuthorizedSuccess'))
       emit('reauthorized')

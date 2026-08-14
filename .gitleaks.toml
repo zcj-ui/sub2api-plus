@@ -1,0 +1,68 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated caches and documented public OAuth clients"
+paths = [
+  '''(^|[/\\])\.gomodcache([/\\]|$)''',
+  '''(^|[/\\])\.gocache([/\\]|$)''',
+  '''(^|[/\\])tmp([/\\]|$)''',
+  '''(^|[/\\])release([/\\]|$)''',
+  '''(^|[/\\])frontend[/\\]node_modules([/\\]|$)''',
+  '''^backend[/\\]internal[/\\]pkg[/\\]antigravity[/\\]oauth\.go$''',
+  '''^backend[/\\]internal[/\\]pkg[/\\]geminicli[/\\]constants\.go$''',
+  '''^backend[/\\]internal[/\\]repository[/\\]ops_repo_preagg\.go$''',
+]
+
+[[allowlists]]
+description = "Reviewed synthetic tokens used by exact unit tests and payment examples"
+targetRules = ["generic-api-key", "jwt"]
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^backend[/\\]internal[/\\]handler[/\\]auth_wechat_oauth_test\.go$''',
+  '''^backend[/\\]internal[/\\]handler[/\\]openai_gateway_handler_test\.go$''',
+  '''^backend[/\\]internal[/\\]handler[/\\]payment_handler_resume_test\.go$''',
+  '''^backend[/\\]internal[/\\]handler[/\\]stream_error_event_test\.go$''',
+  '''^backend[/\\]internal[/\\]payment[/\\]provider[/\\]alipay_test\.go$''',
+  '''^backend[/\\]internal[/\\]payment[/\\]provider[/\\]wxpay_test\.go$''',
+  '''^backend[/\\]internal[/\\]repository[/\\]migrations_runner_checksum_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]content_moderation_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]gateway_beta_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]gateway_context_management_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]openai_oauth_passthrough_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]payment_order_result_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]payment_webhook_provider_test\.go$''',
+  '''^backend[/\\]internal[/\\]util[/\\]logredact[/\\]redact_test\.go$''',
+  '''^docs[/\\]ADMIN_PAYMENT_INTEGRATION_API\.md$''',
+]
+regexes = [
+  '''0123456789abcdef0123456789abcdef(?:0123456789abcdef0123456789abcdef)?''',
+  '''abc123456789xyz''',
+  '''claude-haiku-4-5-20251001''',
+  '''cm1234567890''',
+  '''conversation-1''',
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.signaturepart''',
+  '''fd277bc5-ff7e-45d1-8aa9-f54e1df318f1''',
+  '''ffd3e8a2c9295fa9cbefefd629a78268877e5b51bc970a82d9b3f46ec4ebd15e''',
+  '''interleaved-thinking-2025-05-14''',
+  '''MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\.\.\.''',
+  '''pay-cm1234567890-success''',
+  '''prepay_id=wx_prepay_123''',
+  '''ya29\.a0AfH6SMDUMMY''',
+]
+
+[[allowlists]]
+description = "Reviewed malformed private-key fixtures used by parser and redaction tests"
+targetRules = ["private-key"]
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^backend[/\\]internal[/\\]payment[/\\]provider[/\\]wxpay_test\.go$''',
+  '''^backend[/\\]internal[/\\]service[/\\]batch_image_provider_vertex_test\.go$''',
+]
+regexes = [
+  '''BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\.\.\.\\n-----END PRIVATE KEY''',
+  '''BEGIN RSA PRIVATE KEY-----\\ndata\\n-----END RSA PRIVATE KEY''',
+  '''BEGIN PRIVATE KEY-----secret-----END PRIVATE KEY''',
+]

@@ -62,7 +62,7 @@ vi.mock('vue-i18n', () => ({
   useI18n: () => ({
     t: (key: string, params?: Record<string, string | number>) => {
       if (key === 'auth.accountCreatedSuccess') {
-        return `Account created for ${params?.siteName ?? 'Sub2API'}`
+        return `Account created for ${params?.siteName ?? 'Sub2API Plus'}`
       }
       if (key === 'auth.emailDomainRegistrationLimit') {
         return '该邮箱域名无法注册新账户。请使用主流邮箱注册；如需使用企业邮箱，请联系客服添加域名白名单。'
@@ -127,7 +127,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: [],
     })
     sendVerifyCodeMock.mockResolvedValue({ countdown: 60 })
@@ -141,7 +141,7 @@ describe('EmailVerifyView', () => {
       turnstile_site_key: '',
       tencent_captcha_enabled: true,
       tencent_captcha_app_id: 'tencent-app-id',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: [],
     })
     sendVerifyCodeMock.mockResolvedValue({ countdown: 0 })
@@ -235,7 +235,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: true,
       turnstile_site_key: 'site-key',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: [],
     })
     sendVerifyCodeMock.mockRejectedValue(new Error('send failed'))
@@ -279,7 +279,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -314,7 +314,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
       registration_email_domain_quota_enabled: true,
     })
@@ -349,7 +349,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
       registration_email_domain_quota_enabled: true,
     })
@@ -387,7 +387,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
       registration_email_domain_quota_enabled: true,
     })
@@ -430,7 +430,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -468,7 +468,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -510,7 +510,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sendPendingOAuthVerifyCodeMock.mockResolvedValue({
@@ -617,7 +617,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: true,
       turnstile_site_key: 'site-key',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -689,7 +689,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: true,
       turnstile_site_key: 'site-key',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -746,7 +746,7 @@ describe('EmailVerifyView', () => {
     getPublicSettingsMock.mockResolvedValue({
       turnstile_enabled: false,
       turnstile_site_key: '',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: ['allowed.com'],
     })
     sessionStorage.setItem(
@@ -848,7 +848,7 @@ describe('EmailVerifyView', () => {
       turnstile_site_key: '',
       tencent_captcha_enabled: true,
       tencent_captcha_app_id: 'tencent-app-id',
-      site_name: 'Sub2API',
+      site_name: 'Sub2API Plus',
       registration_email_suffix_whitelist: [],
     })
     sessionStorage.setItem(

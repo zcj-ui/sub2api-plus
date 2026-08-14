@@ -1,76 +1,54 @@
-# Sub2API Docker Image
+# Sub2API Plus Container Image
 
-Sub2API is an AI API Gateway Platform for distributing and managing AI product subscription API quotas.
+> The `0.2.x` images are technical-preview artifacts for isolated testing. They are not production-qualified; do not attach live paid users, irreplaceable data, or high-value credentials. Pin a version and digest, keep tested backups, and read the [complete risk notice](../docs/legal/admin-compliance.en.md).
 
-## Quick Start
+Stable image:
+
+```text
+ghcr.io/zcj-ui/sub2api-plus:latest
+```
+
+This tag exists only after a successful `vX.Y.Z` release workflow. For a new
+source-only fork with no release yet, use the repository source build instead
+of the Compose image workflow.
+
+Development image:
+
+```text
+ghcr.io/zcj-ui/sub2api-plus:dev
+```
+
+## Recommended Deployment
+
+Use the repository Compose files because the application requires PostgreSQL, Redis, persistent secrets, and a data directory:
 
 ```bash
-docker run -d \
-  --name sub2api \
-  -p 8080:8080 \
-  -e DATABASE_URL="postgres://user:pass@host:5432/sub2api" \
-  -e REDIS_URL="redis://host:6379" \
-  weishaw/sub2api:latest
+mkdir -p sub2api-plus && cd sub2api-plus
+curl -sSL https://raw.githubusercontent.com/zcj-ui/sub2api-plus/main/deploy/docker-deploy.sh | bash
+docker compose -f docker-compose.yml up -d
 ```
 
-## Docker Compose
+## Upgrade
 
-```yaml
-version: '3.8'
-
-services:
-  sub2api:
-    image: weishaw/sub2api:latest
-    ports:
-      - "8080:8080"
-    environment:
-      - DATABASE_URL=postgres://postgres:postgres@db:5432/sub2api?sslmode=disable
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - db
-      - redis
-
-  db:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=sub2api
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-
-volumes:
-  postgres_data:
-  redis_data:
+```bash
+docker compose -f docker-compose.yml pull
+docker compose -f docker-compose.yml up -d
 ```
 
-## Environment Variables
+Pin a stable version in `.env` when automatic image movement is not desired:
 
-| Variable | Description | Required | Default |
-|----------|-------------|----------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | Yes | - |
-| `REDIS_URL` | Redis connection string | Yes | - |
-| `PORT` | Server port | No | `8080` |
-| `GIN_MODE` | Gin framework mode (`debug`/`release`) | No | `release` |
+```dotenv
+SUB2API_IMAGE=ghcr.io/zcj-ui/sub2api-plus:0.2.0
+SUB2API_UPDATE_REPO=zcj-ui/sub2api-plus
+```
 
-## Supported Architectures
+## Architectures
 
 - `linux/amd64`
 - `linux/arm64`
 
-## Tags
+## Image Metadata
 
-- `latest` - Latest stable release
-- `x.y.z` - Specific version
-- `x.y` - Latest patch of minor version
-- `x` - Latest minor of major version
+Images include OCI source, revision, version, and `LGPL-3.0-or-later` labels. `LICENSE`, `NOTICE`, and `DISCLAIMER.md` are installed under `/usr/share/licenses/sub2api/`. The disclaimer records the current technical-preview maturity and operational risks; it does not add conditions to the license.
 
-## Links
-
-- [GitHub Repository](https://github.com/weishaw/sub2api)
-- [Documentation](https://github.com/weishaw/sub2api#readme)
+See [README.md](README.md) for environment variables, persistence, health checks, and acceptance-test requirements.

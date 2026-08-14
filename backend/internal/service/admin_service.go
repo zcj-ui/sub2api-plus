@@ -378,6 +378,9 @@ type CreateAccountInput struct {
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
 	// This should only be set when the caller has explicitly confirmed the risk.
 	SkipMixedChannelCheck bool
+	// ConfirmOveragesRisk records the administrator's explicit acknowledgement
+	// before enabling paid AI Credits overages.
+	ConfirmOveragesRisk bool
 }
 
 // ShadowOptions is the input for CreateShadow.
@@ -407,6 +410,7 @@ type UpdateAccountInput struct {
 	ProbeEnabled          *bool
 	RateSyncEnabled       *bool
 	SkipMixedChannelCheck bool // 跳过混合渠道检查（用户已确认风险）
+	ConfirmOveragesRisk   bool // 已明确确认开启付费 AI Credits 超额风险
 }
 
 // BulkUpdateAccountsInput describes the payload for bulk updating accounts.
@@ -428,6 +432,7 @@ type BulkUpdateAccountsInput struct {
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
 	// This should only be set when the caller has explicitly confirmed the risk.
 	SkipMixedChannelCheck bool
+	ConfirmOveragesRisk   bool
 }
 
 type BulkUpdateAccountFilters struct {

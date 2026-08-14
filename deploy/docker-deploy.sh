@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# Sub2API Docker Deployment Preparation Script
+# Sub2API Plus Docker Deployment Preparation Script
 # =============================================================================
-# This script prepares deployment files for Sub2API:
+# This script prepares deployment files for Sub2API Plus:
 #   - Downloads docker-compose.local.yml and .env.example
 #   - Generates secure secrets (JWT_SECRET, TOTP_ENCRYPTION_KEY, POSTGRES_PASSWORD)
 #   - Creates necessary data directories
@@ -20,8 +20,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# GitHub raw content base URL
-GITHUB_RAW_URL="https://raw.githubusercontent.com/Wei-Shaw/sub2api/main/deploy"
+# Distribution repository. Override with SUB2API_UPDATE_REPO=owner/repository.
+GITHUB_REPO="${SUB2API_UPDATE_REPO:-zcj-ui/sub2api-plus}"
+if [[ ! "$GITHUB_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "SUB2API_UPDATE_REPO must use owner/repository format" >&2
+    exit 1
+fi
+GITHUB_RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy"
+LOWER_GITHUB_REPO="$(printf '%s' "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')"
+DEFAULT_SUB2API_IMAGE="ghcr.io/${LOWER_GITHUB_REPO}:latest"
+SUB2API_IMAGE="${SUB2API_IMAGE:-$DEFAULT_SUB2API_IMAGE}"
 
 # Print colored message
 print_info() {
@@ -54,7 +62,7 @@ command_exists() {
 main() {
     echo ""
     echo "=========================================="
-    echo "  Sub2API Deployment Preparation"
+    echo "  Sub2API Plus Deployment Preparation"
     echo "=========================================="
     echo ""
 
@@ -114,11 +122,17 @@ main() {
         sed -i "s/^JWT_SECRET=.*/JWT_SECRET=${JWT_SECRET}/" .env
         sed -i "s/^TOTP_ENCRYPTION_KEY=.*/TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY}/" .env
         sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+        sed -i "s|^SUB2API_IMAGE=.*|SUB2API_IMAGE=${SUB2API_IMAGE}|" .env
+        sed -i "s|^SUB2API_UPDATE_REPO=.*|SUB2API_UPDATE_REPO=${GITHUB_REPO}|" .env
+        sed -i "s|^SUB2API_REPOSITORY_URL=.*|SUB2API_REPOSITORY_URL=https://github.com/${GITHUB_REPO}|" .env
     else
         # BSD sed (macOS)
         sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=${JWT_SECRET}/" .env
         sed -i '' "s/^TOTP_ENCRYPTION_KEY=.*/TOTP_ENCRYPTION_KEY=${TOTP_ENCRYPTION_KEY}/" .env
         sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+        sed -i '' "s|^SUB2API_IMAGE=.*|SUB2API_IMAGE=${SUB2API_IMAGE}|" .env
+        sed -i '' "s|^SUB2API_UPDATE_REPO=.*|SUB2API_UPDATE_REPO=${GITHUB_REPO}|" .env
+        sed -i '' "s|^SUB2API_REPOSITORY_URL=.*|SUB2API_REPOSITORY_URL=https://github.com/${GITHUB_REPO}|" .env
     fi
 
     # Create data directories

@@ -19,6 +19,7 @@ import (
 func TestAccountTestServiceOpenAICompactAgentIdentityUsesFreshAssertion(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	key, privateKey := newTestAgentIdentityKey(t)
+	proxyID := int64(9201)
 	account := Account{
 		ID:          21,
 		Name:        "agent-identity",
@@ -27,6 +28,8 @@ func TestAccountTestServiceOpenAICompactAgentIdentityUsesFreshAssertion(t *testi
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials: map[string]any{
 			"auth_mode":                  OpenAIAuthModeAgentIdentity,
 			"agent_runtime_id":           key.runtimeID,
@@ -58,6 +61,7 @@ func TestAccountTestServiceOpenAICompactAgentIdentityUsesFreshAssertion(t *testi
 func TestAccountTestServiceOpenAICompactAgentIdentityRecoversInvalidTaskOnce(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	key, privateKey := newTestAgentIdentityKey(t)
+	proxyID := int64(9202)
 	account := &Account{
 		ID:          22,
 		Name:        "agent-identity-recovery",
@@ -66,6 +70,8 @@ func TestAccountTestServiceOpenAICompactAgentIdentityRecoversInvalidTaskOnce(t *
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials: map[string]any{
 			"auth_mode":          OpenAIAuthModeAgentIdentity,
 			"agent_runtime_id":   key.runtimeID,
@@ -81,6 +87,7 @@ func TestAccountTestServiceOpenAICompactAgentIdentityRecoversInvalidTaskOnce(t *
 		_, _ = io.WriteString(w, `{"task_id":"task-compact-new"}`)
 	}))
 	defer registerServer.Close()
+	bindOpenAITestProxyToServer(t, account, registerServer.URL)
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = registerServer.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
@@ -315,6 +322,7 @@ func TestOpenAIAgentIdentityTaskInvalidRetriesExactlyOnce(t *testing.T) {
 		_, _ = io.WriteString(w, `{"task_id":"task-new"}`)
 	}))
 	defer registerServer.Close()
+	bindOpenAITestProxyToServer(t, account, registerServer.URL)
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = registerServer.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
@@ -419,6 +427,7 @@ func TestOpenAIAgentIdentityCompatRoutesRecoverInvalidTaskOnce(t *testing.T) {
 				_, _ = io.WriteString(w, `{"task_id":"task-compat-new"}`)
 			}))
 			defer registerServer.Close()
+			bindOpenAITestProxyToServer(t, account, registerServer.URL)
 			oldBase := openAIAgentIdentityAuthAPIBaseURL
 			openAIAgentIdentityAuthAPIBaseURL = registerServer.URL
 			t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })

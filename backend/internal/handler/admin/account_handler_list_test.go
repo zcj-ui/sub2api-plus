@@ -19,7 +19,38 @@ func setupAccountListRouter() (*gin.Engine, *stubAdminService) {
 	adminSvc := newStubAdminService()
 	handler := NewAccountHandler(adminSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	router.GET("/api/v1/admin/accounts", handler.List)
+	router.GET("/api/v1/admin/accounts/health-probe-failures", handler.ListHealthProbeFailures)
 	return router, adminSvc
+}
+
+func TestAccountHandlerListHealthProbeFailuresReturnsAllPersistedFailures(t *testing.T) {
+	router, adminSvc := setupAccountListRouter()
+	adminSvc.accounts = []service.Account{
+		{ID: 1, Name: "dead", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Extra: map[string]any{
+			service.AccountHealthProbeExtraKey: map[string]any{
+				"status": service.AccountHealthProbeStatusFailed, "mode": service.AccountHealthProbeModeOAuth,
+				"attempts": 2, "checked_at": "2026-08-15T00:00:00Z", "reason": "quota failed",
+			},
+		}},
+		{ID: 2, Name: "healthy", Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Extra: map[string]any{
+			service.AccountHealthProbeExtraKey: map[string]any{"status": service.AccountHealthProbeStatusHealthy},
+		}},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/health-probe-failures", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var payload struct {
+		Data []service.AccountHealthProbeResult `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Data, 1)
+	require.Equal(t, int64(1), payload.Data[0].AccountID)
+	require.True(t, payload.Data[0].Dead)
+	require.True(t, payload.Data[0].HealthPersisted)
+	require.Equal(t, "quota failed", payload.Data[0].Reason)
 }
 
 func TestAccountHandlerListIncludesCreatedAt(t *testing.T) {
@@ -50,6 +81,29 @@ func TestAccountHandlerListIncludesCreatedAt(t *testing.T) {
 	require.NoError(t, err)
 	_, offset := parsed.Zone()
 	require.Equal(t, 0, offset)
+}
+
+func TestAccountHandlerListLiteReturnsOnlySelectionMetadata(t *testing.T) {
+	router, _ := setupAccountListRouter()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts?page=1&page_size=20&lite=1", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var payload struct {
+		Data struct {
+			Items []map[string]any `json:"items"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Len(t, payload.Data.Items, 1)
+	item := payload.Data.Items[0]
+	require.Contains(t, item, "id")
+	require.Contains(t, item, "name")
+	require.Contains(t, item, "platform")
+	require.Contains(t, item, "type")
+	require.NotContains(t, item, "credentials")
+	require.NotContains(t, item, "current_concurrency")
 }
 
 func TestAccountHandlerListReturnsSchedulerScoresPerGroup(t *testing.T) {

@@ -411,7 +411,9 @@ func TestBuildSchedulerMetadataAccount_KeepsSlimGroupMembership(t *testing.T) {
 
 func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 	account := service.Account{
-		ID: 88,
+		ID:       88,
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
 		Extra: map[string]any{
 			"codex_5h_used_percent":        12.34,
 			"codex_7d_used_percent":        56.78,
@@ -420,10 +422,20 @@ func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 			"codex_5h_reset_after_seconds": 300,
 			"codex_7d_reset_after_seconds": 600,
 			"codex_usage_updated_at":       "2026-05-29T09:00:00Z",
-			"auto_pause_5h_threshold":      0.95,
-			"auto_pause_7d_threshold":      0.96,
-			"auto_pause_5h_disabled":       true,
-			"auto_pause_7d_disabled":       false,
+			"codex_credit_snapshot": map[string]any{
+				"has_credits": true,
+				"balance":     "1000.0000000000",
+				"updated_at":  "2026-05-29T09:00:00Z",
+			},
+			"auto_pause_5h_threshold": 0.95,
+			"auto_pause_7d_threshold": 0.96,
+			"auto_pause_5h_disabled":  true,
+			"auto_pause_7d_disabled":  false,
+			service.AccountHealthProbeExtraKey: map[string]any{
+				"status":   service.AccountHealthProbeStatusFailed,
+				"mode":     service.AccountHealthProbeModeOAuth,
+				"attempts": 2,
+			},
 		},
 	}
 
@@ -436,10 +448,13 @@ func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 	require.Equal(t, 300, got.Extra["codex_5h_reset_after_seconds"])
 	require.Equal(t, 600, got.Extra["codex_7d_reset_after_seconds"])
 	require.Equal(t, "2026-05-29T09:00:00Z", got.Extra["codex_usage_updated_at"])
+	require.Equal(t, account.Extra["codex_credit_snapshot"], got.Extra["codex_credit_snapshot"])
 	require.Equal(t, 0.95, got.Extra["auto_pause_5h_threshold"])
 	require.Equal(t, 0.96, got.Extra["auto_pause_7d_threshold"])
 	require.Equal(t, true, got.Extra["auto_pause_5h_disabled"])
 	require.Equal(t, false, got.Extra["auto_pause_7d_disabled"])
+	require.Equal(t, account.Extra[service.AccountHealthProbeExtraKey], got.Extra[service.AccountHealthProbeExtraKey])
+	require.True(t, got.HasFailedHealthProbe())
 }
 
 func TestBuildSchedulerMetadataAccount_KeepsQuotaStateForCachedAccounts(t *testing.T) {

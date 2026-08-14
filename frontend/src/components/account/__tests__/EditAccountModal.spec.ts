@@ -467,6 +467,59 @@ describe('EditAccountModal', () => {
     )
   })
 
+  it('defaults legacy OpenAI OAuth accounts to the 429 guard enabled', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const toggle = wrapper.get('[data-testid="edit-codex-429-guard-toggle"]')
+    expect(toggle.attributes('aria-checked')).toBe('true')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_codex_429_guard_enabled).toBe(true)
+  })
+
+  it('loads and saves an explicitly disabled OpenAI OAuth 429 guard', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { openai_codex_429_guard_enabled: false }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const toggle = wrapper.get('[data-testid="edit-codex-429-guard-toggle"]')
+    expect(toggle.attributes('aria-checked')).toBe('false')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_codex_429_guard_enabled).toBe(false)
+  })
+
+  it('hides and omits the 429 guard for OpenAI API key accounts', async () => {
+    const account = buildAccount()
+    account.extra = { openai_codex_429_guard_enabled: true }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-codex-429-guard-toggle"]').exists()).toBe(false)
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty(
+      'openai_codex_429_guard_enabled'
+    )
+  })
+
   it('defaults legacy OpenAI accounts to long-context billing disabled', async () => {
     const account = buildAccount()
     updateAccountMock.mockReset()
@@ -1158,6 +1211,24 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock.mock.calls[0]?.[1]?.credentials?.antigravity_project_id).toBe(
       'updated-project'
     )
+  })
+
+  it('confirms paid overages and does not invent a proxy for an unbound account', async () => {
+    const account = buildAntigravityAccount('configured-project')
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = mountModal(account)
+
+    await wrapper.get('[data-testid="allow-overages-toggle"]').setValue(true)
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    const payload = updateAccountMock.mock.calls[0]?.[1]
+    expect(payload?.extra?.allow_overages).toBe(true)
+    expect(payload?.confirm_overages_risk).toBe(true)
+    expect(payload?.proxy_id).toBe(0)
   })
 
   it('clears Antigravity configured project fallback when input is empty', async () => {

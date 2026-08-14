@@ -75,6 +75,9 @@ func NeedsToolContinuation(reqBody map[string]any) bool {
 		if !ok {
 			continue
 		}
+		if isCodexSyntheticAgentContextItem(itemMap) {
+			continue
+		}
 		itemType, _ := itemMap["type"].(string)
 		if isCodexToolCallItemType(itemType) || itemType == "item_reference" {
 			return true
@@ -102,6 +105,9 @@ func AnalyzeToolContinuationSignals(reqBody map[string]any) ToolContinuationSign
 	for _, item := range input {
 		itemMap, ok := item.(map[string]any)
 		if !ok {
+			continue
+		}
+		if isCodexSyntheticAgentContextItem(itemMap) {
 			continue
 		}
 		itemType, _ := itemMap["type"].(string)
@@ -170,6 +176,9 @@ func ValidateFunctionCallOutputContextBytes(body []byte) FunctionCallOutputValid
 	var referenceIDs map[string]struct{}
 	input.ForEach(func(_, item gjson.Result) bool {
 		if !item.IsObject() {
+			return true
+		}
+		if isCodexSyntheticAgentContextJSONItem(item) {
 			return true
 		}
 		itemType := item.Get("type").String()
@@ -246,6 +255,9 @@ func AnalyzeToolCallOutputContextCoverageBytes(body []byte) ToolCallOutputContex
 		if !item.IsObject() {
 			return true
 		}
+		if isCodexSyntheticAgentContextJSONItem(item) {
+			return true
+		}
 		itemType := item.Get("type").String()
 		switch {
 		case isCodexToolCallOutputItemType(itemType):
@@ -313,6 +325,9 @@ func ValidateFunctionCallOutputContext(reqBody map[string]any) FunctionCallOutpu
 		if !ok {
 			continue
 		}
+		if isCodexSyntheticAgentContextItem(itemMap) {
+			continue
+		}
 		itemType, _ := itemMap["type"].(string)
 		switch {
 		case isCodexToolCallOutputItemType(itemType):
@@ -337,6 +352,9 @@ func ValidateFunctionCallOutputContext(reqBody map[string]any) FunctionCallOutpu
 	for _, item := range input {
 		itemMap, ok := item.(map[string]any)
 		if !ok {
+			continue
+		}
+		if isCodexSyntheticAgentContextItem(itemMap) {
 			continue
 		}
 		itemType, _ := itemMap["type"].(string)
@@ -371,6 +389,27 @@ func ValidateFunctionCallOutputContext(reqBody map[string]any) FunctionCallOutpu
 	}
 	result.HasItemReferenceForAllCallIDs = allReferenced
 	return result
+}
+
+func isCodexSyntheticAgentContextJSONItem(item gjson.Result) bool {
+	if !item.IsObject() {
+		return false
+	}
+	itemType := strings.TrimSpace(item.Get("type").String())
+	callID := strings.TrimSpace(item.Get("call_id").String())
+	if !strings.HasPrefix(callID, codexSyntheticAgentContextCallPrefix) {
+		return false
+	}
+	switch itemType {
+	case "custom_tool_call":
+		return strings.TrimSpace(item.Get("name").String()) == codexSyntheticAgentContextToolName &&
+			item.Get("input").String() == codexSyntheticAgentContextInput
+	case "custom_tool_call_output":
+		return item.Get("output.0.type").String() == "input_text" &&
+			item.Get("output.0.text").String() == codexSyntheticAgentContextOutputText
+	default:
+		return false
+	}
 }
 
 // HasFunctionCallOutput 判断 input 是否包含任意 Codex 工具输出，用于触发续链校验。

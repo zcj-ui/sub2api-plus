@@ -1,6 +1,7 @@
 name: Security Scan
 
 on:
+  workflow_call:
   push:
   pull_request:
   schedule:
@@ -10,6 +11,17 @@ permissions:
   contents: read
 
 jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Scan repository history for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   backend-security:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -21,9 +33,6 @@ jobs:
           go-version-file: backend/go.mod
           check-latest: false
           cache-dependency-path: backend/go.sum
-      - name: Verify Go version
-        run: |
-          go version | grep -q 'go1.26.5'
       - name: Run govulncheck
         working-directory: backend
         run: |

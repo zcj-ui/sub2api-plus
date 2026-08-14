@@ -63,6 +63,33 @@ func (r passthroughErrReadCloser) Close() error {
 	return nil
 }
 
+func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.3-codex","prompt_cache_key":"conversation-1","input":[{"type":"input_text","text":"hello"}]}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("session-id", "client-session-1")
+
+	account := &Account{
+		ID:       901,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{"openai_device_id": "device-901"},
+	}
+	ids := resolveCodexFingerprintIDsForRequest(account, c.Request.Header, body, 0)
+	c.Set(codexFingerprintIDsContextKey, ids)
+
+	svc := &OpenAIGatewayService{}
+	req, err := svc.buildUpstreamRequestOpenAIPassthrough(context.Background(), c, account, body, "token")
+	require.NoError(t, err)
+	require.Equal(t, "device-901", req.Header.Get("x-codex-installation-id"))
+	require.Equal(t, ids.sessionID, req.Header.Get("session_id"))
+	require.Equal(t, ids.sessionID, req.Header.Get("conversation_id"))
+	require.Equal(t, ids.threadID, req.Header.Get("thread-id"))
+	require.NotEmpty(t, req.Header.Get("x-client-request-id"))
+}
+
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	u.lastReq = req
 	u.lastProxyURL = proxyURL
@@ -385,13 +412,16 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamKeepsToolNameAndBodyNormali
 	}
 
 	account := &Account{
-		ID:             123,
-		Name:           "acc",
-		Platform:       PlatformOpenAI,
-		Type:           AccountTypeOAuth,
-		Concurrency:    1,
-		Credentials:    map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
-		Extra:          map[string]any{"openai_passthrough": true},
+		ID:          123,
+		Name:        "acc",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+		Extra: map[string]any{
+			"openai_passthrough":               true,
+			OpenAICodex429GuardEnabledExtraKey: true,
+		},
 		Status:         StatusActive,
 		Schedulable:    true,
 		RateMultiplier: f64p(1),
@@ -412,6 +442,11 @@ func TestOpenAIGatewayService_OAuthPassthrough_StreamKeepsToolNameAndBodyNormali
 	// 其余关键字段保持原值。
 	require.Equal(t, "gpt-5.2", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.Equal(t, "hi", gjson.GetBytes(upstream.lastBody, "input.0.text").String())
+	require.Equal(t, "custom_tool_call", gjson.GetBytes(upstream.lastBody, "input.1.type").String())
+	require.Equal(t, codexSyntheticAgentContextToolName, gjson.GetBytes(upstream.lastBody, "input.1.name").String())
+	require.Equal(t, "custom_tool_call_output", gjson.GetBytes(upstream.lastBody, "input.2.type").String())
+	require.Equal(t, gjson.GetBytes(upstream.lastBody, "input.1.call_id").String(), gjson.GetBytes(upstream.lastBody, "input.2.call_id").String())
+	require.False(t, gjson.GetBytes(upstream.lastBody, `tools.#(name=="agent_context_checkpoint")`).Exists())
 
 	// 2) only auth is replaced; inbound auth/cookie are not forwarded
 	require.Equal(t, "Bearer oauth-token", upstream.lastReq.Header.Get("Authorization"))
@@ -756,6 +791,7 @@ func TestOpenAIGatewayService_OAuthPassthrough_CompactUsesJSONAndKeepsNonStreami
 	require.False(t, gjson.GetBytes(upstream.lastBody, "stream").Exists())
 	require.Equal(t, "gpt-5.1-codex", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.Equal(t, "compact me", gjson.GetBytes(upstream.lastBody, "input.0.text").String())
+	require.Len(t, gjson.GetBytes(upstream.lastBody, "input").Array(), 1, "compact must not receive the synthetic context pair")
 	require.Equal(t, "local-test-instructions", strings.TrimSpace(gjson.GetBytes(upstream.lastBody, "instructions").String()))
 	require.Equal(t, "application/json", upstream.lastReq.Header.Get("Accept"))
 	require.Equal(t, codexCLIVersion, upstream.lastReq.Header.Get("Version"))
@@ -884,13 +920,16 @@ func TestOpenAIGatewayService_OAuthPassthrough_DisabledUsesLegacyTransform(t *te
 	}
 
 	account := &Account{
-		ID:             123,
-		Name:           "acc",
-		Platform:       PlatformOpenAI,
-		Type:           AccountTypeOAuth,
-		Concurrency:    1,
-		Credentials:    map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
-		Extra:          map[string]any{"openai_passthrough": false},
+		ID:          123,
+		Name:        "acc",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "oauth-token", "chatgpt_account_id": "chatgpt-acc"},
+		Extra: map[string]any{
+			"openai_passthrough":               false,
+			OpenAICodex429GuardEnabledExtraKey: true,
+		},
 		Status:         StatusActive,
 		Schedulable:    true,
 		RateMultiplier: f64p(1),
@@ -903,6 +942,8 @@ func TestOpenAIGatewayService_OAuthPassthrough_DisabledUsesLegacyTransform(t *te
 	require.NotEqual(t, inputBody, upstream.lastBody)
 	require.Contains(t, string(upstream.lastBody), `"store":false`)
 	require.Contains(t, string(upstream.lastBody), `"stream":true`)
+	require.Equal(t, codexSyntheticAgentContextToolName, gjson.GetBytes(upstream.lastBody, "input.1.name").String())
+	require.Equal(t, "custom_tool_call_output", gjson.GetBytes(upstream.lastBody, "input.2.type").String())
 }
 
 func TestOpenAIGatewayService_OAuthLegacy_UpstreamRequestIgnoresClientCancel(t *testing.T) {
@@ -1397,9 +1438,8 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 			}(),
 			expectFailover: true,
 			assertRepo: func(t *testing.T, repo *openAIPassthroughFailoverRepo, _ time.Time) {
-				require.Len(t, repo.rateLimitCalls, 1)
+				require.Empty(t, repo.rateLimitCalls, "the first OpenAI OAuth 429 must not persist account cooldown")
 				require.Empty(t, repo.overloadCalls)
-				require.True(t, time.Until(repo.rateLimitCalls[0]) > 24*time.Hour)
 			},
 		},
 		{

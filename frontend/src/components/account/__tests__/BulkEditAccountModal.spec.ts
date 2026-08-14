@@ -288,6 +288,75 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
+  it('OpenAI OAuth 批量编辑可统一关闭卡429开关', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth']
+    })
+
+    await wrapper.get('#bulk-edit-codex-429-guard-enabled').setValue(true)
+    await wrapper.get('[data-testid="bulk-edit-codex-429-guard-toggle"]').trigger('click')
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      extra: { openai_codex_429_guard_enabled: false }
+    })
+  })
+
+  it.each([
+    [['openai'], ['apikey']],
+    [['openai'], ['setup-token']],
+    [['anthropic'], ['oauth']],
+    [['openai', 'anthropic'], ['oauth']]
+  ])('非严格 OpenAI OAuth 目标不显示卡429批量开关', (platforms, types) => {
+    const wrapper = mountModal({ selectedPlatforms: platforms, selectedTypes: types })
+    expect(wrapper.find('#bulk-edit-codex-429-guard-enabled').exists()).toBe(false)
+  })
+
+  it('Antigravity 批量开启超额时强制确认并提交确认凭据', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = mountModal({
+      selectedPlatforms: ['antigravity'],
+      selectedTypes: ['oauth']
+    })
+
+    await wrapper.get('#bulk-edit-allow-overages-enabled').setValue(true)
+    await wrapper.get('[data-testid="bulk-edit-allow-overages-toggle"]').trigger('click')
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(confirmSpy).toHaveBeenCalledWith('admin.accounts.allowOveragesProConfirm')
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      extra: { allow_overages: true },
+      confirm_overages_risk: true
+    })
+    confirmSpy.mockRestore()
+  })
+
+  it('Antigravity 批量关闭超额不需要付费确认', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    const wrapper = mountModal({
+      selectedPlatforms: ['antigravity'],
+      selectedTypes: ['oauth']
+    })
+
+    await wrapper.get('#bulk-edit-allow-overages-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      extra: { allow_overages: false }
+    })
+    confirmSpy.mockRestore()
+  })
+
+  it('非 Antigravity 目标不显示超额批量开关', () => {
+    const wrapper = mountModal({ selectedPlatforms: ['openai'], selectedTypes: ['oauth'] })
+    expect(wrapper.find('#bulk-edit-allow-overages-enabled').exists()).toBe(false)
+  })
+
   it('namespace 摊平开关不对 setup-token 等非 OAuth 选择展示', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],

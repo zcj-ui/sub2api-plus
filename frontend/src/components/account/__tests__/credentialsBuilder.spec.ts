@@ -112,6 +112,11 @@ describe('isHeaderOverrideCapable', () => {
     expect(isHeaderOverrideCapable('grok', 'bedrock')).toBe(false)
   })
 
+  it('antigravity upstream supports relay compatibility headers', () => {
+    expect(isHeaderOverrideCapable('antigravity', 'upstream')).toBe(true)
+    expect(isHeaderOverrideCapable('antigravity', 'oauth')).toBe(false)
+  })
+
   it('other platforms are not supported', () => {
     expect(isHeaderOverrideCapable('gemini', 'apikey')).toBe(false)
     expect(isHeaderOverrideCapable('antigravity', 'apikey')).toBe(false)
@@ -468,4 +473,3 @@ describe('plan_type helpers', () => {
     })
   })
 })
-

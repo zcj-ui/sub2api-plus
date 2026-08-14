@@ -401,6 +401,9 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.POST("/batch-delete", h.Admin.Account.BatchDelete)
 		accounts.POST("/batch-clear-error", h.Admin.Account.BatchClearError)
 		accounts.POST("/batch-refresh", h.Admin.Account.BatchRefresh)
+		accounts.POST("/batch-health-probe", h.Admin.Account.BatchHealthProbe)
+		accounts.POST("/batch-inventory", h.Admin.Account.BatchInventory)
+		accounts.GET("/health-probe-failures", h.Admin.Account.ListHealthProbeFailures)
 
 		// Antigravity 默认模型映射
 		accounts.GET("/antigravity/default-model-mapping", h.Admin.Account.GetAntigravityDefaultModelMapping)

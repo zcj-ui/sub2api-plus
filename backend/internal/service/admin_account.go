@@ -66,6 +66,16 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 const maxAccountNameRunes = 100
 const duplicateAccountOperationIDExtraKey = "duplicate_operation_id"
 
+var ErrOveragesConfirmationRequired = infraerrors.BadRequest(
+	"OVERAGES_CONFIRMATION_REQUIRED",
+	"enabling paid AI Credits overages requires explicit confirmation",
+)
+
+func overagesEnabledInExtra(extra map[string]any) bool {
+	enabled, _ := extra["allow_overages"].(bool)
+	return enabled
+}
+
 func duplicateAccountName(sourceName string) string {
 	const suffix = " (Copy)"
 	nameRunes := []rune(strings.TrimSpace(sourceName))
@@ -304,6 +314,7 @@ func (s *adminServiceImpl) DuplicateAccount(ctx context.Context, id int64, actor
 		AutoPauseOnExpired:    &autoPauseOnExpired,
 		SkipDefaultGroupBind:  true,
 		SkipMixedChannelCheck: true,
+		ConfirmOveragesRisk:   source.IsOveragesEnabled(),
 	}
 	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
 	if err != nil {
@@ -354,6 +365,28 @@ func ValidateOpenAILongContextBillingExtra(platform string, extra map[string]any
 		return infraerrors.BadRequest(
 			"OPENAI_LONG_CONTEXT_BILLING_INVALID",
 			"openai_long_context_billing_enabled must be a boolean",
+		)
+	}
+	return nil
+}
+
+// ValidateOpenAICodex429GuardExtra keeps the account-scoped guard out of
+// unrelated providers and OpenAI API-key/setup-token accounts.
+func ValidateOpenAICodex429GuardExtra(platform, accountType string, extra map[string]any) error {
+	raw, exists := extra[OpenAICodex429GuardEnabledExtraKey]
+	if !exists {
+		return nil
+	}
+	if _, ok := raw.(bool); !ok {
+		return infraerrors.BadRequest(
+			"OPENAI_CODEX_429_GUARD_INVALID",
+			"openai_codex_429_guard_enabled must be a boolean",
+		)
+	}
+	if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
+		return infraerrors.BadRequest(
+			"OPENAI_CODEX_429_GUARD_ACCOUNT_INVALID",
+			"openai_codex_429_guard_enabled only applies to OpenAI OAuth accounts",
 		)
 	}
 	return nil
@@ -459,6 +492,9 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if err := ValidateOpenAICodex429GuardExtra(input.Platform, input.Type, input.Extra); err != nil {
+		return nil, err
+	}
 	accountExtra, err := normalizeOpenAILongContextBillingExtra(input.Platform, input.Extra)
 	if err != nil {
 		return nil, err
@@ -466,6 +502,9 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	accountExtra, err = normalizeGrokMediaEligibilityExtra(input.Platform, accountExtra)
 	if err != nil {
 		return nil, err
+	}
+	if input.Platform == PlatformAntigravity && overagesEnabledInExtra(accountExtra) && !input.ConfirmOveragesRisk {
+		return nil, ErrOveragesConfirmationRequired
 	}
 
 	// 绑定分组
@@ -548,6 +587,13 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	var normalizedExtra map[string]any
 	if input.Extra != nil {
+		effectiveType := account.Type
+		if input.Type != "" {
+			effectiveType = input.Type
+		}
+		if err := ValidateOpenAICodex429GuardExtra(account.Platform, effectiveType, input.Extra); err != nil {
+			return nil, err
+		}
 		normalizedExtra, err = normalizeOpenAILongContextBillingUpdateExtra(account, input)
 		if err != nil {
 			return nil, err
@@ -615,6 +661,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	requestedProbeEnabledUpdate := input.ProbeEnabled
 	requestedRateSyncEnabledUpdate := input.RateSyncEnabled
 	if input.Extra != nil {
+		if account.Platform == PlatformAntigravity && !wasOveragesEnabled && overagesEnabledInExtra(normalizedExtra) && !input.ConfirmOveragesRisk {
+			return nil, ErrOveragesConfirmationRequired
+		}
 		requestedProbeEnabled, hasRequestedProbeEnabled := normalizedExtra[UpstreamBillingProbeEnabledExtraKey]
 		if hasRequestedProbeEnabled {
 			enabled, ok := requestedProbeEnabled.(bool)
@@ -909,15 +958,33 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	needMixedChannelCheck := input.GroupIDs != nil && !input.SkipMixedChannelCheck
 	_, hasLongContextBillingUpdate := input.Extra[openAILongContextBillingEnabledKey]
+	_, hasCodex429GuardUpdate := input.Extra[OpenAICodex429GuardEnabledExtraKey]
+	overagesEnabled, hasOveragesUpdate := input.Extra["allow_overages"].(bool)
+	if _, present := input.Extra["allow_overages"]; present && !hasOveragesUpdate {
+		return nil, infraerrors.BadRequest("INVALID_ALLOW_OVERAGES", "allow_overages must be a boolean")
+	}
+	if overagesEnabled && !input.ConfirmOveragesRisk {
+		return nil, ErrOveragesConfirmationRequired
+	}
 
 	// 预取所有目标账号，供凭据守卫/代理守卫/混合渠道检查共用，避免多次 DB 查询。
 	var cachedTargets []*Account
-	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil {
+	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || hasCodex429GuardUpdate || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil {
 		loaded, err := s.accountRepo.GetByIDs(ctx, input.AccountIDs)
 		if err != nil {
 			return nil, err
 		}
 		cachedTargets = loaded
+	}
+	if hasOveragesUpdate {
+		for _, account := range cachedTargets {
+			if account == nil {
+				return nil, ErrAccountNotFound
+			}
+			if account.Platform != PlatformAntigravity {
+				return nil, infraerrors.BadRequest("ALLOW_OVERAGES_PLATFORM_INVALID", "allow_overages is only supported for Antigravity accounts")
+			}
+		}
 	}
 	if input.ProbeEnabled != nil {
 		targetsByID := make(map[int64]*Account, len(cachedTargets))
@@ -945,6 +1012,16 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 				return nil, err
 			}
 			break
+		}
+	}
+	if hasCodex429GuardUpdate {
+		for _, account := range cachedTargets {
+			if account == nil {
+				return nil, ErrAccountNotFound
+			}
+			if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, input.Extra); err != nil {
+				return nil, err
+			}
 		}
 	}
 

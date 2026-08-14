@@ -1,14 +1,16 @@
-# Sub2API Deployment and Operation Compliance Commitment
+# Sub2API Plus Deployment and Operation Compliance Commitment
 
-Version: v2026.06.10
+Version: v2026.08.15
 
-This document applies to any individual, organization, or authorized representative that deploys, configures, manages, operates, or effectively controls a Sub2API instance. Before continuing to access or use console functions, the acknowledging party must read, understand, and accept this document in full.
+This document applies to any individual, organization, or authorized representative that deploys, configures, manages, operates, or effectively controls a Sub2API Plus instance. Before continuing to access or use console functions, the acknowledging party must read, understand, and accept this document in full.
 
 ## 1. Scope
 
-Sub2API is open-source software. Any self-hosted deployment, modification, hosted operation, external service, commercial use, user management, content processing, data processing, payment settlement, customer support, or upstream account/API usage based on Sub2API is the sole responsibility of the party that deploys, operates, or controls the relevant instance.
+Sub2API Plus is open-source software. Any self-hosted deployment, modification, hosted operation, external service, commercial use, user management, content processing, data processing, payment settlement, customer support, or upstream account/API usage based on Sub2API Plus is the sole responsibility of the party that deploys, operates, or controls the relevant instance.
 
 This document does not replace the open-source license, upstream terms of service, user agreements, privacy policies, data processing agreements, commercial contracts, regulatory filings, administrative permits, security assessments, or any other documents, procedures, or obligations required by applicable law or contract.
+
+> **Technical preview and production warning:** the current `0.2.x` series is intended for functional validation and compatibility testing. It has not completed an independent security audit, sustained load testing, disaster-recovery exercises, cross-version database rollback validation, or production service-level qualification. It should not be deployed directly to production or used for critical workloads, real paid users, irreplaceable data, or high-value credentials. This statement describes release maturity and operational risk; it does not add a restriction to the rights granted by LGPL-3.0-or-later. Any operator choosing to proceed should first complete its own isolated review, load testing, backup restoration, fault injection, migration, and rollback acceptance.
 
 ## 2. Responsibility of the Deploying or Operating Party
 
@@ -40,9 +42,31 @@ By continuing to use console functions, the acknowledging party makes the follow
 
 ## 5. Risk and Responsibility Notice
 
-Using Sub2API for public API services, commercial relay, quota distribution, team sharing, paid calls, or similar purposes may involve risks relating to terms of service, contractual breach, data protection, content safety, consumer protection, payment settlement, taxes, export controls, sanctions compliance, cybersecurity, industry access, and administrative regulation. Requirements vary by jurisdiction and business model and may change over time.
+Using Sub2API Plus for public API services, commercial relay, quota distribution, team sharing, paid calls, or similar purposes may involve risks relating to terms of service, contractual breach, data protection, content safety, consumer protection, payment settlement, taxes, export controls, sanctions compliance, cybersecurity, industry access, and administrative regulation. Requirements vary by jurisdiction and business model and may change over time.
 
 The mandatory notice, document link, exact-phrase acknowledgment, and local acknowledgment record in the console are intended to provide clear, conspicuous, and reproducible notice of deployment and operation risks, confirm that the console user has read the current version of this document, and create a clear responsibility-separation record between the open-source project, copyright holders, contributors, maintainers and any third-party deploying, operating, or controlling party.
+
+### 5.1 Software maturity and availability
+
+The project is provided as-is under its open-source license. It does not promise uninterrupted availability, absence of defects, suitability for a particular purpose, production certification, security certification, regulatory approval, commercial availability, or a maintenance period. Passing tests and CI does not eliminate failures caused by real networks, upstream policy changes, unusual responses, streaming connections, concurrency spikes, clock drift, database contention, or unstable proxies. A version number, `latest` image, GitHub Release, or “release build” identifies a distribution channel only. Operators should pin versions and image digests, review each changelog, and avoid automated rolling-tag upgrades without verified backups.
+
+### 5.2 Credentials, proxies, and accounts
+
+The system may process API keys, OAuth and refresh tokens, cookies, proxy credentials, account identifiers, quota snapshots, and request metadata. Logging, reverse proxies, browser extensions, monitoring systems, backups, screenshots, or exports may expose that material. Operators are responsible for key management, least privilege, encryption, audit logging, redaction, rotation, retention, and deletion. Fixed-proxy routing reduces accidental egress drift but does not guarantee proxy trustworthiness, exclusivity, location, anonymity, uptime, or non-retention. Operators must independently verify that model requests, quota probes, health checks, OAuth refreshes, and WebSocket traffic use the intended egress.
+
+### 5.3 Upstream, quota, and billing information
+
+Upstream providers and relay services may change APIs, fields, status codes, controls, model names, pricing, regional policies, and terms without notice. Compatibility code is based on finite samples and may omit, synthesize, reorder, or transform fields. Stream retries can duplicate requests or charges. Quota values from `/backend-api/wham/usage`, `credits.balance`, reset counters, and usage windows are point-in-time upstream snapshots and may be stale or incomplete. The displayed USD amount is only `Credit / 25`; it is not legal tender, an invoice, a settlement record, a promised price, or a withdrawable asset. The two-429 rule, “429 Guard” history injection, local threshold handling, and scheduler do not change upstream limits or guarantee success.
+
+### 5.4 Data, concurrency, and recovery
+
+Bulk inventory, bulk edit, import, and scheduling operations can affect many accounts at once. Concurrent execution, stale pages, repeated submission, partial transactions, and incompatible versions can produce partial success or temporary inconsistency. Back up PostgreSQL, required Redis state, configuration, encryption keys, proxy settings, and matching source versions before changes, then test restoration in an isolated environment. Database migrations are not promised to be reversible. The scheduler is not a financial limit, capacity guarantee, strict fair queue, or independent oversell control; critical deployments require external budget, rate, concurrency, and circuit-breaker controls.
+
+### 5.5 Security, privacy, content, and support
+
+Examples and defaults are demonstrations, not hardened configuration. Replace secrets, isolate databases and Redis, configure HTTPS and trusted proxies, require strong administrator authentication, and maintain firewalls, rate limits, monitoring, and updates. Inputs, outputs, attachments, tool calls, and logs may contain personal data, confidential material, protected works, or inaccurate model content. Operators must establish a lawful basis, notice, minimization, access, deletion, moderation, and human review appropriate to their use. Model output should not be the sole unsupervised basis for high-impact medical, legal, financial, safety, or control decisions.
+
+Maintainers do not promise response times, repair times, long-term support, data recovery, operational assistance, or permanent compatibility with a particular upstream. Public reports must not contain live secrets, account exports, production databases, proxy credentials, or identifiable logs. Operators need their own monitoring, on-call process, change approval, rollback, capacity planning, and shutdown procedure. This risk list is not exhaustive and is not legal, tax, financial, security, or compliance advice. The license's warranty and liability terms continue to apply; these operational notices do not modify LGPL-3.0-or-later rights or obligations.
 
 ## 6. Electronic Acknowledgment
 

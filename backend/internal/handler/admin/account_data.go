@@ -2,6 +2,8 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -46,7 +48,8 @@ type DataProxy struct {
 	Status          string `json:"status"`
 	ExpiresAt       *int64 `json:"expires_at,omitempty"`        // unix 秒，与 DataAccount.ExpiresAt 风格一致
 	FallbackMode    string `json:"fallback_mode,omitempty"`     // none/direct/proxy
-	BackupProxyName string `json:"backup_proxy_name,omitempty"` // 备用代理 name（跨实例按 name 反查）
+	BackupProxyName string `json:"backup_proxy_name,omitempty"` // 旧备份按 name 反查
+	BackupProxyKey  string `json:"backup_proxy_key,omitempty"`  // 规范端点键，优先于名称
 	ExpiryWarnDays  int    `json:"expiry_warn_days,omitempty"`
 }
 
@@ -75,6 +78,8 @@ type DataAccount struct {
 type DataImportRequest struct {
 	Data                 DataPayload `json:"data"`
 	SkipDefaultGroupBind *bool       `json:"skip_default_group_bind"`
+	Codex429GuardEnabled *bool       `json:"codex_429_guard_enabled"`
+	ConfirmOveragesRisk  *bool       `json:"confirm_overages_risk"`
 }
 
 type DataImportResult struct {
@@ -94,7 +99,45 @@ type DataImportError struct {
 }
 
 func buildProxyKey(protocol, host string, port int, username, password string) string {
+	// Length-prefix every field before hashing so delimiters in credentials can
+	// never alias another endpoint. The digest also keeps proxy passwords out of
+	// exported keys and import error responses.
+	fields := []string{strings.TrimSpace(protocol), strings.TrimSpace(host), strconv.Itoa(port), strings.TrimSpace(username), strings.TrimSpace(password)}
+	var canonical strings.Builder
+	for _, field := range fields {
+		canonical.WriteString(strconv.Itoa(len(field)))
+		canonical.WriteByte(':')
+		canonical.WriteString(field)
+	}
+	sum := sha256.Sum256([]byte(canonical.String()))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// buildLegacyProxyKey is retained solely for importing backups written before
+// proxy_key became a non-secret digest.
+func buildLegacyProxyKey(protocol, host string, port int, username, password string) string {
 	return fmt.Sprintf("%s|%s|%d|%s|%s", strings.TrimSpace(protocol), strings.TrimSpace(host), port, strings.TrimSpace(username), strings.TrimSpace(password))
+}
+
+func proxyKeyMatches(item DataProxy, canonicalKey string) bool {
+	if item.ProxyKey == "" {
+		return true
+	}
+	return item.ProxyKey == canonicalKey || item.ProxyKey == buildLegacyProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)
+}
+
+func proxyKeyForError(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.HasPrefix(trimmed, "sha256:") {
+		return trimmed
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return "legacy-sha256:" + hex.EncodeToString(sum[:])
+}
+
+func addProxyKeyAliases(keys map[string]int64, p service.Proxy) {
+	keys[buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)] = p.ID
+	keys[buildLegacyProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)] = p.ID
 }
 
 func (h *AccountHandler) ExportData(c *gin.Context) {
@@ -147,18 +190,19 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 		proxies = []service.Proxy{}
 	}
 
-	// 构建 id→name 映射，用于导出备用代理 name
+	// Build all lookups first so a backup proxy can appear later in the export.
 	proxyNameByID := make(map[int64]string, len(proxies))
+	proxyKeyByID := make(map[int64]string, len(proxies))
 	for i := range proxies {
-		proxyNameByID[proxies[i].ID] = proxies[i].Name
+		p := proxies[i]
+		proxyNameByID[p.ID] = p.Name
+		proxyKeyByID[p.ID] = buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
 	}
 
-	proxyKeyByID := make(map[int64]string, len(proxies))
 	dataProxies := make([]DataProxy, 0, len(proxies))
 	for i := range proxies {
 		p := proxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
-		proxyKeyByID[p.ID] = key
+		key := proxyKeyByID[p.ID]
 
 		var expiresAt *int64
 		if p.ExpiresAt != nil {
@@ -166,8 +210,10 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			expiresAt = &v
 		}
 		var backupProxyName string
+		var backupProxyKey string
 		if p.BackupProxyID != nil {
 			backupProxyName = proxyNameByID[*p.BackupProxyID]
+			backupProxyKey = proxyKeyByID[*p.BackupProxyID]
 		}
 		dataProxies = append(dataProxies, DataProxy{
 			ProxyKey:        key,
@@ -181,6 +227,7 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 			ExpiresAt:       expiresAt,
 			FallbackMode:    p.FallbackMode,
 			BackupProxyName: backupProxyName,
+			BackupProxyKey:  backupProxyKey,
 			ExpiryWarnDays:  p.ExpiryWarnDays,
 		})
 	}
@@ -257,23 +304,28 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 	}
 
 	proxyKeyToID := make(map[string]int64, len(existingProxies))
+	proxyByID := make(map[int64]*service.Proxy, len(existingProxies)+len(dataPayload.Proxies))
 	// proxyNameToID 用于 backup_proxy_name 反查：DB 已有 + 本批次新建均会写入
 	proxyNameToID := make(map[string]int64, len(existingProxies))
 	for i := range existingProxies {
 		p := existingProxies[i]
-		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
-		proxyKeyToID[key] = p.ID
+		addProxyKeyAliases(proxyKeyToID, p)
+		proxyCopy := p
+		proxyByID[p.ID] = &proxyCopy
 		if p.Name != "" {
 			proxyNameToID[p.Name] = p.ID
 		}
 	}
+	type pendingProxyConfig struct {
+		ID   int64
+		Item DataProxy
+		Key  string
+	}
+	pendingProxyConfigs := make([]pendingProxyConfig, 0, len(dataPayload.Proxies))
 
 	for i := range dataPayload.Proxies {
 		item := dataPayload.Proxies[i]
-		key := item.ProxyKey
-		if key == "" {
-			key = buildProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)
-		}
+		key := buildProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)
 		if err := validateDataProxy(item); err != nil {
 			result.ProxyFailed++
 			result.Errors = append(result.Errors, DataImportError{
@@ -284,43 +336,19 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			})
 			continue
 		}
-		normalizedStatus := normalizeProxyStatus(item.Status)
+		if !proxyKeyMatches(item, key) {
+			result.ProxyFailed++
+			result.Errors = append(result.Errors, DataImportError{
+				Kind:     "proxy",
+				Name:     item.Name,
+				ProxyKey: proxyKeyForError(item.ProxyKey),
+				Message:  "proxy_key does not match the proxy endpoint",
+			})
+			continue
+		}
 		if existingID, ok := proxyKeyToID[key]; ok {
-			proxyKeyToID[key] = existingID
 			result.ProxyReused++
-			if normalizedStatus != "" {
-				if proxy, getErr := h.adminService.GetProxy(ctx, existingID); getErr == nil && proxy != nil && proxy.Status != normalizedStatus {
-					// 同步 status 时传入完整字段，避免零值覆盖已存在代理的有效期/fallback 配置。
-					var existingExpiresAt *time.Time
-					if item.ExpiresAt != nil {
-						t := time.Unix(*item.ExpiresAt, 0).UTC()
-						existingExpiresAt = &t
-					}
-					existingFallbackMode := item.FallbackMode
-					if existingFallbackMode == "" {
-						existingFallbackMode = service.FallbackModeNone
-					}
-					var existingBackupProxyID *int64
-					if item.BackupProxyName != "" {
-						if bid, ok := proxyNameToID[item.BackupProxyName]; ok {
-							existingBackupProxyID = &bid
-						}
-					}
-					_, _ = h.adminService.UpdateProxy(ctx, existingID, &service.UpdateProxyInput{
-						Status:         normalizedStatus,
-						ExpiresAt:      existingExpiresAt,
-						FallbackMode:   existingFallbackMode,
-						BackupProxyID:  existingBackupProxyID,
-						ExpiryWarnDays: item.ExpiryWarnDays,
-						Name:           proxy.Name,
-						Protocol:       proxy.Protocol,
-						Host:           proxy.Host,
-						Port:           proxy.Port,
-						Username:       proxy.Username,
-						Password:       proxy.Password,
-					})
-				}
-			}
+			pendingProxyConfigs = append(pendingProxyConfigs, pendingProxyConfig{ID: existingID, Item: item, Key: key})
 			continue
 		}
 
@@ -331,24 +359,6 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			expiresAt = &t
 		}
 
-		// 解析 backup_proxy_name → backup_proxy_id
-		fallbackMode := item.FallbackMode
-		var backupProxyID *int64
-		if item.BackupProxyName != "" {
-			if bid, ok := proxyNameToID[item.BackupProxyName]; ok {
-				backupProxyID = &bid
-			} else {
-				// 查不到备用代理：降级 fallback_mode=none，记录 warning
-				fallbackMode = service.FallbackModeNone
-				result.Errors = append(result.Errors, DataImportError{
-					Kind:     "proxy",
-					Name:     item.Name,
-					ProxyKey: key,
-					Message:  fmt.Sprintf("backup_proxy_name %q not found, fallback_mode downgraded to none", item.BackupProxyName),
-				})
-			}
-		}
-
 		created, createErr := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
 			Name:           defaultProxyName(item.Name),
 			Protocol:       item.Protocol,
@@ -357,8 +367,8 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			Username:       item.Username,
 			Password:       item.Password,
 			ExpiresAt:      expiresAt,
-			FallbackMode:   fallbackMode,
-			BackupProxyID:  backupProxyID,
+			FallbackMode:   service.FallbackModeNone,
+			BackupProxyID:  nil,
 			ExpiryWarnDays: item.ExpiryWarnDays,
 		})
 		if createErr != nil {
@@ -372,27 +382,80 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			continue
 		}
 		proxyKeyToID[key] = created.ID
+		proxyKeyToID[buildLegacyProxyKey(item.Protocol, item.Host, item.Port, item.Username, item.Password)] = created.ID
+		created.Protocol = item.Protocol
+		created.Host = item.Host
+		created.Port = item.Port
+		created.Username = item.Username
+		created.Password = item.Password
+		created.ExpiresAt = expiresAt
+		proxyByID[created.ID] = created
 		// 把新建代理的 name 也加入反查表，供后续批内代理引用
 		if created.Name != "" {
 			proxyNameToID[created.Name] = created.ID
 		}
 		result.ProxyCreated++
+		pendingProxyConfigs = append(pendingProxyConfigs, pendingProxyConfig{ID: created.ID, Item: item, Key: key})
+	}
 
-		if normalizedStatus != "" && normalizedStatus != created.Status {
-			// 新建后同步 status 时，传入完整字段，避免零值覆盖刚创建的有效期/fallback 配置。
-			_, _ = h.adminService.UpdateProxy(ctx, created.ID, &service.UpdateProxyInput{
-				Status:         normalizedStatus,
-				ExpiresAt:      expiresAt,
-				FallbackMode:   fallbackMode,
-				BackupProxyID:  backupProxyID,
-				ExpiryWarnDays: item.ExpiryWarnDays,
-				Name:           created.Name,
-				Protocol:       created.Protocol,
-				Host:           created.Host,
-				Port:           created.Port,
-				Username:       created.Username,
-				Password:       created.Password,
-			})
+	// Apply status, expiry, and backup references only after every proxy has an
+	// ID. This supports forward references and makes update failures visible.
+	for _, pending := range pendingProxyConfigs {
+		proxy := proxyByID[pending.ID]
+		if proxy == nil {
+			result.ProxyFailed++
+			result.Errors = append(result.Errors, DataImportError{Kind: "proxy", Name: pending.Item.Name, ProxyKey: pending.Key, Message: "proxy disappeared before configuration"})
+			continue
+		}
+		status := normalizeProxyStatus(pending.Item.Status)
+		if status == "" {
+			status = proxy.Status
+		}
+		fallbackMode := strings.TrimSpace(pending.Item.FallbackMode)
+		if fallbackMode == "" {
+			fallbackMode = proxy.FallbackMode
+		}
+		if fallbackMode == "" {
+			fallbackMode = service.FallbackModeNone
+		}
+		expiresAt := proxy.ExpiresAt
+		if pending.Item.ExpiresAt != nil {
+			t := time.Unix(*pending.Item.ExpiresAt, 0).UTC()
+			expiresAt = &t
+		}
+
+		var backupProxyID *int64
+		if fallbackMode == service.FallbackModeProxy {
+			var backupID int64
+			var found bool
+			if pending.Item.BackupProxyKey != "" {
+				backupID, found = proxyKeyToID[pending.Item.BackupProxyKey]
+			} else if pending.Item.BackupProxyName != "" {
+				backupID, found = proxyNameToID[pending.Item.BackupProxyName]
+			}
+			if !found {
+				result.ProxyFailed++
+				result.Errors = append(result.Errors, DataImportError{Kind: "proxy", Name: pending.Item.Name, ProxyKey: pending.Key, Message: "backup proxy reference was not found"})
+				continue
+			}
+			backupProxyID = &backupID
+		}
+
+		if _, updateErr := h.adminService.UpdateProxy(ctx, pending.ID, &service.UpdateProxyInput{
+			Status:         status,
+			ExpiresAt:      expiresAt,
+			FallbackMode:   fallbackMode,
+			BackupProxyID:  backupProxyID,
+			ExpiryWarnDays: pending.Item.ExpiryWarnDays,
+			Name:           proxy.Name,
+			Protocol:       proxy.Protocol,
+			Host:           proxy.Host,
+			Port:           proxy.Port,
+			Username:       proxy.Username,
+			Password:       proxy.Password,
+		}); updateErr != nil {
+			result.ProxyFailed++
+			result.Errors = append(result.Errors, DataImportError{Kind: "proxy", Name: pending.Item.Name, ProxyKey: pending.Key, Message: updateErr.Error()})
 		}
 	}
 
@@ -420,7 +483,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 				result.Errors = append(result.Errors, DataImportError{
 					Kind:     "account",
 					Name:     item.Name,
-					ProxyKey: *item.ProxyKey,
+					ProxyKey: proxyKeyForError(*item.ProxyKey),
 					Message:  "proxy_key not found",
 				})
 				continue
@@ -428,6 +491,12 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		enrichCredentialsFromIDToken(&item)
+		if req.Codex429GuardEnabled != nil && item.Platform == service.PlatformOpenAI && item.Type == service.AccountTypeOAuth {
+			if item.Extra == nil {
+				item.Extra = make(map[string]any)
+			}
+			item.Extra[service.OpenAICodex429GuardEnabledExtraKey] = *req.Codex429GuardEnabled
+		}
 
 		accountInput := &service.CreateAccountInput{
 			Name:                 item.Name,
@@ -444,6 +513,7 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			ExpiresAt:            item.ExpiresAt,
 			AutoPauseOnExpired:   item.AutoPauseOnExpired,
 			SkipDefaultGroupBind: skipDefaultGroupBind,
+			ConfirmOveragesRisk:  req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
 		}
 
 		created, err := h.adminService.CreateAccount(ctx, accountInput)
@@ -568,7 +638,7 @@ func (h *AccountHandler) resolveExportProxies(ctx context.Context, accounts []se
 		return []service.Proxy{}, nil
 	}
 
-	seen := make(map[int64]struct{})
+	requested := make(map[int64]struct{})
 	ids := make([]int64, 0)
 	for i := range accounts {
 		if accounts[i].ProxyID == nil {
@@ -578,17 +648,46 @@ func (h *AccountHandler) resolveExportProxies(ctx context.Context, accounts []se
 		if id <= 0 {
 			continue
 		}
-		if _, ok := seen[id]; ok {
+		if _, ok := requested[id]; ok {
 			continue
 		}
-		seen[id] = struct{}{}
+		requested[id] = struct{}{}
 		ids = append(ids, id)
 	}
 	if len(ids) == 0 {
 		return []service.Proxy{}, nil
 	}
 
-	return h.adminService.GetProxiesByIDs(ctx, ids)
+	proxies := make([]service.Proxy, 0, len(ids))
+	for len(ids) > 0 {
+		batch, err := h.adminService.GetProxiesByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		loaded := make(map[int64]struct{}, len(batch))
+		next := make([]int64, 0)
+		for i := range batch {
+			proxy := batch[i]
+			loaded[proxy.ID] = struct{}{}
+			proxies = append(proxies, proxy)
+			if proxy.BackupProxyID == nil || *proxy.BackupProxyID <= 0 {
+				continue
+			}
+			backupID := *proxy.BackupProxyID
+			if _, ok := requested[backupID]; ok {
+				continue
+			}
+			requested[backupID] = struct{}{}
+			next = append(next, backupID)
+		}
+		for _, id := range ids {
+			if _, ok := loaded[id]; !ok {
+				return nil, fmt.Errorf("proxy %d referenced by account backup data was not found", id)
+			}
+		}
+		ids = next
+	}
+	return proxies, nil
 }
 
 func parseAccountIDs(c *gin.Context) ([]int64, error) {
@@ -672,6 +771,9 @@ func validateDataProxy(item DataProxy) error {
 			return fmt.Errorf("proxy status is invalid: %s", item.Status)
 		}
 	}
+	if mode := strings.TrimSpace(item.FallbackMode); mode != "" && mode != service.FallbackModeNone && mode != service.FallbackModeProxy && mode != service.FallbackModeDirect {
+		return fmt.Errorf("proxy fallback_mode is invalid: %s", item.FallbackMode)
+	}
 	return nil
 }
 
@@ -682,16 +784,31 @@ func validateDataAccount(item DataAccount) error {
 	if strings.TrimSpace(item.Platform) == "" {
 		return errors.New("account platform is required")
 	}
+	if item.Platform != strings.TrimSpace(item.Platform) || !service.IsAllowedQuotaPlatform(item.Platform) {
+		return fmt.Errorf("account platform is invalid: %s", item.Platform)
+	}
 	if strings.TrimSpace(item.Type) == "" {
 		return errors.New("account type is required")
+	}
+	if item.Type != strings.TrimSpace(item.Type) {
+		return fmt.Errorf("account type is invalid: %s", item.Type)
 	}
 	if len(item.Credentials) == 0 {
 		return errors.New("account credentials is required")
 	}
 	switch item.Type {
-	case service.AccountTypeOAuth, service.AccountTypeSetupToken, service.AccountTypeAPIKey, service.AccountTypeUpstream:
+	case service.AccountTypeOAuth, service.AccountTypeSetupToken, service.AccountTypeAPIKey, service.AccountTypeUpstream, service.AccountTypeBedrock, service.AccountTypeServiceAccount:
 	default:
 		return fmt.Errorf("account type is invalid: %s", item.Type)
+	}
+	if raw, exists := item.Extra["allow_overages"]; exists {
+		enabled, ok := raw.(bool)
+		if !ok {
+			return errors.New("allow_overages must be a boolean")
+		}
+		if enabled && item.Platform != service.PlatformAntigravity {
+			return errors.New("allow_overages is only supported for Antigravity accounts")
+		}
 	}
 	if item.RateMultiplier != nil && *item.RateMultiplier < 0 {
 		return errors.New("rate_multiplier must be >= 0")

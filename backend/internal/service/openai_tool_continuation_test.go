@@ -56,6 +56,27 @@ func TestHasFunctionCallOutput(t *testing.T) {
 	}))
 }
 
+func TestSyntheticAgentContextPairDoesNotTriggerToolContinuationSignals(t *testing.T) {
+	reqBody := map[string]any{
+		"input": []any{map[string]any{"type": "message", "role": "user", "content": "hello"}},
+	}
+	require.True(t, appendCodexSyntheticAgentContextPair(reqBody))
+	require.False(t, NeedsToolContinuation(reqBody))
+	require.False(t, HasFunctionCallOutput(reqBody))
+	require.False(t, HasToolCallContext(reqBody))
+	require.Empty(t, FunctionCallOutputCallIDs(reqBody))
+	require.False(t, HasFunctionCallOutputMissingCallID(reqBody))
+
+	body, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+	require.Equal(t, FunctionCallOutputValidation{}, ValidateFunctionCallOutputContextBytes(body))
+	require.Equal(t, ToolCallOutputContextCoverage{}, AnalyzeToolCallOutputContextCoverageBytes(body))
+
+	realOutput := map[string]any{"type": "function_call_output", "call_id": codexSyntheticAgentContextCallPrefix + "client_value", "output": "client result"}
+	reqBody["input"] = append(reqBody["input"].([]any), realOutput)
+	require.True(t, HasFunctionCallOutput(reqBody), "an unrelated real output must not be hidden by the reserved prefix alone")
+}
+
 func TestHasToolCallContext(t *testing.T) {
 	// 工具调用上下文必须包含 call_id，才能作为可关联上下文。
 	require.False(t, HasToolCallContext(nil))

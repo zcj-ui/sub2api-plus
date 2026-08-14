@@ -65,6 +65,97 @@ beforeEach(() => {
 })
 
 describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
+  it('显示缓存的 Credit 原值和 Credit ÷ 25 美元参考金额', () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_credit_snapshot: {
+          balance: '1000.0000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+          updated_at: '2026-08-13T12:00:00Z',
+        },
+      },
+    })
+
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+    const balance = wrapper.find('[data-testid="codex-credit-balance"]')
+
+    expect(balance.exists()).toBe(true)
+    expect(balance.text()).toContain('1000.0000000000 Credit')
+    expect(balance.text()).toContain('≈ $40.00')
+    wrapper.unmount()
+  })
+
+  it('查询后用最新 wham credits 替换缓存余额', async () => {
+    vi.mocked(refreshOpenAIQuota).mockResolvedValue({
+      credits: {
+        balance: '25.5000000000',
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+      },
+      rate_limit_reset_credits: { available_count: 0, credits: [] },
+      fetched_at: 1770000000,
+      cache_persisted: true,
+    })
+    const account = makeAccount({ parent_account_id: null })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+
+    const balance = wrapper.find('[data-testid="codex-credit-balance"]')
+    expect(balance.text()).toContain('25.5000000000 Credit')
+    expect(balance.text()).toContain('≈ $1.02')
+    wrapper.unmount()
+  })
+
+  it('无限积分在余额字符串为空时仍显示无限额', () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_credit_snapshot: {
+          balance: '',
+          has_credits: false,
+          unlimited: true,
+          overage_limit_reached: false,
+          updated_at: '2026-08-13T12:00:00Z',
+        },
+      },
+    })
+
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+    const balance = wrapper.find('[data-testid="codex-credit-balance"]')
+
+    expect(balance.exists()).toBe(true)
+    expect(balance.text()).toContain('admin.accounts.openaiQuotaReset.unlimitedBalance')
+    expect(balance.text()).not.toContain('$')
+    wrapper.unmount()
+  })
+
+  it('Spark 影子不显示母账号 wham 返回的积分余额', async () => {
+    vi.mocked(refreshOpenAIQuota).mockResolvedValue({
+      credits: {
+        balance: '1000.0000000000',
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+      },
+      fetched_at: 1770000000,
+      cache_persisted: true,
+    })
+    const account = makeAccount({ parent_account_id: 100 })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
   it('影子账号(parent_account_id 非空)的 reset 按钮被禁用且提示在母账号重置', () => {
     const account = makeAccount({ parent_account_id: 100 })
     const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
@@ -104,6 +195,63 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
     expect(wrapper.text()).toContain('admin.accounts.openaiQuotaReset.count')
     expect(wrapper.text()).toContain('admin.accounts.openaiQuotaReset.expiresAt:')
     expect(wrapper.text()).toContain('+1')
+    expect(resetButton(wrapper).attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('uses cached applicable count to gate reset while keeping the total count visible', () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_reset_credit_snapshot: {
+          available_count: 2,
+          applicable_available_count: 0,
+          credits: [
+            { expires_at: FUTURE_EXPIRY_EARLY },
+            { expires_at: FUTURE_EXPIRY_LATE },
+          ],
+        },
+      },
+    })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    expect(wrapper.text()).toContain('admin.accounts.openaiQuotaReset.count2')
+    expect(resetButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(resetButton(wrapper).attributes('title')).toBe('admin.accounts.openaiQuotaReset.resetTooltipNoCredits')
+    wrapper.unmount()
+  })
+
+  it('prefers a live applicable count and falls back to available count when absent', async () => {
+    vi.mocked(refreshOpenAIQuota)
+      .mockResolvedValueOnce({
+        rate_limit_reset_credits: {
+          available_count: 2,
+          applicable_available_count: 0,
+          credits: [
+            { expires_at: FUTURE_EXPIRY_EARLY },
+            { expires_at: FUTURE_EXPIRY_LATE },
+          ],
+        },
+        fetched_at: 1770000000,
+        cache_persisted: true,
+      })
+      .mockResolvedValueOnce({
+        rate_limit_reset_credits: {
+          available_count: 1,
+          credits: [{ expires_at: FUTURE_EXPIRY_EARLY }],
+        },
+        fetched_at: 1770000001,
+        cache_persisted: true,
+      })
+    const account = makeAccount({ parent_account_id: null })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+    expect(resetButton(wrapper).attributes('disabled')).toBeDefined()
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
     expect(resetButton(wrapper).attributes('disabled')).toBeUndefined()
     wrapper.unmount()
   })

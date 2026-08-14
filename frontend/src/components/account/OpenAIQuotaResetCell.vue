@@ -63,6 +63,23 @@
       </button>
     </div>
 
+    <div
+      v-if="creditBalanceDisplay || creditUnlimited"
+      data-testid="codex-credit-balance"
+      class="flex flex-wrap items-center gap-1 text-[10px] tabular-nums"
+      :title="t('admin.accounts.openaiQuotaReset.balanceReferenceHint')"
+    >
+      <span v-if="creditBalanceDisplay" class="font-medium text-emerald-700 dark:text-emerald-400">
+        {{ creditBalanceDisplay }} Credit
+      </span>
+      <span v-if="creditUsdReference" class="text-gray-500 dark:text-gray-400">
+        ≈ ${{ creditUsdReference }}
+      </span>
+      <span v-if="creditUnlimited" class="text-emerald-700 dark:text-emerald-400">
+        {{ t('admin.accounts.openaiQuotaReset.unlimitedBalance') }}
+      </span>
+    </div>
+
     <div v-if="primaryResetCreditExpiry" class="space-y-1">
       <div class="flex flex-wrap items-center gap-1">
         <span
@@ -181,8 +198,13 @@ const readCachedResetCredits = (account: Account): OpenAIQuotaUsage | null => {
   const cached = account.extra?.codex_reset_credit_snapshot
   if (!cached || typeof cached !== 'object' || Array.isArray(cached)) return null
 
-  const { available_count: count, credits: rawCredits } = cached as {
+  const {
+    available_count: count,
+    applicable_available_count: applicableCount,
+    credits: rawCredits
+  } = cached as {
     available_count?: unknown
+    applicable_available_count?: unknown
     credits?: unknown
   }
   if (typeof count !== 'number' || !Number.isFinite(count)) return null
@@ -209,6 +231,9 @@ const readCachedResetCredits = (account: Account): OpenAIQuotaUsage | null => {
     fetched_at: 0,
     rate_limit_reset_credits: {
       available_count: availableCount,
+      ...(typeof applicableCount === 'number' && Number.isFinite(applicableCount)
+        ? { applicable_available_count: Math.min(Math.max(applicableCount, 0), availableCount) }
+        : {}),
       credits
     }
   }
@@ -222,6 +247,27 @@ data.value = cachedData.value
 const isShadow = computed(() => props.account.parent_account_id != null)
 
 const availableResetCount = computed(() => data.value?.rate_limit_reset_credits?.available_count ?? 0)
+const applicableResetCount = computed(() => {
+  const credits = data.value?.rate_limit_reset_credits
+  if (!credits) return 0
+  return typeof credits.applicable_available_count === 'number'
+    ? credits.applicable_available_count
+    : credits.available_count
+})
+const cachedCreditSnapshot = computed(() => props.account.extra?.codex_credit_snapshot)
+const creditSnapshot = computed(() =>
+  isShadow.value ? null : (data.value?.credits ?? cachedCreditSnapshot.value ?? null)
+)
+const creditBalanceDisplay = computed(() => {
+  const balance = creditSnapshot.value?.balance
+  return typeof balance === 'string' && balance.trim() !== '' ? balance.trim() : ''
+})
+const creditUsdReference = computed(() => {
+  if (!creditBalanceDisplay.value) return ''
+  const balance = Number(creditBalanceDisplay.value)
+  return Number.isFinite(balance) ? (balance / 25).toFixed(2) : ''
+})
+const creditUnlimited = computed(() => creditSnapshot.value?.unlimited === true)
 // Prefer the live payload and fall back to the persisted snapshot only when the
 // live state is unknown, so the count and the expirations never come from two
 // different generations of the same data.
@@ -233,7 +279,7 @@ const resetCreditExpirations = computed(() =>
 )
 const primaryResetCreditExpiry = computed(() => resetCreditExpirations.value[0] ?? '')
 const hiddenResetCreditCount = computed(() => Math.max(resetCreditExpirations.value.length - 1, 0))
-const canReset = computed(() => availableResetCount.value > 0 && !isShadow.value)
+const canReset = computed(() => applicableResetCount.value > 0 && !isShadow.value)
 
 const resetCreditDetailsTitle = computed(() =>
   resetCreditExpirations.value

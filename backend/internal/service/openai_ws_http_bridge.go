@@ -220,9 +220,12 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		upstreamReq.Header.Set(responsesLiteHeader, "true")
 	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveOpenAIAccountProxyURL(account)
+	if proxyErr != nil {
+		if turn == 1 {
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, proxyErr, true)
+		}
+		return nil, fmt.Errorf("resolve upstream proxy: %w", proxyErr)
 	}
 	if c != nil {
 		c.Set("openai_passthrough", true)

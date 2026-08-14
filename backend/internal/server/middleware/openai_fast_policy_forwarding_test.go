@@ -78,6 +78,7 @@ func TestAPIKeyAuthForwardsUserScopedOpenAIFastPolicyToUpstream(t *testing.T) {
 		"key-user-43": newOpenAIFastPolicyForwardingAPIKey(2, "key-user-43", 43, groupID, group),
 	}
 	apiKeyService := service.NewAPIKeyService(&openAIFastPolicyForwardingAPIKeyRepo{apiKeys: apiKeys}, nil, nil, nil, nil, nil, cfg)
+	proxyID := int64(901)
 	account := &service.Account{
 		ID:          900,
 		Name:        "openai-upstream",
@@ -86,6 +87,8 @@ func TestAPIKeyAuthForwardsUserScopedOpenAIFastPolicyToUpstream(t *testing.T) {
 		Status:      service.StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &service.Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
 			"base_url": upstreamServer.URL,

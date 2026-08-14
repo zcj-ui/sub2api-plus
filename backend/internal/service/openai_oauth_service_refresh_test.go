@@ -18,6 +18,16 @@ type openaiOAuthClientRefreshStub struct {
 	refreshCalls int32
 }
 
+type openAIProxyRepoRefreshStub struct {
+	ProxyRepository
+	proxy *Proxy
+	err   error
+}
+
+func (s *openAIProxyRepoRefreshStub) GetByID(context.Context, int64) (*Proxy, error) {
+	return s.proxy, s.err
+}
+
 func (s *openaiOAuthClientRefreshStub) ExchangeCode(ctx context.Context, code, codeVerifier, redirectURI, proxyURL, clientID string) (*openai.TokenResponse, error) {
 	return nil, errors.New("not implemented")
 }
@@ -60,6 +70,27 @@ func TestOpenAIOAuthService_RefreshAccountToken_NoRefreshTokenUsesExistingAccess
 	require.Equal(t, "client-id-1", info.ClientID)
 	require.Zero(t, atomic.LoadInt32(&client.refreshCalls), "existing access token should be reused without calling refresh")
 	require.Positive(t, atomic.LoadInt32(&privacyClientCalls), "existing access token should still run enrichment")
+}
+
+func TestOpenAIOAuthService_RefreshAccountTokenFailsClosedWhenConfiguredProxyIsMissing(t *testing.T) {
+	client := &openaiOAuthClientRefreshStub{}
+	svc := NewOpenAIOAuthService(&openAIProxyRepoRefreshStub{}, client)
+	proxyID := int64(9001)
+	account := &Account{
+		ID:       78,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Credentials: map[string]any{
+			"refresh_token": "refresh-token",
+		},
+	}
+
+	_, err := svc.RefreshAccountToken(context.Background(), account)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "proxy")
+	require.Zero(t, atomic.LoadInt32(&client.refreshCalls))
 }
 
 func TestOpenAIOAuthService_RefreshAccountToken_PATIgnoresStaleRefreshToken(t *testing.T) {

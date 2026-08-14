@@ -31,10 +31,11 @@ var embeddedVersion string
 
 // Build-time variables (can be set by ldflags)
 var (
-	Version   = ""
-	Commit    = "unknown"
-	Date      = "unknown"
-	BuildType = "source" // "source" for manual builds, "release" for CI builds (set by ldflags)
+	Version    = ""
+	Commit     = "unknown"
+	Date       = "unknown"
+	BuildType  = "source" // "source", "dev", or "release" (set by ldflags in CI)
+	UpdateRepo = "zcj-ui/sub2api-plus"
 )
 
 func init() {
@@ -62,7 +63,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		log.Printf("Sub2API %s (commit: %s, built: %s)\n", Version, Commit, Date)
+		log.Printf("Sub2API Plus %s (commit: %s, built: %s)\n", Version, Commit, Date)
 		return
 	}
 
@@ -112,7 +113,7 @@ func runSetupServer() {
 	// This allows users to run setup on a different address if needed
 	addr := config.GetServerAddress()
 	log.Printf("Setup wizard available at http://%s", addr)
-	log.Println("Complete the setup wizard to configure Sub2API")
+	log.Println("Complete the setup wizard to configure Sub2API Plus")
 
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
@@ -143,9 +144,14 @@ func runMainServer() {
 		log.Println("⚠️  WARNING: Running in SIMPLE mode - billing and quota checks are DISABLED")
 	}
 
+	updateRepo := strings.TrimSpace(os.Getenv("SUB2API_UPDATE_REPO"))
+	if updateRepo == "" {
+		updateRepo = UpdateRepo
+	}
 	buildInfo := handler.BuildInfo{
-		Version:   Version,
-		BuildType: BuildType,
+		Version:    Version,
+		BuildType:  BuildType,
+		UpdateRepo: updateRepo,
 	}
 
 	app, err := initializeApplication(buildInfo)

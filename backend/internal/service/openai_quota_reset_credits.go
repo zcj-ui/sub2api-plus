@@ -8,27 +8,32 @@ import (
 )
 
 type openAIRateLimitResetCreditDetailPayload struct {
-	ExpiresAt      string `json:"expires_at,omitempty"`
-	ExpiresAtCamel string `json:"expiresAt,omitempty"`
-	ResetType      string `json:"reset_type,omitempty"`
-	ResetTypeCamel string `json:"resetType,omitempty"`
-	Status         string `json:"status,omitempty"`
+	ConsumableUntil      string `json:"consumable_until,omitempty"`
+	ConsumableUntilCamel string `json:"consumableUntil,omitempty"`
+	ExpiresAt            string `json:"expires_at,omitempty"`
+	ExpiresAtCamel       string `json:"expiresAt,omitempty"`
+	ResetType            string `json:"reset_type,omitempty"`
+	ResetTypeCamel       string `json:"resetType,omitempty"`
+	Status               string `json:"status,omitempty"`
 }
 
 type openAIRateLimitResetCreditDetailsPayload struct {
-	AvailableCount        json.RawMessage `json:"available_count,omitempty"`
-	AvailableCountCamel   json.RawMessage `json:"availableCount,omitempty"`
-	Credits               json.RawMessage `json:"credits,omitempty"`
-	RateLimitResetCredits json.RawMessage `json:"rate_limit_reset_credits,omitempty"`
-	Items                 json.RawMessage `json:"items,omitempty"`
-	Data                  json.RawMessage `json:"data,omitempty"`
+	AvailableCount                json.RawMessage `json:"available_count,omitempty"`
+	AvailableCountCamel           json.RawMessage `json:"availableCount,omitempty"`
+	ApplicableAvailableCount      json.RawMessage `json:"applicable_available_count,omitempty"`
+	ApplicableAvailableCountCamel json.RawMessage `json:"applicableAvailableCount,omitempty"`
+	Credits                       json.RawMessage `json:"credits,omitempty"`
+	RateLimitResetCredits         json.RawMessage `json:"rate_limit_reset_credits,omitempty"`
+	Items                         json.RawMessage `json:"items,omitempty"`
+	Data                          json.RawMessage `json:"data,omitempty"`
 }
 
 type openAIRateLimitResetCreditDetails struct {
-	AvailableCount       *int
-	AvailableCreditCount int
-	CreditListPresent    bool
-	Credits              []OpenAIRateLimitResetCreditDetail
+	AvailableCount           *int
+	ApplicableAvailableCount *int
+	AvailableCreditCount     int
+	CreditListPresent        bool
+	Credits                  []OpenAIRateLimitResetCreditDetail
 }
 
 func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCreditDetails, error) {
@@ -39,6 +44,7 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 
 	var rawCredits []*openAIRateLimitResetCreditDetailPayload
 	var availableCount *int
+	var applicableAvailableCount *int
 	var creditListPresent bool
 	if trimmed[0] == '[' {
 		if err := json.Unmarshal(trimmed, &rawCredits); err != nil {
@@ -51,6 +57,10 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			return openAIRateLimitResetCreditDetails{}, err
 		}
 		availableCount = parseOpenAIResetCreditAvailableCount(payload.AvailableCount, payload.AvailableCountCamel)
+		applicableAvailableCount = parseOpenAIResetCreditAvailableCount(
+			payload.ApplicableAvailableCount,
+			payload.ApplicableAvailableCountCamel,
+		)
 		var err error
 		rawCredits, creditListPresent, err = firstPresentResetCreditPayload(
 			payload.Credits,
@@ -59,7 +69,10 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			payload.Data,
 		)
 		if err != nil {
-			return openAIRateLimitResetCreditDetails{AvailableCount: availableCount}, err
+			return openAIRateLimitResetCreditDetails{
+				AvailableCount:           availableCount,
+				ApplicableAvailableCount: applicableAvailableCount,
+			}, err
 		}
 	}
 
@@ -80,7 +93,13 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			continue
 		}
 		availableCreditCount++
-		expiresAt := strings.TrimSpace(raw.ExpiresAt)
+		expiresAt := strings.TrimSpace(raw.ConsumableUntil)
+		if expiresAt == "" {
+			expiresAt = strings.TrimSpace(raw.ConsumableUntilCamel)
+		}
+		if expiresAt == "" {
+			expiresAt = strings.TrimSpace(raw.ExpiresAt)
+		}
 		if expiresAt == "" {
 			expiresAt = strings.TrimSpace(raw.ExpiresAtCamel)
 		}
@@ -90,10 +109,11 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 		credits = append(credits, OpenAIRateLimitResetCreditDetail{ExpiresAt: expiresAt})
 	}
 	return openAIRateLimitResetCreditDetails{
-		AvailableCount:       availableCount,
-		AvailableCreditCount: availableCreditCount,
-		CreditListPresent:    creditListPresent,
-		Credits:              credits,
+		AvailableCount:           availableCount,
+		ApplicableAvailableCount: applicableAvailableCount,
+		AvailableCreditCount:     availableCreditCount,
+		CreditListPresent:        creditListPresent,
+		Credits:                  credits,
 	}, nil
 }
 

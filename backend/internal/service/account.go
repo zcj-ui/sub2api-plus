@@ -87,6 +87,11 @@ type OpenAIEndpointCapability string
 
 const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 
+// OpenAICodex429GuardEnabledExtraKey controls the Codex-only history
+// checkpoint used by the 429 guard. Missing values default to enabled so
+// existing OAuth accounts retain the upgraded request behavior.
+const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
+
 const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
@@ -181,6 +186,9 @@ func (a *Account) IsSchedulable() bool {
 	if !a.IsActive() || !a.Schedulable {
 		return false
 	}
+	if a.HasFailedHealthProbe() {
+		return false
+	}
 	now := time.Now()
 	if a.AutoPauseOnExpired && a.ExpiresAt != nil && !now.Before(*a.ExpiresAt) {
 		return false
@@ -192,7 +200,9 @@ func (a *Account) IsSchedulable() bool {
 		return false
 	}
 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
-		return false
+		if !(a.HasAvailableCodexCredits() && IsAccountSchedulingThresholdReason(a.TempUnschedulableReason)) {
+			return false
+		}
 	}
 	if a.IsAPIKeyOrBedrock() && a.IsQuotaExceeded() {
 		return false
@@ -1257,6 +1267,60 @@ func (a *Account) IsOpenAIOAuth() bool {
 	return a.IsOpenAI() && a.Type == AccountTypeOAuth
 }
 
+// HasAvailableCodexCredits reports whether the latest /wham/usage snapshot
+// explicitly says this ordinary Codex OAuth account can spend paid credits.
+// Spark shadows do not consume the parent account's paid-credit balance.
+func (a *Account) HasAvailableCodexCredits() bool {
+	return a.hasAvailableCodexCreditsAt(time.Now().UTC())
+}
+
+func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark || len(a.Extra) == 0 {
+		return false
+	}
+	raw, ok := a.Extra[openaiQuotaCreditBalanceKey]
+	if !ok || raw == nil {
+		return false
+	}
+	var snapshot *OpenAICodexCreditSnapshot
+	switch value := raw.(type) {
+	case *OpenAICodexCreditSnapshot:
+		snapshot = value
+	case OpenAICodexCreditSnapshot:
+		snapshot = &value
+	case map[string]any:
+		snapshot = &OpenAICodexCreditSnapshot{
+			OpenAICodexCredits: OpenAICodexCredits{
+				HasCredits:          resolveAccountExtraBool(value, "has_credits"),
+				Unlimited:           resolveAccountExtraBool(value, "unlimited"),
+				OverageLimitReached: resolveAccountExtraBool(value, "overage_limit_reached"),
+				Balance:             firstStringValue(value, "balance"),
+			},
+			UpdatedAt: firstStringValue(value, "updated_at"),
+		}
+	default:
+		return false
+	}
+	if snapshot == nil || strings.TrimSpace(snapshot.UpdatedAt) == "" {
+		return false
+	}
+	updatedAt, err := parseTime(snapshot.UpdatedAt)
+	if err != nil || updatedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if snapshot.OverageLimitReached {
+		return false
+	}
+	if snapshot.Unlimited {
+		return true
+	}
+	if !snapshot.HasCredits {
+		return false
+	}
+	balance, err := strconv.ParseFloat(strings.TrimSpace(snapshot.Balance), 64)
+	return err == nil && balance > 0
+}
+
 func (a *Account) IsOpenAIChatGPTSubscription() bool {
 	if !a.IsOpenAIOAuth() {
 		return false
@@ -1458,6 +1522,37 @@ func (a *Account) GetOpenAISessionID() string {
 		return ""
 	}
 	return strings.TrimSpace(a.GetExtraString("openai_session_id"))
+}
+
+func (a *Account) Codex429GuardEnabled() bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark {
+		return false
+	}
+	if a.Extra == nil {
+		return true
+	}
+	raw, exists := a.Extra[OpenAICodex429GuardEnabledExtraKey]
+	if !exists || raw == nil {
+		return true
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		return err != nil || parsed
+	case json.Number:
+		parsed, err := strconv.ParseBool(value.String())
+		return err != nil || parsed
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case int64:
+		return value != 0
+	default:
+		return true
+	}
 }
 
 func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapability) bool {

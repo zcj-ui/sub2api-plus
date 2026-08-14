@@ -31,6 +31,8 @@ export default {
       dataImportHint: '上传导出的 JSON 文件以批量导入账号与代理。',
       dataImportWarning: '导入将创建新账号与代理，分组需手工绑定；请确认已有数据不会冲突。',
       dataImportFile: '数据文件',
+      codex429Guard: '卡429开关',
+      codex429GuardHint: '仅用于 OpenAI/Codex OAuth 账户；开启后会在普通请求历史末尾追加合成工具调用与配对响应，减少账户误判 429，CC/Claude 不受影响。',
       dataImportButton: '开始导入',
       dataImporting: '导入中...',
       dataImportSelectFile: '请选择数据文件',
@@ -176,7 +178,7 @@ export default {
         }
       },
       upstreamBilling: {
-        trustWarning: '此倍率由上游站点针对当前 API Key 自行声明。Sub2API 无法验证该值是否与实际扣费一致；上游站点或中间代理可能返回伪造、过期或被篡改的数据。请结合账单、余额变化和实际用量自行核验。',
+        trustWarning: '此倍率由上游站点针对当前 API Key 自行声明。Sub2API Plus 无法验证该值是否与实际扣费一致；上游站点或中间代理可能返回伪造、过期或被篡改的数据。请结合账单、余额变化和实际用量自行核验。',
         autoProbe: '自动探测上游声明倍率',
         autoProbeHint: '启用后按全局周期刷新上游声明倍率；此开关本身不会修改账号倍率。',
         syncRate: '同步上游声明倍率',
@@ -334,6 +336,8 @@ export default {
         active: '正常',
         inactive: '停用',
         error: '错误',
+        healthDead: '测活死亡',
+        healthDeadUnknown: '连续两次测活失败',
         cooldown: '冷却中',
         paused: '暂停',
         limited: '限流',
@@ -434,6 +438,8 @@ export default {
       openaiQuotaReset: {
         count: '次数',
         reset: '重置',
+        balanceReferenceHint: '美元金额为 Credit ÷ 25 的前端参考换算',
+        unlimitedBalance: '无限额',
         countTooltipLoad: '点击查询剩余重置次数',
         countTooltipRefresh: '点击刷新剩余重置次数',
         resetTooltipReady: '消耗 1 次重置次数以立即恢复当前窗口',
@@ -497,9 +503,43 @@ export default {
         resetStatus: '批量重置状态',
         refreshToken: '批量刷新令牌',
         probeUpstreamBilling: '探测上游倍率',
+        healthProbe: '批量测活',
+        inventory: '一键盘点',
         resetStatusSuccess: '已成功重置 {count} 个账号状态',
         refreshTokenSuccess: '已成功刷新 {count} 个账号令牌',
         partialSuccess: '操作部分完成：{success} 成功，{failed} 失败'
+      },
+      healthProbe: {
+        failurePool: '测活失败池（{count}）',
+        failurePoolHint: 'OAuth 已连续两次查询额度和重置次数失败；API Key 已连续两次真实连接测试失败。',
+        completed: '测活完成：{healthy} 个健康，{skipped} 个跳过',
+        completedWithFailures: '测活完成：{healthy} 个健康，{failed} 个死亡，{skipped} 个跳过',
+        batchLimit: '每次最多测活 200 个账号',
+        failed: '批量测活失败'
+      },
+      inventory: {
+        title: '所选账户一键盘点',
+        hint: '只盘点当前选中的账户。未设置代理的 OpenAI 账户保持直连；已设置代理但代理失效时失败关闭。API Key 账户只展示连接健康，不包含 ChatGPT 积分数据。',
+        account: '账户',
+        accountType: '平台 / 类型',
+        health: '健康状态',
+        healthy: '健康',
+        failed: '失败',
+        skipped: '跳过',
+        quotaFetched: '已获取额度',
+        credits: '积分',
+        resetCredits: '重置次数',
+        fiveHourUsage: '5 小时用量',
+        sevenDayUsage: '7 天用量',
+        reason: '失败 / 跳过原因',
+        unlimited: '无限额度',
+        noData: '暂无数据',
+        apiKeyNoQuota: '无 ChatGPT 积分数据',
+        empty: '暂无盘点结果',
+        completed: '盘点完成：健康 {healthy} 个，跳过 {skipped} 个，获取额度 {quota} 个',
+        completedWithFailures: '盘点完成：健康 {healthy} 个，失败 {failed} 个，跳过 {skipped} 个，获取额度 {quota} 个',
+        batchLimit: '每次最多盘点 200 个已选账户',
+        requestFailed: '所选账户盘点失败'
       },
       bulkEdit: {
         title: '批量编辑账号',
@@ -644,11 +684,11 @@ export default {
         codexCLIOnlyAppServer: '允许 Codex app-server 客户端',
         codexCLIOnlyAppServerDesc: '仅在上方开关开启时生效。开启后本账号额外放行内嵌 Codex 引擎、经 app-server 协议接入的第三方客户端（如 Claude Code 的 codex 插件），仍需通过全局引擎指纹门；与全局 app-server 开关取 OR（任一开即放行）。',
         codexFingerprintMode: 'Codex 指纹收敛',
-        codexFingerprintModeDesc: '多人共享同一 OAuth 账号时，将各用户的设备/会话标识收敛为账号级恒定值，减少上游可见的设备数和会话数。关闭时原样透传客户端标识。',
+        codexFingerprintModeDesc: '推荐模式让一个 OAuth 账号保持一台稳定设备，同时为每个对话派生独立且稳定的会话，并为每次请求生成新请求 ID。完全收敛才会让整个账号共用一个会话；关闭时原样透传客户端标识。',
         codexFingerprintOff: '关闭（透传）',
         codexFingerprintDevice: '仅设备',
-        codexFingerprintSession: '设备+会话（推荐）',
-        codexFingerprintFull: '完全收敛',
+        codexFingerprintSession: '一设备+每对话一会话（推荐）',
+        codexFingerprintFull: '完全收敛（一账号一会话）',
         codexImageTool: 'Codex 图片桥接策略',
         codexImageToolDesc:
           '统一控制 Codex /responses 文本请求的 hosted image_generation 桥接和客户端图片工具声明。hosted 工具自动注入仅适用于非 Responses Lite 请求；账号级策略优先于渠道和全局配置，不影响独立图片生成接口。',
@@ -708,8 +748,8 @@ export default {
         searchTestHint:
           '独立网页搜索探测（与网关 /v1/web_search 语义一致），不是带 tools 的自由对话。',
         ttsTextLabel: 'TTS 文本',
-        ttsTextPlaceholder: '例如：Hello from Sub2API connectivity test.',
-        ttsTextDefault: 'Hello from Sub2API account connectivity test.',
+        ttsTextPlaceholder: '例如：Hello from Sub2API Plus connectivity test.',
+        ttsTextDefault: 'Hello from Sub2API Plus account connectivity test.',
         ttsTestHint: '独立调用 /v1/tts（language=en）；成功时显示音频字节数。',
         sttTestHint: '独立调用 /v1/stt，使用合成静音 WAV；成功表示接口可达。',
         realtimeTestHint:
@@ -933,7 +973,8 @@ export default {
       affinityBufferInfinite: '不限制',
       expired: '已过期',
       proxy: '代理',
-      noProxy: '无代理',
+    noProxy: '无代理',
+    configuredProxyUnavailable: '已配置代理 #{id}（当前不可用或未加载）',
       concurrency: '并发数',
       loadFactor: '负载因子',
       loadFactorHint: '提高负载因子可以提高对账号的调度频率',
@@ -952,6 +993,12 @@ export default {
       allowOverages: '允许超量请求 (AI Credits)',
       allowOveragesTooltip:
         '仅在免费配额被明确判定为耗尽后才会使用 AI Credits。普通并发 429 限流不会切换到超量请求。',
+      allowOveragesConfirm:
+        '确认开启 AI Credits 超额请求？这会在免费配额耗尽后消耗付费积分，可能产生额外费用；只有确认后才会保存。',
+      allowOveragesProConfirm:
+        '这是 Google AI Pro 账号。确认开启超额请求？免费配额耗尽后将继续消耗 AI Credits，可能产生额外费用或耗尽余额；请先确认代理、预算和备份策略。',
+      allowOveragesImportConfirm:
+        '导入数据中包含已开启付费 AI Credits 超额的 Antigravity 账号。确认同时导入这些付费消费设置吗？',
       creating: '创建中...',
       updating: '更新中...',
       accountCreated: '账号创建成功',

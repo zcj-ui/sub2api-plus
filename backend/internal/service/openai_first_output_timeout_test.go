@@ -72,7 +72,7 @@ func TestOpenAIForwardFirstOutputTimeoutIncludesResponseHeaderWait(t *testing.T)
 	}
 
 	started := time.Now()
-	_, err := svc.Forward(context.Background(), c, account, body)
+	_, err := svc.Forward(context.Background(), c, openAITestAccountWithProxy(account), body)
 
 	require.Error(t, err)
 	var failoverErr *UpstreamFailoverError

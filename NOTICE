@@ -1,0 +1,34 @@
+Sub2API Plus modified distribution notices
+
+This repository is a modified distribution derived from Sub2API:
+https://github.com/Wei-Shaw/sub2api
+
+Current distribution:
+https://github.com/zcj-ui/sub2api-plus
+
+The upstream project is licensed under the GNU Lesser General Public License
+version 3.0 or later. The full license text is included in the LICENSE file.
+The original copyright notice is:
+
+Copyright (c) 2026 Wesley Liddick
+
+Changes in this repository are copyright their respective contributors and are
+distributed under the same LGPL-3.0-or-later terms. Git history and release
+notes identify the modified files and changes.
+
+This modified distribution is not an official release of the upstream project
+and does not imply endorsement by the upstream authors.
+
+Operational notice:
+
+The current 0.2.x series is a technical preview for development, compatibility
+testing, and isolated acceptance. A release artifact, container image, version
+tag, successful build, or passing test suite is not a production certification,
+security warranty, service-level commitment, or endorsement by an upstream
+provider. Do not use this series directly for production workloads, paid users,
+irreplaceable data, or high-value credentials. Read DISCLAIMER.md before use.
+
+This operational notice describes project maturity and does not modify, narrow,
+or add conditions to the LGPL-3.0-or-later license. Third-party deployments,
+services, account usage, proxy providers, billing decisions, and data processing
+remain the responsibility of their respective operators.

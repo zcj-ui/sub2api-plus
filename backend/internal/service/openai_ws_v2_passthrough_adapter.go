@@ -674,6 +674,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
+	if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(firstClientMessage) {
+		withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(firstClientMessage)
+		if appendErr != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
+		}
+		if appended {
+			firstClientMessage = withContextPair
+		}
+	}
 	if account.IsOpenAIOAuth() && isOpenAIResponsesLiteWebSocketPayload(firstClientMessage) {
 		liteFirstMessage, _, liteErr := normalizeOpenAIResponsesLiteToolsPayload(firstClientMessage)
 		if liteErr != nil {
@@ -752,6 +761,20 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
 	}
 	firstClientMessage = updatedFirst
+	var codexFPIDs *codexFingerprintIDs
+	if account.IsOpenAIOAuth() {
+		var clientHeaders http.Header
+		if c != nil && c.Request != nil {
+			clientHeaders = c.Request.Header
+		}
+		codexFPIDs = resolveCodexFingerprintIDsForRequest(account, clientHeaders, firstClientMessage, getAPIKeyIDFromContext(c))
+		if nextMessage, changed := applyCodexFingerprintToBodyBytes(firstClientMessage, codexFPIDs); changed {
+			firstClientMessage = nextMessage
+		}
+		if c != nil && codexFPIDs != nil {
+			c.Set(codexFingerprintIDsContextKey, codexFPIDs)
+		}
+	}
 
 	// 在 policy filter 之后再提取 service_tier / reasoning_effort 用于
 	// usage 上报：filter
@@ -773,6 +796,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if err != nil {
 		return fmt.Errorf("build ws url: %w", err)
 	}
+	proxyURL, proxyErr := resolveRequiredOpenAIProxyURL(account)
+	if proxyErr != nil {
+		return fmt.Errorf("resolve upstream proxy: %w", proxyErr)
+	}
 	wsHost := "-"
 	wsPath := "-"
 	if parsedURL, parseErr := url.Parse(wsURL); parseErr == nil && parsedURL != nil {
@@ -784,7 +811,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		account.ID,
 		wsHost,
 		wsPath,
-		account.ProxyID != nil && account.Proxy != nil,
+		proxyURL != "",
 	)
 
 	isCodexCLI := false
@@ -816,11 +843,6 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if buildHdrErr != nil {
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
-
 	dialer := s.getOpenAIWSPassthroughDialer()
 	if dialer == nil {
 		return errors.New("openai ws passthrough dialer is nil")
@@ -954,17 +976,26 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				}()
 			}
 			if isResponseCreate {
+				if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
+					if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+						payload = capped
+					}
+				}
+				if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(payload) {
+					withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(payload)
+					if appendErr != nil {
+						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
+					}
+					if appended {
+						payload = withContextPair
+					}
+				}
 				if account.IsOpenAIOAuth() && isOpenAIResponsesLiteWebSocketPayload(payload) {
 					litePayload, _, liteErr := normalizeOpenAIResponsesLiteToolsPayload(payload)
 					if liteErr != nil {
 						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
 					}
 					payload = litePayload
-				}
-				if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-					if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
-						payload = capped
-					}
 				}
 			}
 			turnNo := int(completedTurns.Load()) + 1
@@ -1019,6 +1050,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				payload = s.ReplaceModelInBody(payload, model)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
+			if policyErr == nil && blocked == nil && isResponseCreate && codexFPIDs != nil {
+				if nextPayload, changed := applyCodexFingerprintToBodyBytes(out, nextCodexFingerprintTurn(codexFPIDs)); changed {
+					out = nextPayload
+				}
+			}
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
 			// filter 处理后的 payload，与首帧 policy-after-extract 语义

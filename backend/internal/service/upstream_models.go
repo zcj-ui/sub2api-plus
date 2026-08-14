@@ -81,7 +81,7 @@ func (s *AccountTestService) FetchUpstreamSupportedModels(ctx context.Context, a
 		return nil, newUpstreamModelSyncConfigError("Account is required", nil)
 	}
 
-	if account.Platform == PlatformAntigravity && account.Type != AccountTypeAPIKey {
+	if account.Platform == PlatformAntigravity && account.Type == AccountTypeOAuth {
 		return s.fetchAntigravityOAuthUpstreamModels(ctx, account)
 	}
 
@@ -94,7 +94,10 @@ func (s *AccountTestService) FetchUpstreamSupportedModels(ctx context.Context, a
 		return nil, err
 	}
 
-	proxyURL := upstreamModelsProxyURL(account)
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, newUpstreamModelSyncConfigError("Configured proxy is unavailable", proxyErr)
+	}
 	resp, err := s.doUpstreamModelsRequest(req, proxyURL, account)
 	if err != nil {
 		return nil, newUpstreamModelSyncUpstreamError("Failed to request upstream model list", err)
@@ -302,6 +305,12 @@ func (s *AccountTestService) buildAnthropicUpstreamModelsRequest(ctx context.Con
 }
 
 func (s *AccountTestService) buildAntigravityAPIKeyModelsRequest(ctx context.Context, account *Account) (*http.Request, error) {
+	if account == nil {
+		return nil, newUpstreamModelSyncConfigError("Account is required", nil)
+	}
+	if account.Type == AccountTypeUpstream {
+		return s.buildAntigravityUpstreamModelsRequest(ctx, account)
+	}
 	if account.Type != AccountTypeAPIKey {
 		return nil, newUpstreamModelSyncUnsupportedError(
 			fmt.Sprintf("Unsupported Antigravity account type for upstream model sync: %s", account.Type), nil,
@@ -338,6 +347,34 @@ func (s *AccountTestService) buildAntigravityAPIKeyModelsRequest(ctx context.Con
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("anthropic-beta", claude.APIKeyBetaHeader)
 	req.Header.Set("x-api-key", apiKey)
+	return req, nil
+}
+
+// buildAntigravityUpstreamModelsRequest targets a generic Anthropic-compatible
+// relay, including New API. Unlike native Antigravity API-key accounts it does
+// not append /antigravity and accepts root, /v1, or /v1/models base URLs.
+func (s *AccountTestService) buildAntigravityUpstreamModelsRequest(ctx context.Context, account *Account) (*http.Request, error) {
+	apiKey := strings.TrimSpace(account.GetCredential("api_key"))
+	if apiKey == "" {
+		return nil, newUpstreamModelSyncConfigError("No upstream API key is available", nil)
+	}
+	baseURL := strings.TrimSpace(account.GetCredential("base_url"))
+	if baseURL == "" {
+		return nil, newUpstreamModelSyncConfigError("Upstream base URL is required for model sync", nil)
+	}
+	normalizedBaseURL, err := s.validateUpstreamBaseURL(baseURL)
+	if err != nil {
+		return nil, newUpstreamModelSyncConfigError("Invalid upstream base URL", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, buildAnthropicRelayEndpointURL(normalizedBaseURL, "/v1/models"), nil)
+	if err != nil {
+		return nil, newUpstreamModelSyncConfigError("Invalid upstream model list URL", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("x-api-key", apiKey)
+	account.ApplyHeaderOverrides(req.Header)
 	return req, nil
 }
 

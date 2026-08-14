@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -37,11 +38,22 @@ func buildGeminiAIStudioModelActionURL(baseURL, model, action string, stream boo
 		return "", fmt.Errorf("unsupported gemini action: %s", trimmedAction)
 	}
 
-	fullURL := fmt.Sprintf("%s/v1beta/models/%s:%s", trimmedBase, trimmedModel, trimmedAction)
-	if stream {
-		fullURL += "?alt=sse"
+	parsed, err := url.Parse(trimmedBase)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", errors.New("gemini base url must be an absolute URL")
 	}
-	return fullURL, nil
+	path := strings.TrimRight(parsed.Path, "/")
+	if strings.HasSuffix(strings.ToLower(path), "/v1beta") {
+		path = strings.TrimSuffix(path, "/v1beta")
+	}
+	parsed.Path = path + "/v1beta/models/" + trimmedModel + ":" + trimmedAction
+	parsed.RawPath = ""
+	if stream {
+		query := parsed.Query()
+		query.Set("alt", "sse")
+		parsed.RawQuery = query.Encode()
+	}
+	return parsed.String(), nil
 }
 
 // IsSafeGeminiModelPathSegment 供 handler 层在解析出 URL 里的模型名后立刻校验，

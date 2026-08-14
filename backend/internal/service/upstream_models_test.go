@@ -245,6 +245,20 @@ func TestBuildUpstreamModelsRequestsForAPIKeyAccounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "https://gateway.example.com/antigravity/v1/models", antigravityReq.URL.String())
 	require.Equal(t, "antigravity-key", antigravityReq.Header.Get("x-api-key"))
+
+	antigravityUpstreamReq, err := svc.buildUpstreamModelsRequest(ctx, &Account{
+		Platform: PlatformAntigravity,
+		Type:     AccountTypeUpstream,
+		Credentials: map[string]any{
+			"api_key":  "relay-key",
+			"base_url": "https://relay.example.com/prefix/v1",
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "https://relay.example.com/prefix/v1/models", antigravityUpstreamReq.URL.String())
+	require.Equal(t, "Bearer relay-key", antigravityUpstreamReq.Header.Get("Authorization"))
+	require.Equal(t, "relay-key", antigravityUpstreamReq.Header.Get("x-api-key"))
+	require.Equal(t, "2023-06-01", antigravityUpstreamReq.Header.Get("anthropic-version"))
 }
 
 func TestBuildUpstreamModelsRequestSupportsGrokOAuth(t *testing.T) {

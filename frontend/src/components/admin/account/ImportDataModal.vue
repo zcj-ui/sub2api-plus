@@ -52,6 +52,20 @@
       </div>
 
       <div
+        class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 dark:border-dark-700 dark:bg-dark-800"
+      >
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-gray-800 dark:text-dark-100">
+            {{ t('admin.accounts.codex429Guard') }}
+          </div>
+          <div class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">
+            {{ t('admin.accounts.codex429GuardHint') }}
+          </div>
+        </div>
+        <Toggle v-model="codex429GuardEnabled" data-test="codex-429-guard-toggle" />
+      </div>
+
+      <div
         v-if="result"
         class="space-y-2 rounded-xl border border-gray-200 p-4 dark:border-dark-700"
       >
@@ -99,8 +113,10 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
+import Toggle from '@/components/common/Toggle.vue'
 import { adminAPI } from '@/api/admin'
 import { useAppStore } from '@/stores/app'
+import { isAntigravityProTier } from '@/utils/antigravityOverages'
 import type { AdminDataImportResult, AdminDataPayload } from '@/types'
 
 interface Props {
@@ -124,6 +140,7 @@ const dragDepth = ref(0)
 const dragActive = computed(() => dragDepth.value > 0)
 const hasCreatedData = ref(false)
 const result = ref<AdminDataImportResult | null>(null)
+const codex429GuardEnabled = ref(true)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFilesLabel = computed(() => {
@@ -143,6 +160,7 @@ watch(
       dragDepth.value = 0
       hasCreatedData.value = false
       result.value = null
+      codex429GuardEnabled.value = true
       if (fileInput.value) {
         fileInput.value.value = ''
       }
@@ -226,6 +244,8 @@ const readFileAsText = async (sourceFile: File): Promise<string> => {
 
 const SUPPORTED_DATA_TYPES = ['sub2api-data', 'sub2api-bundle']
 const SUPPORTED_DATA_VERSION = 1
+const SUPPORTED_ACCOUNT_PLATFORMS = new Set(['anthropic', 'openai', 'gemini', 'antigravity', 'grok'])
+const SUPPORTED_ACCOUNT_TYPES = new Set(['oauth', 'setup-token', 'apikey', 'upstream', 'bedrock', 'service_account'])
 
 // 与后端 validateDataHeader 对齐:合并前逐文件校验,避免坏文件混入合并 payload 后
 // 报错无法定位来源,或绕过后端本会对单文件做的 type/version 检查。
@@ -246,7 +266,25 @@ const isValidDataPayload = (payload: unknown): payload is AdminDataPayload => {
   ) {
     return false
   }
-  return Array.isArray(candidate.proxies) && Array.isArray(candidate.accounts)
+  if (!Array.isArray(candidate.proxies) || !Array.isArray(candidate.accounts)) return false
+  return candidate.accounts.every((rawAccount) => {
+    if (!rawAccount || typeof rawAccount !== 'object' || Array.isArray(rawAccount)) return false
+    const account = rawAccount as Record<string, unknown>
+    if (!SUPPORTED_ACCOUNT_PLATFORMS.has(account.platform as string)) return false
+    if (!SUPPORTED_ACCOUNT_TYPES.has(account.type as string)) return false
+    if (!account.credentials || typeof account.credentials !== 'object' || Array.isArray(account.credentials)) return false
+    const extra = account.extra
+    if (extra === undefined) return true
+    if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return false
+    const allowOverages = (extra as Record<string, unknown>).allow_overages
+    if (allowOverages !== undefined && typeof allowOverages !== 'boolean') return false
+    return allowOverages !== true || account.platform === 'antigravity'
+  })
+}
+
+const importAccountUsesProOverages = (account: AdminDataPayload['accounts'][number]) => {
+  if (account.platform !== 'antigravity' || account.extra?.allow_overages !== true) return false
+  return isAntigravityProTier(account.credentials, account.extra)
 }
 
 const mergeDataPayloads = (payloads: AdminDataPayload[]): AdminDataPayload => {
@@ -292,10 +330,22 @@ const handleImport = async () => {
       dataPayloads.push(parsed)
     }
     const dataPayload = mergeDataPayloads(dataPayloads)
+    const importsOverages = dataPayload.accounts.some(
+      (account) => account.platform === 'antigravity' && account.extra?.allow_overages === true
+    )
+    const importsProOverages = dataPayload.accounts.some(importAccountUsesProOverages)
+    const overagesWarningKey = importsProOverages
+      ? 'admin.accounts.allowOveragesProConfirm'
+      : 'admin.accounts.allowOveragesImportConfirm'
+    if (importsOverages && !window.confirm(t(overagesWarningKey))) {
+      return
+    }
 
     const res = await adminAPI.accounts.importData({
       data: dataPayload,
-      skip_default_group_bind: true
+      skip_default_group_bind: true,
+      codex_429_guard_enabled: codex429GuardEnabled.value,
+      confirm_overages_risk: importsOverages
     })
 
     result.value = res

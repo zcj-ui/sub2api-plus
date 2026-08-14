@@ -86,7 +86,7 @@ export async function getByPlatform(platform: GroupPlatform): Promise<AdminGroup
   return getAll(platform)
 }
 
-/** 获取当前 Sub2API 服务端的 Live 运行环境能力。 */
+/** 获取当前 Sub2API Plus 服务端的 Live 运行环境能力。 */
 export async function getLiveCapability(): Promise<LiveCapability> {
   const { data } = await apiClient.get<LiveCapability>('/admin/groups/live-capability')
   return data

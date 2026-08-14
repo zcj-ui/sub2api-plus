@@ -108,6 +108,30 @@ func TestResolveConvergedThreadID_EmptySession(t *testing.T) {
 	assert.Equal(t, "", resolveConvergedThreadID(account, ""))
 }
 
+func TestResolveCodexConversationSessionID_PerConversation(t *testing.T) {
+	account := newTestOAuthAccount(1, nil)
+	a := resolveCodexConversationSessionID(account, "session-aaa")
+	b := resolveCodexConversationSessionID(account, "session-bbb")
+	require.NotEqual(t, a, b)
+	require.Equal(t, a, resolveCodexConversationSessionID(account, "session-aaa"))
+}
+
+func TestResolveCodexFingerprintIDsForRequest_UsesStableBodyAnchor(t *testing.T) {
+	account := newTestOAuthAccount(1, nil)
+	round1 := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]}]}`)
+	round2 := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"follow up"}]}]}`)
+	other := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"different opener"}]}]}`)
+
+	ids1 := resolveCodexFingerprintIDsForRequest(account, nil, round1, 17)
+	ids2 := resolveCodexFingerprintIDsForRequest(account, nil, round2, 17)
+	idsOther := resolveCodexFingerprintIDsForRequest(account, nil, other, 17)
+	require.NotNil(t, ids1)
+	require.Equal(t, ids1.installationID, ids2.installationID)
+	require.Equal(t, ids1.sessionID, ids2.sessionID)
+	require.Equal(t, ids1.threadID, ids2.threadID)
+	require.NotEqual(t, ids1.sessionID, idsOther.sessionID)
+}
+
 // --- off 模式：resolveCodexFingerprintIDsFromRequest 返回 nil ---
 
 func TestResolveCodexFingerprintIDsFromRequest_ExplicitOff(t *testing.T) {
@@ -184,14 +208,18 @@ func TestApplyCodexFingerprintHeaders_SessionMode(t *testing.T) {
 	applyCodexFingerprintHeaders(h, ids)
 
 	convergedInstall := resolveConvergedInstallationID(account)
-	convergedSession := resolveConvergedSessionID(account)
+	convergedSession := resolveCodexConversationSessionID(account, "client-session-aaa")
 	convergedThread := resolveConvergedThreadID(account, "client-session-aaa")
 
 	assert.Equal(t, convergedInstall, h.Get("x-codex-installation-id"))
 	assert.Equal(t, convergedSession, h.Get("session-id"))
 	assert.Equal(t, convergedSession, h.Get("session_id"), "下划线形式也应被改写")
 	assert.Equal(t, convergedThread, h.Get("thread-id"))
-	assert.Equal(t, convergedThread, h.Get("x-client-request-id"))
+	requestID := h.Get("x-client-request-id")
+	require.NotEmpty(t, requestID)
+	_, err := uuid.Parse(requestID)
+	require.NoError(t, err, "x-client-request-id 应为每次请求生成的 UUID")
+	assert.NotEqual(t, convergedThread, requestID)
 	assert.Equal(t, convergedThread+":0", h.Get("x-codex-window-id"))
 
 	var meta map[string]any
@@ -229,10 +257,36 @@ func TestApplyCodexFingerprintHeaders_SessionMode_DifferentClients(t *testing.T)
 	hB.Set("x-codex-turn-metadata", makeTurnMeta())
 	applyCodexFingerprintHeaders(hB, idsB)
 
-	assert.Equal(t, hA.Get("session-id"), hB.Get("session-id"), "session_id 应相同")
+	assert.NotEqual(t, hA.Get("session-id"), hB.Get("session-id"), "不同客户端会话的 session_id 应隔离")
 	assert.NotEqual(t, hA.Get("thread-id"), hB.Get("thread-id"), "不同客户端 thread_id 应不同")
 	assert.NotEqual(t, hA.Get("x-codex-window-id"), hB.Get("x-codex-window-id"), "不同客户端 window_id 应不同")
 	assert.Equal(t, hA.Get("x-codex-installation-id"), hB.Get("x-codex-installation-id"))
+}
+
+func TestApplyCodexFingerprintHeaders_RequestIDChangesPerAttempt(t *testing.T) {
+	account := newTestOAuthAccount(1, nil)
+	clientHeaders := http.Header{"session-id": []string{"client-session"}}
+	ids := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
+	h1 := http.Header{}
+	h2 := http.Header{}
+	applyCodexFingerprintHeaders(h1, ids)
+	applyCodexFingerprintHeaders(h2, ids)
+	require.NotEmpty(t, h1.Get("x-client-request-id"))
+	require.NotEmpty(t, h2.Get("x-client-request-id"))
+	require.NotEqual(t, h1.Get("x-client-request-id"), h2.Get("x-client-request-id"))
+	require.Equal(t, h1.Get("session-id"), h2.Get("session-id"))
+}
+
+func TestNextCodexFingerprintTurn_PreservesConversationAndRotatesTurn(t *testing.T) {
+	account := newTestOAuthAccount(1, nil)
+	ids := resolveCodexFingerprintIDs(account, "client-session", codexFingerprintSession)
+	next := nextCodexFingerprintTurn(ids)
+	require.NotNil(t, next)
+	require.Equal(t, ids.installationID, next.installationID)
+	require.Equal(t, ids.sessionID, next.sessionID)
+	require.Equal(t, ids.threadID, next.threadID)
+	require.Equal(t, ids.windowID, next.windowID)
+	require.NotEqual(t, ids.turnID, next.turnID)
 }
 
 // --- full 模式 ---
@@ -385,7 +439,7 @@ func TestApplyCodexFingerprintClientMetadata_SessionMode(t *testing.T) {
 	cm, ok := reqBody["client_metadata"].(map[string]any)
 	require.True(t, ok)
 	convergedInstall := resolveConvergedInstallationID(account)
-	convergedSession := resolveConvergedSessionID(account)
+	convergedSession := resolveCodexConversationSessionID(account, "client-session-aaa")
 	convergedThread := resolveConvergedThreadID(account, "client-session-aaa")
 
 	assert.Equal(t, convergedInstall, cm["x-codex-installation-id"])

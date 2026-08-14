@@ -13,7 +13,7 @@ import (
 )
 
 func newResponsesProbeAccount(id int64) Account {
-	return Account{
+	return *openAITestAccountWithProxy(&Account{
 		ID:          id,
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeAPIKey,
@@ -23,7 +23,7 @@ func newResponsesProbeAccount(id int64) Account {
 			"api_key":  "sk-test",
 			"base_url": "https://compat-upstream.example/v1",
 		},
-	}
+	})
 }
 
 // runResponsesProbe 跑一次探测，返回落库的 extra 更新；未落库时返回 nil。

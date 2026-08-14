@@ -61,7 +61,7 @@ func (s *GatewayService) ForwardAsChatCompletions(
 
 	// 4. Model mapping
 	mappedModel := originalModel
-	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount {
+	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount || account.Type == AccountTypeUpstream {
 		mappedModel = account.GetMappedModel(originalModel)
 	}
 	if mappedModel == originalModel && account.Platform == PlatformAnthropic && account.Type == AccountTypeServiceAccount {
@@ -111,10 +111,11 @@ func (s *GatewayService) ForwardAsChatCompletions(
 		return nil, fmt.Errorf("get access token: %w", err)
 	}
 
-	// 9. Get proxy URL
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	// 9. Resolve proxy URL. OpenAI accounts fail closed when a selected proxy
+	// is no longer hydrated; other platforms retain their existing routing.
+	proxyURL, proxyErr := resolveOpenAIAccountProxyURL(account)
+	if proxyErr != nil {
+		return nil, fmt.Errorf("resolve upstream proxy: %w", proxyErr)
 	}
 
 	// 10. Build upstream request

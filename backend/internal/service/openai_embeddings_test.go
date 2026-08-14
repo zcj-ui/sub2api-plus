@@ -71,7 +71,7 @@ func TestForwardEmbeddings_APIKeyPassthroughRecordsUsageAndBatchInput(t *testing
 		cfg:          &config.Config{},
 		httpUpstream: upstream,
 	}
-	account := &Account{
+	account := openAITestAccountWithProxy(&Account{
 		ID:       42,
 		Platform: PlatformOpenAI,
 		Type:     AccountTypeAPIKey,
@@ -82,9 +82,9 @@ func TestForwardEmbeddings_APIKeyPassthroughRecordsUsageAndBatchInput(t *testing
 				"nowledge-embedding": "jina-embeddings-v5-text-small",
 			},
 		},
-	}
+	})
 
-	result, err := svc.ForwardEmbeddings(context.Background(), c, account, reqBody, "")
+	result, err := svc.ForwardEmbeddings(context.Background(), c, openAITestAccountWithProxy(account), reqBody, "")
 
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, rec.Code)

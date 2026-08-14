@@ -180,10 +180,14 @@
           :total-results="pagination.total"
           :selecting-all="selectingAllResults"
           :all-results-selected="allResultsSelected"
+          :health-probe-running="healthProbeRunning"
+          :inventory-running="inventoryRunning"
           @delete="handleBulkDelete"
           @reset-status="handleBulkResetStatus"
           @refresh-token="handleBulkRefreshToken"
           @probe-upstream-billing="handleBulkProbeUpstreamBilling"
+          @health-probe="handleBulkHealthProbe"
+          @inventory="handleBulkInventory"
           @edit-selected="openBulkEditSelected"
           @edit-filtered="openBulkEditFiltered"
           @clear="clearSelection"
@@ -191,6 +195,32 @@
           @select-all-results="handleSelectAllResults"
           @toggle-schedulable="handleBulkToggleSchedulable"
         />
+        <div
+          v-if="healthProbeFailurePool.length > 0"
+          class="mb-3 border-y border-red-200 bg-red-50 px-4 py-3 dark:border-red-900/50 dark:bg-red-950/20"
+          data-testid="account-health-failure-pool"
+        >
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <div class="text-sm font-semibold text-red-800 dark:text-red-300">
+                {{ t('admin.accounts.healthProbe.failurePool', { count: healthProbeFailurePool.length }) }}
+              </div>
+              <div class="mt-0.5 text-xs text-red-700/80 dark:text-red-300/80">
+                {{ t('admin.accounts.healthProbe.failurePoolHint') }}
+              </div>
+            </div>
+            <button class="btn btn-secondary btn-sm" @click="healthProbeFailurePool = []">
+              {{ t('common.close') }}
+            </button>
+          </div>
+          <div class="mt-3 divide-y divide-red-200 dark:divide-red-900/50">
+            <div v-for="item in healthProbeFailurePool" :key="item.account_id" class="grid gap-1 py-2 text-xs sm:grid-cols-[minmax(180px,1fr)_120px_2fr]">
+              <span class="font-medium text-gray-900 dark:text-white">{{ item.name || `#${item.account_id}` }}</span>
+              <span class="text-gray-600 dark:text-gray-300">{{ item.type === 'oauth' ? 'OAuth' : 'API Key' }}</span>
+              <span class="break-words text-red-700 dark:text-red-300">{{ item.reason }}</span>
+            </div>
+          </div>
+        </div>
         <div ref="accountTableRef" class="flex min-h-0 flex-1 flex-col overflow-hidden">
         <DataTable
           ref="dataTableRef"
@@ -462,8 +492,8 @@
     <BulkEditAccountModal
       :show="showBulkEdit"
       :account-ids="selIds"
-      :selected-platforms="selPlatforms"
-      :selected-types="selTypes"
+      :selected-platforms="bulkEditTarget?.selectedPlatforms ?? []"
+      :selected-types="bulkEditTarget?.selectedTypes ?? []"
       :target="bulkEditTarget ?? undefined"
       :proxies="proxies"
       :groups="groups"
@@ -480,6 +510,11 @@
       </label>
     </ConfirmDialog>
     <ErrorPassthroughRulesModal :show="showErrorPassthrough" @close="showErrorPassthrough = false" />
+    <AccountInventoryModal
+      :show="showInventory"
+      :response="inventoryResponse"
+      @close="showInventory = false"
+    />
     <TLSFingerprintProfilesModal :show="showTLSFingerprintProfiles" @close="showTLSFingerprintProfiles = false" />
     <TotpStepUpDialog :controller="accountExportStepUp" />
   </AppLayout>
@@ -507,6 +542,7 @@ import { CreateAccountModal, EditAccountModal, BulkEditAccountModal, SyncFromCrs
 import AccountTableActions from '@/components/admin/account/AccountTableActions.vue'
 import AccountTableFilters from '@/components/admin/account/AccountTableFilters.vue'
 import AccountBulkActionsBar from '@/components/admin/account/AccountBulkActionsBar.vue'
+import AccountInventoryModal from '@/components/admin/account/AccountInventoryModal.vue'
 import AccountActionMenu from '@/components/admin/account/AccountActionMenu.vue'
 import ImportDataModal from '@/components/admin/account/ImportDataModal.vue'
 import ReAuthAccountModal from '@/components/admin/account/ReAuthAccountModal.vue'
@@ -524,7 +560,7 @@ import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import Icon from '@/components/icons/Icon.vue'
 import ErrorPassthroughRulesModal from '@/components/admin/ErrorPassthroughRulesModal.vue'
 import TLSFingerprintProfilesModal from '@/components/admin/TLSFingerprintProfilesModal.vue'
-import { fetchAllAccountIds } from '@/utils/accountSelection'
+import { fetchAccountSelectionMetadata, fetchAllAccountIds } from '@/utils/accountSelection'
 import { buildGrokUsageRefreshKey, buildOpenAIUsageRefreshKey } from '@/utils/accountUsageRefresh'
 import { formatDateTime, formatRelativeTime } from '@/utils/format'
 import { proxyExpiryBadgeClass, proxyExpiryLabelKey } from '@/utils/proxyExpiry'
@@ -532,6 +568,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
+import type { AccountHealthProbeResult, BatchAccountInventoryResponse } from '@/api/admin/accounts'
 import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
@@ -565,22 +602,6 @@ type AccountBulkEditTarget =
       selectedPlatforms: AccountPlatform[]
       selectedTypes: AccountType[]
     }
-const selPlatforms = computed<AccountPlatform[]>(() => {
-  const platforms = new Set(
-    accounts.value
-      .filter(a => isSelected(a.id))
-      .map(a => a.platform)
-  )
-  return [...platforms]
-})
-const selTypes = computed<AccountType[]>(() => {
-  const types = new Set(
-    accounts.value
-      .filter(a => isSelected(a.id))
-      .map(a => a.type)
-  )
-  return [...types]
-})
 const showCreate = ref(false)
 const showEdit = ref(false)
 const showSync = ref(false)
@@ -589,6 +610,7 @@ const showExportDataDialog = ref(false)
 const includeProxyOnExport = ref(true)
 const showBulkEdit = ref(false)
 const bulkEditTarget = ref<AccountBulkEditTarget | null>(null)
+const openingBulkEdit = ref(false)
 const showTempUnsched = ref(false)
 const showDeleteDialog = ref(false)
 const showCreateShadowDialog = ref(false)
@@ -611,6 +633,11 @@ const togglingSchedulable = ref<number | null>(null)
 const menu = reactive<{show:boolean, acc:Account|null, pos:{top:number, left:number}|null}>({ show: false, acc: null, pos: null })
 const exportingData = ref(false)
 const probingUpstreamBilling = reactive(new Set<number>())
+const healthProbeFailurePool = ref<AccountHealthProbeResult[]>([])
+const healthProbeRunning = ref(false)
+const inventoryRunning = ref(false)
+const showInventory = ref(false)
+const inventoryResponse = ref<BatchAccountInventoryResponse | null>(null)
 const upstreamBillingProbeGloballyEnabled = ref<boolean | undefined>(undefined)
 const upstreamBillingNow = ref(Date.now())
 let lastUpstreamBillingSortRefreshMinute = -1
@@ -1253,6 +1280,29 @@ watch(accounts, (rows) => {
   usageBatchRequestTokenByAccountId.value = Object.fromEntries(
     Object.entries(usageBatchRequestTokenByAccountId.value).filter(([key]) => visibleIDs.has(key))
   )
+
+  const persistedFailures = new Map(healthProbeFailurePool.value.map((item) => [item.account_id, item]))
+  rows.forEach((account) => {
+    const snapshot = account.extra?.account_health_probe
+    if (snapshot?.status !== 'failed') {
+      persistedFailures.delete(account.id)
+      return
+    }
+    persistedFailures.set(account.id, {
+      account_id: account.id,
+      name: account.name,
+      platform: account.platform,
+      type: account.type,
+      healthy: false,
+      dead: true,
+      attempts: snapshot.attempts,
+      mode: snapshot.mode,
+      reason: snapshot.reason,
+      health_persisted: true,
+      snapshot
+    })
+  })
+  healthProbeFailurePool.value = [...persistedFailures.values()].sort((a, b) => a.account_id - b.account_id)
 })
 
 watch(upstreamBillingNow, () => {
@@ -1276,6 +1326,7 @@ const isAnyModalOpen = computed(() => {
     showStats.value ||
     showSchedulePanel.value ||
     showErrorPassthrough.value ||
+    showInventory.value ||
     showTLSFingerprintProfiles.value
   )
 })
@@ -1872,6 +1923,127 @@ const handleBulkProbeUpstreamBilling = async () => {
     accountIDs.forEach(id => probingUpstreamBilling.delete(id))
   }
 }
+const mergeHealthProbeFailurePool = (results: AccountHealthProbeResult[]) => {
+  const failurePool = new Map(healthProbeFailurePool.value.map(item => [item.account_id, item]))
+  results.forEach(item => {
+    if (item.dead) failurePool.set(item.account_id, item)
+    else if (item.healthy) failurePool.delete(item.account_id)
+  })
+  healthProbeFailurePool.value = [...failurePool.values()].sort((a, b) => a.account_id - b.account_id)
+}
+const loadGlobalHealthProbeFailures = async () => {
+  const loader = adminAPI.accounts.listHealthProbeFailures
+  if (typeof loader !== 'function') return
+  try {
+    healthProbeFailurePool.value = (await loader()).sort((a, b) => a.account_id - b.account_id)
+  } catch (error) {
+    console.error('Failed to load account health failure pool:', error)
+  }
+}
+const ACCOUNT_PROBE_BATCH_SIZE = 200
+const chunkAccountIDs = (accountIDs: number[]) => {
+  const chunks: number[][] = []
+  for (let offset = 0; offset < accountIDs.length; offset += ACCOUNT_PROBE_BATCH_SIZE) {
+    chunks.push(accountIDs.slice(offset, offset + ACCOUNT_PROBE_BATCH_SIZE))
+  }
+  return chunks
+}
+const handleBulkHealthProbe = async () => {
+  const accountIDs = [...selIds.value]
+  if (accountIDs.length === 0 || healthProbeRunning.value || inventoryRunning.value) return
+  healthProbeRunning.value = true
+  let completed = false
+  try {
+    const result = { results: [] as AccountHealthProbeResult[], healthy: 0, failed: 0, skipped: 0 }
+    for (const batch of chunkAccountIDs(accountIDs)) {
+      const batchResult = await adminAPI.accounts.batchHealthProbe(batch)
+      result.results.push(...batchResult.results)
+      result.healthy += batchResult.healthy
+      result.failed += batchResult.failed
+      result.skipped += batchResult.skipped
+    }
+    mergeHealthProbeFailurePool(result.results)
+    if (result.failed > 0) {
+      appStore.showError(t('admin.accounts.healthProbe.completedWithFailures', {
+        healthy: result.healthy,
+        failed: result.failed,
+        skipped: result.skipped
+      }))
+    } else {
+      appStore.showSuccess(t('admin.accounts.healthProbe.completed', {
+        healthy: result.healthy,
+        skipped: result.skipped
+      }))
+    }
+    completed = true
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.healthProbe.failed')))
+  } finally {
+    healthProbeRunning.value = false
+  }
+  if (completed) {
+    try {
+      await reload()
+    } catch (error) {
+      appStore.showError(extractApiErrorMessage(error, t('admin.accounts.failedToLoad')))
+    }
+  }
+}
+const handleBulkInventory = async () => {
+  const accountIDs = [...selIds.value]
+  if (accountIDs.length === 0 || inventoryRunning.value || healthProbeRunning.value) return
+  inventoryRunning.value = true
+  showInventory.value = false
+  inventoryResponse.value = null
+  let completed = false
+  try {
+    const result: BatchAccountInventoryResponse = {
+      results: [],
+      healthy: 0,
+      failed: 0,
+      skipped: 0,
+      quota_fetched: 0
+    }
+    for (const batch of chunkAccountIDs(accountIDs)) {
+      const batchResult = await adminAPI.accounts.batchInventory(batch)
+      result.results.push(...batchResult.results)
+      result.healthy += batchResult.healthy
+      result.failed += batchResult.failed
+      result.skipped += batchResult.skipped
+      result.quota_fetched += batchResult.quota_fetched
+    }
+    inventoryResponse.value = result
+    showInventory.value = true
+    mergeHealthProbeFailurePool(result.results)
+
+    if (result.failed > 0) {
+      appStore.showError(t('admin.accounts.inventory.completedWithFailures', {
+        healthy: result.healthy,
+        failed: result.failed,
+        skipped: result.skipped,
+        quota: result.quota_fetched
+      }))
+    } else {
+      appStore.showSuccess(t('admin.accounts.inventory.completed', {
+        healthy: result.healthy,
+        skipped: result.skipped,
+        quota: result.quota_fetched
+      }))
+    }
+    completed = true
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.inventory.requestFailed')))
+  } finally {
+    inventoryRunning.value = false
+  }
+  if (completed) {
+    try {
+      await reload()
+    } catch (error) {
+      appStore.showError(extractApiErrorMessage(error, t('admin.accounts.failedToLoad')))
+    }
+  }
+}
 const updateSchedulableInList = (accountIds: number[], schedulable: boolean) => {
   if (accountIds.length === 0) return
   const idSet = new Set(accountIds)
@@ -2015,34 +2187,57 @@ const handleSelectAllResults = async () => {
   }
 }
 
-const collectSelectionMetadata = (rows: Account[]) => {
-  const selectedPlatforms = Array.from(new Set(rows.map(account => account.platform)))
-  const selectedTypes = Array.from(new Set(rows.map(account => account.type)))
-  return { selectedPlatforms, selectedTypes }
+const loadSelectionMetadata = async (selectedAccountIds?: number[]) => {
+  const metadata = await fetchAccountSelectionMetadata(
+    (page, pageSize, requestFilters) => adminAPI.accounts.list(page, pageSize, requestFilters),
+    buildBulkEditFilterSnapshot(),
+    selectedAccountIds
+  )
+  return {
+    selectedPlatforms: metadata.platforms as AccountPlatform[],
+    selectedTypes: metadata.types as AccountType[]
+  }
 }
 
-const openBulkEditSelected = () => {
-  bulkEditTarget.value = {
-    mode: 'selected',
-    accountIds: [...selIds.value],
-    selectedPlatforms: [...selPlatforms.value],
-    selectedTypes: [...selTypes.value]
+const openBulkEditSelected = async () => {
+  if (openingBulkEdit.value || selIds.value.length === 0) return
+  openingBulkEdit.value = true
+  try {
+    const accountIds = [...selIds.value]
+    const { selectedPlatforms, selectedTypes } = await loadSelectionMetadata(accountIds)
+    bulkEditTarget.value = {
+      mode: 'selected',
+      accountIds,
+      selectedPlatforms,
+      selectedTypes
+    }
+    showBulkEdit.value = true
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.bulkEdit.metadataFailed')))
+  } finally {
+    openingBulkEdit.value = false
   }
-  showBulkEdit.value = true
 }
 
 const openBulkEditFiltered = async () => {
-  const filters = buildBulkEditFilterSnapshot()
-  const preview = await adminAPI.accounts.list(1, 100, filters)
-  const { selectedPlatforms, selectedTypes } = collectSelectionMetadata(preview.items)
-  bulkEditTarget.value = {
-    mode: 'filtered',
-    filters,
-    previewCount: preview.total,
-    selectedPlatforms,
-    selectedTypes
+  if (openingBulkEdit.value) return
+  openingBulkEdit.value = true
+  try {
+    const filters = buildBulkEditFilterSnapshot()
+    const { selectedPlatforms, selectedTypes } = await loadSelectionMetadata()
+    bulkEditTarget.value = {
+      mode: 'filtered',
+      filters,
+      previewCount: pagination.total,
+      selectedPlatforms,
+      selectedTypes
+    }
+    showBulkEdit.value = true
+  } catch (error) {
+    appStore.showError(extractApiErrorMessage(error, t('admin.accounts.bulkEdit.metadataFailed')))
+  } finally {
+    openingBulkEdit.value = false
   }
-  showBulkEdit.value = true
 }
 
 const handleBulkUpdated = () => {
@@ -2453,6 +2648,7 @@ onMounted(async () => {
   }
 
   load()
+  void loadGlobalHealthProbeFailures()
   loadUpstreamBillingProbeGlobalState()
   try {
     const [p, g] = await Promise.all([adminAPI.proxies.getAll(), adminAPI.groups.getAll()])

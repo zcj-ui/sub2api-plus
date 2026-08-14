@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { fetchAllAccountIds } from '../accountSelection'
+import { fetchAccountSelectionMetadata, fetchAllAccountIds } from '../accountSelection'
 
 describe('fetchAllAccountIds', () => {
   it('loads every page with the same filter snapshot and returns unique account IDs', async () => {
@@ -64,5 +64,47 @@ describe('fetchAllAccountIds', () => {
       .mockRejectedValueOnce(new Error('page 2 failed'))
 
     await expect(fetchAllAccountIds(fetchPage, { group: '7' })).rejects.toThrow('page 2 failed')
+  })
+})
+
+describe('fetchAccountSelectionMetadata', () => {
+  it('collects selected account capabilities across every result page', async () => {
+    const fetchPage = vi.fn(async (page: number) => ({
+      items: page === 1
+        ? [{ id: 1, platform: 'openai', type: 'oauth' }]
+        : [{ id: 1001, platform: 'anthropic', type: 'apikey' }],
+      total: 1001,
+      pages: 2
+    }))
+
+    const metadata = await fetchAccountSelectionMetadata(fetchPage, { status: 'active' }, [1, 1001])
+
+    expect(metadata.platforms).toEqual(['openai', 'anthropic'])
+    expect(metadata.types).toEqual(['oauth', 'apikey'])
+    expect(fetchPage).toHaveBeenCalledTimes(2)
+  })
+
+  it('includes an incompatible account after the first one thousand filtered rows', async () => {
+    const fetchPage = vi.fn(async (page: number) => ({
+      items: page === 1
+        ? Array.from({ length: 1000 }, (_, index) => ({ id: index + 1, platform: 'openai', type: 'oauth' }))
+        : [{ id: 1001, platform: 'antigravity', type: 'oauth' }],
+      total: 1001,
+      pages: 2
+    }))
+
+    const metadata = await fetchAccountSelectionMetadata(fetchPage, {})
+
+    expect(metadata.platforms).toEqual(['openai', 'antigravity'])
+  })
+
+  it('rejects when a selected account disappeared before metadata was loaded', async () => {
+    const fetchPage = vi.fn().mockResolvedValue({
+      items: [{ id: 1, platform: 'openai', type: 'oauth' }],
+      total: 1,
+      pages: 1
+    })
+
+    await expect(fetchAccountSelectionMetadata(fetchPage, {}, [1, 2])).rejects.toThrow('元数据不完整')
   })
 })

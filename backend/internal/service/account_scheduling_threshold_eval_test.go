@@ -208,6 +208,63 @@ func TestEvaluateAccountSchedulingThreshold_OpenAIPausesFreshExhaustedSevenDayWi
 	require.True(t, resetAt.Equal(*decision.Until))
 }
 
+func TestEvaluateAccountSchedulingThreshold_OpenAICreditsOverrideLocalWindow(t *testing.T) {
+	now := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	account := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			"codex_usage_updated_at": now.Add(-time.Minute).Format(time.RFC3339),
+			"codex_7d_used_percent":  100.0,
+			"codex_7d_reset_at":      now.Add(5 * 24 * time.Hour).Format(time.RFC3339),
+			openaiQuotaCreditBalanceKey: map[string]any{
+				"has_credits": true,
+				"balance":     "25.0000000000",
+				"updated_at":  now.Format(time.RFC3339),
+			},
+		},
+	}
+
+	decision := EvaluateAccountSchedulingThreshold(account, map[string]int{PlatformOpenAI: 90}, now)
+
+	require.False(t, decision.ShouldPause)
+	require.True(t, account.IsSchedulable())
+
+	account.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["balance"] = "0"
+	decision = EvaluateAccountSchedulingThreshold(account, map[string]int{PlatformOpenAI: 90}, now)
+	require.True(t, decision.ShouldPause)
+}
+
+func TestAccountIsSchedulable_CreditsOnlyOverrideThresholdTempState(t *testing.T) {
+	now := time.Now()
+	blockedUntil := now.Add(time.Hour)
+	account := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			openaiQuotaCreditBalanceKey: map[string]any{
+				"has_credits": true,
+				"balance":     "25",
+				"updated_at":  now.Format(time.RFC3339),
+			},
+		},
+		TempUnschedulableUntil:  &blockedUntil,
+		TempUnschedulableReason: BuildAccountSchedulingThresholdReason("quota threshold"),
+	}
+
+	require.True(t, account.IsSchedulable())
+	account.TempUnschedulableReason = BuildTempUnschedReasonPayload("upstream_transport", "proxy failed")
+	require.False(t, account.IsSchedulable())
+
+	account.TempUnschedulableUntil = nil
+	account.RateLimitResetAt = &blockedUntil
+	require.False(t, account.IsSchedulable())
+}
+
 func TestEvaluateAccountSchedulingThreshold_AnthropicPreservesFractionalUtilizationSemantics(t *testing.T) {
 	t.Parallel()
 

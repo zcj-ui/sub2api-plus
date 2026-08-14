@@ -35,6 +35,16 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 			}
 			targetURL = validatedURL + "/v1/messages?beta=true"
 		}
+	} else if account.Type == AccountTypeUpstream {
+		baseURL := strings.TrimSpace(account.GetCredential("base_url"))
+		if baseURL == "" {
+			return nil, nil, fmt.Errorf("upstream account missing base_url for account %d", account.ID)
+		}
+		validatedURL, err := s.validateUpstreamBaseURL(baseURL)
+		if err != nil {
+			return nil, nil, err
+		}
+		targetURL = buildAnthropicRelayEndpointURL(validatedURL, "/v1/messages")
 	} else if account.IsCustomBaseURLEnabled() {
 		customURL := account.GetCustomBaseURL()
 		if customURL == "" {
@@ -124,6 +134,11 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	// 设置认证头（保持原始大小写）
 	if tokenType == "oauth" {
 		setHeaderRaw(req.Header, "authorization", "Bearer "+token)
+	} else if account.Platform == PlatformAntigravity && account.Type == AccountTypeUpstream {
+		// New API and common Anthropic relays accept either spelling. Sending
+		// both keeps the account compatible with relays that only implement one.
+		setHeaderRaw(req.Header, "authorization", "Bearer "+token)
+		setHeaderRaw(req.Header, "x-api-key", token)
 	} else {
 		setAnthropicAPIKeyAuthHeader(req.Header, account, token)
 	}

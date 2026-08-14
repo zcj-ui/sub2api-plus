@@ -51,6 +51,8 @@ func (u *openAIResponsesFailoverCancelUpstream) calls() []int64 {
 
 func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUpstream) *OpenAIGatewayHandler {
 	t.Helper()
+	proxyID1 := int64(9101)
+	proxyID2 := int64(9102)
 	accounts := []service.Account{
 		{
 			ID:          1,
@@ -61,6 +63,8 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 			Schedulable: true,
 			Concurrency: 0,
 			Priority:    0,
+			ProxyID:     &proxyID1,
+			Proxy:       &service.Proxy{ID: proxyID1, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 			Credentials: map[string]any{"access_token": "token-1"},
 		},
 		{
@@ -72,6 +76,8 @@ func newOpenAIResponsesFailoverTestHandler(t *testing.T, upstream service.HTTPUp
 			Schedulable: true,
 			Concurrency: 0,
 			Priority:    1,
+			ProxyID:     &proxyID2,
+			Proxy:       &service.Proxy{ID: proxyID2, Protocol: "http", Host: "127.0.0.1", Port: 1081},
 			Credentials: map[string]any{"access_token": "token-2"},
 		},
 	}

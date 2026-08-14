@@ -43,6 +43,9 @@ func EvaluateAccountSchedulingThreshold(account *Account, thresholds map[string]
 	if !isAllowedSchedulingThresholdPlatform(decision.Platform) {
 		return decision
 	}
+	if decision.Platform == PlatformOpenAI && account.hasAvailableCodexCreditsAt(now) {
+		return decision
+	}
 
 	threshold, ok := resolveEffectiveAccountSchedulingThreshold(account, thresholds, decision.Platform)
 	decision.ThresholdPercent = threshold

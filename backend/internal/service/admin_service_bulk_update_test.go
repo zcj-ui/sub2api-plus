@@ -155,6 +155,57 @@ func TestAdminService_BulkUpdateAccounts_AllSuccessIDs(t *testing.T) {
 	require.Len(t, result.Results, 3)
 }
 
+func TestAdminServiceBulkUpdateCodex429GuardRequiresOpenAIOAuthTargets(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   any
+		targets []*Account
+		wantErr bool
+	}{
+		{
+			name:  "openai oauth",
+			value: false,
+			targets: []*Account{
+				{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth},
+				{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeOAuth},
+			},
+		},
+		{name: "api key", value: true, targets: []*Account{{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}}, wantErr: true},
+		{name: "claude", value: true, targets: []*Account{{ID: 1, Platform: PlatformAnthropic, Type: AccountTypeOAuth}}, wantErr: true},
+		{name: "malformed", value: "false", targets: []*Account{{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &accountRepoStubForBulkUpdate{getByIDsAccounts: tt.targets}
+			result, err := (&adminServiceImpl{accountRepo: repo}).BulkUpdateAccounts(context.Background(), &BulkUpdateAccountsInput{
+				AccountIDs: []int64{1, 2},
+				Extra:      map[string]any{OpenAICodex429GuardEnabledExtraKey: tt.value},
+			})
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Nil(t, result)
+				require.Empty(t, repo.bulkUpdateIDs)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []int64{1, 2}, repo.bulkUpdateIDs)
+		})
+	}
+}
+
+func TestValidateOpenAICodex429GuardExtra(t *testing.T) {
+	require.NoError(t, ValidateOpenAICodex429GuardExtra(PlatformOpenAI, AccountTypeOAuth, map[string]any{
+		OpenAICodex429GuardEnabledExtraKey: false,
+	}))
+	require.Error(t, ValidateOpenAICodex429GuardExtra(PlatformOpenAI, AccountTypeAPIKey, map[string]any{
+		OpenAICodex429GuardEnabledExtraKey: true,
+	}))
+	require.Error(t, ValidateOpenAICodex429GuardExtra(PlatformOpenAI, AccountTypeOAuth, map[string]any{
+		OpenAICodex429GuardEnabledExtraKey: "false",
+	}))
+}
+
 func TestAdminService_BulkUpdateAccounts_RejectsRateChangeForSyncedAccounts(t *testing.T) {
 	repo := &accountRepoStubForBulkUpdate{
 		getByIDsAccounts: []*Account{

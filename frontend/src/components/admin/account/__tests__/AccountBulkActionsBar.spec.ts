@@ -47,4 +47,78 @@ describe('AccountBulkActionsBar', () => {
     await button!.trigger('click')
     expect(wrapper.emitted('probe-upstream-billing')).toHaveLength(1)
   })
+
+  it('emits the batch health probe action', async () => {
+    const wrapper = mount(AccountBulkActionsBar, {
+      props: {
+        selectedIds: [1, 2],
+        totalResults: 2,
+        selectingAll: false,
+        allResultsSelected: true
+      }
+    })
+
+    const button = wrapper.findAll('button').find(item =>
+      item.text().includes('admin.accounts.bulkActions.healthProbe')
+    )
+    expect(button).toBeDefined()
+    await button!.trigger('click')
+    expect(wrapper.emitted('health-probe')).toHaveLength(1)
+  })
+
+  it('disables the batch health probe while a probe is running', () => {
+    const wrapper = mount(AccountBulkActionsBar, {
+      props: {
+        selectedIds: [1],
+        totalResults: 1,
+        selectingAll: false,
+        allResultsSelected: true,
+        healthProbeRunning: true
+      }
+    })
+
+    const button = wrapper.findAll('button').find(item =>
+      item.text().includes('admin.accounts.bulkActions.healthProbe')
+    )
+    expect(button?.attributes('disabled')).toBeDefined()
+  })
+
+  it('emits selected-account inventory', async () => {
+    const wrapper = mount(AccountBulkActionsBar, {
+      props: {
+        selectedIds: [1, 2],
+        totalResults: 2,
+        selectingAll: false,
+        allResultsSelected: true
+      }
+    })
+
+    const button = wrapper.findAll('button').find(item =>
+      item.text().includes('admin.accounts.bulkActions.inventory')
+    )
+    expect(button).toBeDefined()
+    await button!.trigger('click')
+    expect(wrapper.emitted('inventory')).toHaveLength(1)
+  })
+
+  it('disables inventory and health actions while inventory is running', () => {
+    const wrapper = mount(AccountBulkActionsBar, {
+      props: {
+        selectedIds: [1],
+        totalResults: 1,
+        selectingAll: false,
+        allResultsSelected: true,
+        inventoryRunning: true
+      }
+    })
+
+    const inventoryButton = wrapper.findAll('button').find(item =>
+      item.text().includes('admin.accounts.bulkActions.inventory')
+    )
+    const healthButton = wrapper.findAll('button').find(item =>
+      item.text().includes('admin.accounts.bulkActions.healthProbe')
+    )
+    expect(inventoryButton?.attributes('disabled')).toBeDefined()
+    expect(healthButton?.attributes('disabled')).toBeDefined()
+  })
 })

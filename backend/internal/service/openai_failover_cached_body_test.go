@@ -126,6 +126,11 @@ func TestOpenAIGatewayService_HandleFailoverSideEffects_DoesNotRereadResponseBod
 	require.NotPanics(t, func() {
 		svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
 	})
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+
+	require.NotPanics(t, func() {
+		svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	})
 
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
@@ -148,7 +153,7 @@ func openAIFailoverCachedBodyTestAccount(id int64, name string, mapping map[stri
 	if mapping != nil {
 		credentials["model_mapping"] = mapping
 	}
-	return &Account{
+	return openAITestAccountWithProxy(&Account{
 		ID:             id,
 		Name:           name,
 		Platform:       PlatformOpenAI,
@@ -158,5 +163,5 @@ func openAIFailoverCachedBodyTestAccount(id int64, name string, mapping map[stri
 		Status:         StatusActive,
 		Schedulable:    true,
 		RateMultiplier: f64p(1),
-	}
+	})
 }

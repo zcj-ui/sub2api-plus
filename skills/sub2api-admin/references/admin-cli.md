@@ -1,4 +1,4 @@
-# Sub2API Admin Reference
+# Sub2API Plus Admin Reference
 
 ## Environment
 

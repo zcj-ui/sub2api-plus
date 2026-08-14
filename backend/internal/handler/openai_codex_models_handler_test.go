@@ -53,7 +53,10 @@ type codexModelsFailoverHTTPUpstream struct {
 	statuses    map[int64]int
 }
 
-func (u *codexModelsFailoverHTTPUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+func (u *codexModelsFailoverHTTPUpstream) Do(_ *http.Request, proxyURL string, accountID int64, _ int) (*http.Response, error) {
+	if strings.TrimSpace(proxyURL) == "" {
+		return nil, errors.New("test upstream requires the account proxy URL")
+	}
 	u.mu.Lock()
 	u.accountIDs = append(u.accountIDs, accountID)
 	u.mu.Unlock()
@@ -260,6 +263,7 @@ func newCodexModelsFailoverTestHandlerWithAccountCount(firstStatus, accountCount
 	groupID := int64(42)
 	accounts := make([]service.Account, 0, accountCount)
 	for i := 1; i <= accountCount; i++ {
+		proxyID := int64(1000 + i)
 		accounts = append(accounts, service.Account{
 			ID:          int64(i),
 			Name:        fmt.Sprintf("upstream-%d", i),
@@ -269,6 +273,14 @@ func newCodexModelsFailoverTestHandlerWithAccountCount(firstStatus, accountCount
 			Schedulable: true,
 			Priority:    i - 1,
 			Concurrency: 1,
+			ProxyID:     &proxyID,
+			Proxy: &service.Proxy{
+				ID:       proxyID,
+				Protocol: "http",
+				Host:     "127.0.0.1",
+				Port:     18080 + i,
+				Status:   service.StatusActive,
+			},
 			Credentials: map[string]any{
 				"api_key":  fmt.Sprintf("sk-%d", i),
 				"base_url": fmt.Sprintf("https://upstream-%d.example/v1", i),

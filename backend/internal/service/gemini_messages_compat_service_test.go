@@ -19,15 +19,17 @@ import (
 )
 
 type geminiCompatHTTPUpstreamStub struct {
-	response *http.Response
-	err      error
-	calls    int
-	lastReq  *http.Request
+	response     *http.Response
+	err          error
+	calls        int
+	lastReq      *http.Request
+	lastProxyURL string
 }
 
 func (s *geminiCompatHTTPUpstreamStub) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
 	s.calls++
 	s.lastReq = req
+	s.lastProxyURL = proxyURL
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -36,6 +38,45 @@ func (s *geminiCompatHTTPUpstreamStub) Do(req *http.Request, proxyURL string, ac
 	}
 	resp := *s.response
 	return &resp, nil
+}
+
+func TestGeminiForwardNative_AntigravityUpstreamUsesRelayProtocolAndProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	proxyID := int64(42)
+	httpStub := &geminiCompatHTTPUpstreamStub{
+		response: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "X-Request-Id": []string{"relay-request"}},
+			Body:       io.NopCloser(strings.NewReader(`{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}`)),
+		},
+	}
+	svc := &GeminiMessagesCompatService{httpUpstream: httpStub, cfg: &config.Config{}}
+	account := &Account{
+		ID:          88,
+		Platform:    PlatformAntigravity,
+		Type:        AccountTypeUpstream,
+		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 8080},
+		Credentials: map[string]any{
+			"base_url": "https://relay.example/prefix/v1beta",
+			"api_key":  "relay-key",
+		},
+	}
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-pro:generateContent", bytes.NewReader(body))
+
+	result, err := svc.ForwardNative(context.Background(), c, account, "gemini-2.5-pro", "generateContent", false, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "https://relay.example/prefix/v1beta/models/gemini-2.5-pro:generateContent", httpStub.lastReq.URL.String())
+	require.Equal(t, "Bearer relay-key", httpStub.lastReq.Header.Get("Authorization"))
+	require.Equal(t, "relay-key", httpStub.lastReq.Header.Get("x-api-key"))
+	require.Equal(t, "relay-key", httpStub.lastReq.Header.Get("x-goog-api-key"))
+	require.Equal(t, "http://127.0.0.1:8080", httpStub.lastProxyURL)
+	require.Equal(t, "gemini-2.5-pro", result.UpstreamModel)
 }
 
 func (s *geminiCompatHTTPUpstreamStub) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, profile *tlsfingerprint.Profile) (*http.Response, error) {

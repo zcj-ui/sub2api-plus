@@ -931,6 +931,61 @@
         </div>
       </div>
 
+      <!-- 卡429开关（严格仅 OpenAI OAuth） -->
+      <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <div class="mb-3 flex items-center justify-between">
+          <label class="input-label mb-0" for="bulk-edit-codex-429-guard-enabled">
+            {{ t('admin.accounts.codex429Guard') }}
+          </label>
+          <input
+            id="bulk-edit-codex-429-guard-enabled"
+            v-model="enableCodex429Guard"
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+        <div
+          class="flex items-center justify-between gap-4"
+          :class="!enableCodex429Guard && 'pointer-events-none opacity-50'"
+        >
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.codex429GuardHint') }}
+          </p>
+          <Toggle
+            v-model="codex429GuardEnabled"
+            data-testid="bulk-edit-codex-429-guard-toggle"
+          />
+        </div>
+      </div>
+
+      <!-- Antigravity paid overages -->
+      <div v-if="allTargetsAntigravity" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <div class="mb-3 flex items-center justify-between">
+          <label class="input-label mb-0" for="bulk-edit-allow-overages-enabled">
+            {{ t('admin.accounts.allowOverages') }}
+          </label>
+          <input
+            id="bulk-edit-allow-overages-enabled"
+            v-model="enableAllowOverages"
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+        <div
+          class="flex items-center justify-between gap-4"
+          :class="!enableAllowOverages && 'pointer-events-none opacity-50'"
+        >
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.allowOveragesTooltip') }}
+          </p>
+          <Toggle
+            :model-value="allowOveragesEnabled"
+            data-testid="bulk-edit-allow-overages-toggle"
+            @update:model-value="handleBulkAllowOveragesChange"
+          />
+        </div>
+      </div>
+
       <!-- Upstream billing auto probe (any API-key platform) -->
       <div v-if="allBillingProbeCapable" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
@@ -1325,6 +1380,7 @@ import type { Proxy as ProxyConfig, AdminGroup, AccountPlatform, AccountType, Op
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
+import Toggle from '@/components/common/Toggle.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
@@ -1389,6 +1445,11 @@ const allTargetsGrok = computed(
     targetSelectedPlatforms.value.every((p) => p === 'grok')
 )
 const isMixedPlatform = computed(() => targetSelectedPlatforms.value.length > 1)
+const allTargetsAntigravity = computed(
+  () =>
+    targetSelectedPlatforms.value.length === 1 &&
+    targetSelectedPlatforms.value[0] === 'antigravity'
+)
 
 const allOpenAIPassthroughCapable = computed(() => {
   return (
@@ -1500,6 +1561,8 @@ const enableOpenAIAPIKeyWSMode = ref(false)
 const enableUpstreamBillingAutoProbe = ref(false)
 const enableCodexCLIOnly = ref(false)
 const enableCodexCLIOnlyAppServer = ref(false)
+const enableCodex429Guard = ref(false)
+const enableAllowOverages = ref(false)
 const enableOpenAICompactMode = ref(false)
 const enableOpenAICompactModelMapping = ref(false)
 const enableRpmLimit = ref(false)
@@ -1533,6 +1596,18 @@ const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OF
 const upstreamBillingAutoProbeMode = ref<'enabled' | 'disabled'>('enabled')
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
+const codex429GuardEnabled = ref(true)
+const allowOveragesEnabled = ref(false)
+
+const handleBulkAllowOveragesChange = (enabled: boolean) => {
+  if (!enabled) {
+    allowOveragesEnabled.value = false
+    return
+  }
+  // A bulk selection may contain paid Pro accounts. Use the stronger warning
+  // because the lightweight selection metadata intentionally excludes secrets.
+  allowOveragesEnabled.value = window.confirm(t('admin.accounts.allowOveragesProConfirm'))
+}
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const enableCodexFingerprintMode = ref(false)
 const codexFingerprintMode = ref<CodexFingerprintMode>('session')
@@ -1836,6 +1911,19 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     }
   }
 
+  if (enableCodex429Guard.value && allOpenAIOAuthOnly.value) {
+    const extra = ensureExtra()
+    extra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
+  }
+
+  if (enableAllowOverages.value && allTargetsAntigravity.value) {
+    const extra = ensureExtra()
+    extra.allow_overages = allowOveragesEnabled.value
+    if (allowOveragesEnabled.value) {
+      updates.confirm_overages_risk = true
+    }
+  }
+
   if (enableOpenAICompactMode.value) {
     const extra = ensureExtra()
     extra.openai_compact_mode = openAICompactMode.value
@@ -1946,6 +2034,8 @@ const handleSubmit = async () => {
     enableUpstreamBillingAutoProbe.value ||
     enableCodexCLIOnly.value ||
     enableCodexCLIOnlyAppServer.value ||
+    enableCodex429Guard.value ||
+    enableAllowOverages.value ||
     enableCodexFingerprintMode.value ||
     enableOpenAICompactMode.value ||
     enableOpenAICompactModelMapping.value ||
@@ -2081,6 +2171,10 @@ watch(
       enableUpstreamBillingAutoProbe.value = false
       enableCodexCLIOnly.value = false
       enableCodexCLIOnlyAppServer.value = false
+      enableCodex429Guard.value = false
+      codex429GuardEnabled.value = true
+      enableAllowOverages.value = false
+      allowOveragesEnabled.value = false
       enableCodexFingerprintMode.value = false
       codexFingerprintMode.value = 'session'
       enableOpenAICompactMode.value = false

@@ -51,6 +51,25 @@ function makeAccount(overrides: Partial<Account>): Account {
 }
 
 describe('AccountStatusIndicator', () => {
+  it('shows persisted health-probe failures as dead with the reason', () => {
+    const account = makeAccount({
+      platform: 'openai',
+      type: 'apikey',
+      extra: {
+        account_health_probe: {
+          status: 'failed',
+          mode: 'openai_apikey_connection',
+          attempts: 2,
+          checked_at: '2026-08-13T00:00:00Z',
+          reason: 'API returned 401'
+        }
+      }
+    })
+
+    const wrapper = mount(AccountStatusIndicator, { props: { account } })
+    expect(wrapper.text()).toContain('admin.accounts.status.healthDead')
+    expect(wrapper.text()).toContain('API returned 401')
+  })
   it('Claude 5 模型限流时显示 Opus 和 Sonnet 的短别名', () => {
     const wrapper = mount(AccountStatusIndicator, {
       props: {

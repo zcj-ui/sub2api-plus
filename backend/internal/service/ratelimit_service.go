@@ -26,12 +26,15 @@ type RateLimitService struct {
 	geminiQuotaService    *GeminiQuotaService
 	tempUnschedCache      TempUnschedCache
 	timeoutCounterCache   TimeoutCounterCache
+	openAI429CounterCache OpenAI429CounterCache
 	openAI403CounterCache OpenAI403CounterCache
 	settingService        *SettingService
 	tokenCacheInvalidator TokenCacheInvalidator
 	runtimeBlocker        AccountRuntimeBlocker
 	usageCacheMu          sync.RWMutex
 	usageCache            map[int64]*geminiUsageCacheEntry
+	openAI429Locks        sync.Map
+	openAI429Streak       sync.Map
 }
 
 type AccountRuntimeBlocker interface {
@@ -92,6 +95,95 @@ func NewRateLimitService(accountRepo AccountRepository, usageRepo UsageLogReposi
 	}
 }
 
+func (s *RateLimitService) confirmOpenAIOAuth429(accountID int64, now time.Time) bool {
+	return s.confirmOpenAIOAuth429Context(context.Background(), accountID, now)
+}
+
+func (s *RateLimitService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	state := openAIOAuth429StreakState{}
+	if raw, ok := s.openAI429Streak.Load(accountID); ok {
+		state, _ = raw.(openAIOAuth429StreakState)
+	}
+	if state.UpdatedAt.IsZero() || now.Sub(state.UpdatedAt) > openAIOAuth429ConfirmationWindow || now.Before(state.UpdatedAt) {
+		state.Count = 0
+		state.UpdatedAt = time.Time{}
+	}
+
+	if state.RemoteResetPending && s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_retry_failed", "account_id", accountID, "error", err)
+		} else {
+			// The remote counter belongs to the streak before the successful
+			// response. Keep locally observed 429s from the new generation; only
+			// the stale remote generation is being discarded here.
+			state.RemoteResetPending = false
+		}
+	}
+
+	state.Count++
+	state.UpdatedAt = now
+
+	var remoteCount int64
+	if s.openAI429CounterCache != nil && !state.RemoteResetPending {
+		count, err := s.openAI429CounterCache.IncrementOpenAI429Count(ctx, accountID, openAIOAuth429ConfirmationWindow)
+		if err != nil {
+			slog.Warn("openai_429_confirmation_cache_failed", "account_id", accountID, "error", err)
+		} else {
+			remoteCount = count
+			if int64(state.Count) < count {
+				state.Count = int(count)
+			}
+		}
+	}
+	if state.Count >= 2 || remoteCount >= 2 {
+		if state.RemoteResetPending {
+			state.Count = 0
+			state.UpdatedAt = time.Time{}
+			s.openAI429Streak.Store(accountID, state)
+		} else {
+			s.openAI429Streak.Delete(accountID)
+		}
+		return true
+	}
+
+	s.openAI429Streak.Store(accountID, state)
+	return false
+}
+
+func (s *RateLimitService) openAI429AccountLock(accountID int64) *sync.Mutex {
+	lock, _ := s.openAI429Locks.LoadOrStore(accountID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429Streak(accountID int64) {
+	s.clearOpenAIOAuth429StreakContext(context.Background(), accountID)
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429StreakContext(ctx context.Context, accountID int64) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_failed", "account_id", accountID, "error", err)
+			s.openAI429Streak.Store(accountID, openAIOAuth429StreakState{RemoteResetPending: true})
+			return
+		}
+	}
+	s.openAI429Streak.Delete(accountID)
+}
+
 // SetTimeoutCounterCache 设置超时计数器缓存（可选依赖）
 func (s *RateLimitService) SetTimeoutCounterCache(cache TimeoutCounterCache) {
 	s.timeoutCounterCache = cache
@@ -100,6 +192,10 @@ func (s *RateLimitService) SetTimeoutCounterCache(cache TimeoutCounterCache) {
 // SetOpenAI403CounterCache 设置 OpenAI 403 连续失败计数器（可选依赖）
 func (s *RateLimitService) SetOpenAI403CounterCache(cache OpenAI403CounterCache) {
 	s.openAI403CounterCache = cache
+}
+
+func (s *RateLimitService) SetOpenAI429CounterCache(cache OpenAI429CounterCache) {
+	s.openAI429CounterCache = cache
 }
 
 // SetSettingService 设置系统设置服务（可选依赖）
@@ -268,6 +364,18 @@ func (s *RateLimitService) CheckErrorPolicy(ctx context.Context, account *Accoun
 // 返回是否应该停止该账号的调度
 func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, requestedModel ...string) (shouldDisable bool) {
 	ctx = withTempUnschedulableModel(ctx, requestedModel)
+	if account.IsOpenAIOAuth() && !account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
+		if statusCode != http.StatusTooManyRequests {
+			s.clearOpenAIOAuth429StreakContext(ctx, account.ID)
+		} else if !openAIOAuth429AlreadyConfirmed(ctx) {
+			persistOpenAI429PlanType(ctx, s.accountRepo, account, responseBody)
+			s.persistOpenAICodexSnapshot(ctx, account, headers)
+			if !s.confirmOpenAIOAuth429Context(ctx, account.ID, time.Now()) {
+				slog.Info("openai_429_confirmation_pending", "account_id", account.ID, "count", 1, "required", 2)
+				return false
+			}
+		}
+	}
 	customErrorCodesEnabled := account.IsCustomErrorCodesEnabled()
 
 	// 池模式默认不标记本地账号状态；但管理员显式配置的临时不可调度规则优先。
@@ -1549,7 +1657,14 @@ func pickSooner(a, b *time.Time) *time.Time {
 }
 
 func (s *RateLimitService) persistOpenAICodexSnapshot(ctx context.Context, account *Account, headers http.Header) {
-	if s == nil || s.accountRepo == nil || account == nil || headers == nil {
+	if s == nil {
+		return
+	}
+	persistOpenAICodexSnapshotWithRepo(ctx, s.accountRepo, account, headers)
+}
+
+func persistOpenAICodexSnapshotWithRepo(ctx context.Context, repo AccountRepository, account *Account, headers http.Header) {
+	if repo == nil || account == nil || headers == nil {
 		return
 	}
 	// spark 影子的 codex_* 仅由 QueryUsage(/wham/usage bengalfox 道)更新,不能被 /responses 的
@@ -1565,7 +1680,7 @@ func (s *RateLimitService) persistOpenAICodexSnapshot(ctx context.Context, accou
 	if len(updates) == 0 {
 		return
 	}
-	if err := s.accountRepo.UpdateExtra(ctx, account.ID, updates); err != nil {
+	if err := repo.UpdateExtra(ctx, account.ID, updates); err != nil {
 		slog.Warn("openai_codex_snapshot_persist_failed", "account_id", account.ID, "error", err)
 	}
 }

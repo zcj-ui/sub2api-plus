@@ -79,6 +79,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		if normalized {
 			body = normalizedBody
 		}
+		if account.Codex429GuardEnabled() && !isOpenAIResponsesCompactPath(c) && !isOpenAICompatMessagesBridgeBody(body) {
+			bodyWithContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(body)
+			if appendErr != nil {
+				return nil, fmt.Errorf("append passthrough agent context checkpoint: %w", appendErr)
+			}
+			if appended {
+				body = bodyWithContextPair
+			}
+		}
 		reqStream = gjson.GetBytes(body, "stream").Bool()
 	}
 
@@ -109,6 +118,23 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		return nil, policyErr
 	}
 	body = updatedBody
+
+	// OAuth passthrough still represents one account-scoped Codex installation.
+	// Normalize the same device/session hierarchy used by the regular Responses
+	// path so passthrough cannot leak a different client identity for the account.
+	if account.IsOpenAIOAuth() && !isOpenAIResponsesCompactPath(c) {
+		var clientHeaders http.Header
+		if c != nil && c.Request != nil {
+			clientHeaders = c.Request.Header
+		}
+		fpIDs := resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c))
+		if nextBody, changed := applyCodexFingerprintToBodyBytes(body, fpIDs); changed {
+			body = nextBody
+		}
+		if c != nil && fpIDs != nil {
+			c.Set(codexFingerprintIDsContextKey, fpIDs)
+		}
+	}
 
 	apiKey := getAPIKeyFromContext(c)
 	// 同一 attempt 的最终 model/body 只判定一次，权限检查与后续图片状态设置共用该结果。
@@ -182,9 +208,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		return nil, err
 	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveOpenAIAccountProxyURL(account)
+	if proxyErr != nil {
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, proxyErr, true)
 	}
 
 	if c != nil {
@@ -431,6 +457,13 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		}
 		if clientConversationID != "" {
 			req.Header.Set("conversation_id", isolateOpenAISessionID(apiKeyID, clientConversationID))
+		}
+		if c != nil {
+			if fpIDs, ok := c.Get(codexFingerprintIDsContextKey); ok {
+				if ids, ok := fpIDs.(*codexFingerprintIDs); ok {
+					applyCodexFingerprintHeaders(req.Header, ids)
+				}
+			}
 		}
 	} else if isOpenAIResponsesCompactPath(c) {
 		// 透传白名单会放行客户端的 Accept: text/event-stream；compact 上游是

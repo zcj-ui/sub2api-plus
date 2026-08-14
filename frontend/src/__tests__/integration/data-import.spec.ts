@@ -53,6 +53,15 @@ const setInputFiles = (element: Element, files: File[]) => {
   })
 }
 
+const makeAccount = (name: string) => ({
+  name,
+  platform: 'openai',
+  type: 'oauth',
+  credentials: { fixture: name },
+  concurrency: 1,
+  priority: 1
+})
+
 describe('ImportDataModal', () => {
   beforeEach(async () => {
     showError.mockReset()
@@ -114,7 +123,7 @@ describe('ImportDataModal', () => {
 
     const valid = makeJsonFile(
       'valid.json',
-      JSON.stringify({ exported_at: '2026-07-05T00:00:00Z', proxies: [], accounts: [{ name: 'a' }] })
+      JSON.stringify({ exported_at: '2026-07-05T00:00:00Z', proxies: [], accounts: [makeAccount('a')] })
     )
     setInputFiles(input.element, [valid])
     await input.trigger('change')
@@ -128,9 +137,11 @@ describe('ImportDataModal', () => {
 
     expect(adminAPI.accounts.importData).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        accounts: [{ name: 'a' }]
+        accounts: [makeAccount('a')]
       }),
-      skip_default_group_bind: true
+      skip_default_group_bind: true,
+      codex_429_guard_enabled: true,
+      confirm_overages_risk: false
     })
   })
 
@@ -149,14 +160,14 @@ describe('ImportDataModal', () => {
     const input = wrapper.find('input[type="file"]')
     const first = makeJsonFile(
       'first.json',
-      JSON.stringify({ exported_at: '2026-07-05T00:00:00Z', proxies: [], accounts: [{ name: 'a' }] })
+      JSON.stringify({ exported_at: '2026-07-05T00:00:00Z', proxies: [], accounts: [makeAccount('a')] })
     )
     const second = makeJsonFile(
       'second.json',
       JSON.stringify({
         exported_at: '2026-07-05T00:00:01Z',
         proxies: [{ proxy_key: 'p' }],
-        accounts: [{ name: 'b' }]
+        accounts: [makeAccount('b')]
       })
     )
     setInputFiles(input.element, [first, second])
@@ -168,11 +179,38 @@ describe('ImportDataModal', () => {
     expect(adminAPI.accounts.importData).toHaveBeenCalledWith({
       data: expect.objectContaining({
         proxies: [{ proxy_key: 'p' }],
-        accounts: [{ name: 'a' }, { name: 'b' }]
+        accounts: [makeAccount('a'), makeAccount('b')]
       }),
-      skip_default_group_bind: true
+      skip_default_group_bind: true,
+      codex_429_guard_enabled: true,
+      confirm_overages_risk: false
     })
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.dataImportSuccess')
+  })
+
+  it('卡429开关关闭时把 false 传给导入接口', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
+      proxy_created: 0,
+      proxy_reused: 0,
+      proxy_failed: 0,
+      account_created: 1,
+      account_failed: 0
+    })
+    const wrapper = mountModal()
+    await wrapper.get('[data-test="codex-429-guard-toggle"]').trigger('click')
+
+    const input = wrapper.find('input[type="file"]')
+    setInputFiles(input.element, [
+      makeJsonFile('codex.json', JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [makeAccount('codex')] }))
+    ])
+    await input.trigger('change')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    expect(adminAPI.accounts.importData).toHaveBeenCalledWith(expect.objectContaining({
+      codex_429_guard_enabled: false
+    }))
   })
 
   it('部分成功时关闭弹窗仍通知父组件刷新', async () => {
@@ -193,7 +231,7 @@ describe('ImportDataModal', () => {
         JSON.stringify({
           exported_at: '2026-07-05T00:00:00Z',
           proxies: [],
-          accounts: [{ name: 'a' }, { name: 'b' }]
+          accounts: [makeAccount('a'), makeAccount('b')]
         })
       )
     ])

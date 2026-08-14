@@ -304,6 +304,7 @@ func forwardOAuthChatCompletionsForUpstreamBody(t *testing.T, body []byte) []byt
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-acc",
 		},
+		Extra: map[string]any{OpenAICodex429GuardEnabledExtraKey: true},
 	}
 
 	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
@@ -320,8 +321,10 @@ func TestForwardAsChatCompletions_OAuthPromotesSystemMessageWithoutDuplication(t
 	upstreamBody := forwardOAuthChatCompletionsForUpstreamBody(t, body)
 
 	require.Equal(t, systemPrompt, gjson.GetBytes(upstreamBody, "instructions").String())
-	require.Equal(t, int64(1), gjson.GetBytes(upstreamBody, "input.#").Int())
+	require.Equal(t, int64(3), gjson.GetBytes(upstreamBody, "input.#").Int())
 	require.Equal(t, "user", gjson.GetBytes(upstreamBody, "input.0.role").String())
+	require.Equal(t, codexSyntheticAgentContextToolName, gjson.GetBytes(upstreamBody, "input.1.name").String())
+	require.Equal(t, "custom_tool_call_output", gjson.GetBytes(upstreamBody, "input.2.type").String())
 	require.Equal(t, 1, strings.Count(string(upstreamBody), systemPrompt))
 }
 
@@ -332,7 +335,7 @@ func TestForwardAsChatCompletions_OAuthJsonObjectKeepsSystemMessageInInput(t *te
 	upstreamBody := forwardOAuthChatCompletionsForUpstreamBody(t, body)
 
 	require.Equal(t, systemPrompt, gjson.GetBytes(upstreamBody, "instructions").String())
-	require.Equal(t, int64(2), gjson.GetBytes(upstreamBody, "input.#").Int())
+	require.Equal(t, int64(4), gjson.GetBytes(upstreamBody, "input.#").Int())
 	require.Equal(t, "developer", gjson.GetBytes(upstreamBody, "input.0.role").String())
 	require.Equal(t, systemPrompt, gjson.GetBytes(upstreamBody, "input.0.content").String())
 	require.Equal(t, 2, strings.Count(string(upstreamBody), systemPrompt))
@@ -345,7 +348,7 @@ func TestForwardAsChatCompletions_OAuthKeepsMixedSystemContentInInput(t *testing
 	upstreamBody := forwardOAuthChatCompletionsForUpstreamBody(t, body)
 
 	require.Equal(t, systemPrompt, gjson.GetBytes(upstreamBody, "instructions").String())
-	require.Equal(t, int64(2), gjson.GetBytes(upstreamBody, "input.#").Int())
+	require.Equal(t, int64(4), gjson.GetBytes(upstreamBody, "input.#").Int())
 	require.Equal(t, "developer", gjson.GetBytes(upstreamBody, "input.0.role").String())
 	require.Equal(t, int64(2), gjson.GetBytes(upstreamBody, "input.0.content.#").Int())
 	require.Equal(t, "input_image", gjson.GetBytes(upstreamBody, "input.0.content.1.type").String())

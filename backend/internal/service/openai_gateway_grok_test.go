@@ -3248,7 +3248,11 @@ func TestOpenAIWSHTTPBridgeSSEErrorSideEffectsRunOncePerPlatform(t *testing.T) {
 			require.ErrorAs(t, err, &failoverErr)
 			require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
 			require.Zero(t, writes)
-			require.Equal(t, 1, repo.rateLimitedCalls)
+			if platform == PlatformOpenAI {
+				require.Zero(t, repo.rateLimitedCalls, "the first OpenAI OAuth 429 must remain unconfirmed")
+			} else {
+				require.Equal(t, 1, repo.rateLimitedCalls)
+			}
 		})
 	}
 }

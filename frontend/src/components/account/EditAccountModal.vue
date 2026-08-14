@@ -2019,6 +2019,25 @@
         </div>
       </div>
 
+      <!-- OpenAI/Codex 429 guard（仅 OpenAI OAuth） -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.codex429Guard') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.codex429GuardHint') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="codex429GuardEnabled"
+            data-testid="edit-codex-429-guard-toggle"
+          />
+        </div>
+      </div>
+
       <!-- OpenAI 订阅档位手动覆盖（Plus/Pro/Free），仅 OAuth 非影子账号 -->
       <div
         v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
@@ -2621,7 +2640,9 @@
           <label class="flex cursor-pointer items-center gap-2">
             <input
               type="checkbox"
-              v-model="allowOverages"
+              :checked="allowOverages"
+              @change="handleAllowOveragesChange"
+              data-testid="allow-overages-toggle"
               class="h-4 w-4 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
             />
             <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -2756,6 +2777,7 @@ import {
 } from '@/components/account/credentialsBuilder'
 import { formatDateTime, formatDateTimeLocalInput, parseDateTimeLocalInput } from '@/utils/format'
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
+import { isAntigravityProTier } from '@/utils/antigravityOverages'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
   OPENAI_WS_MODE_CTX_POOL,
@@ -2913,6 +2935,26 @@ const upstreamBillingAutoProbeEnabled = ref(false)
 const upstreamBillingRateSyncEnabled = ref(false)
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 const allowOverages = ref(false) // For antigravity accounts: enable AI Credits overages
+
+const isGoogleOneProAccount = computed(() => {
+  const credentials = (props.account?.credentials || {}) as Record<string, unknown>
+  const extra = (props.account?.extra || {}) as Record<string, unknown>
+  return isAntigravityProTier(credentials, extra)
+})
+
+function handleAllowOveragesChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const enabled = input.checked
+  if (!enabled) {
+    allowOverages.value = false
+    return
+  }
+  const warningKey = isGoogleOneProAccount.value
+    ? 'admin.accounts.allowOveragesProConfirm'
+    : 'admin.accounts.allowOveragesConfirm'
+  allowOverages.value = confirm(t(warningKey))
+  input.checked = allowOverages.value
+}
 const antigravityProjectId = ref('')
 const antigravityModelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const antigravityWhitelistModels = ref<string[]>([])
@@ -2981,6 +3023,7 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('session')
+const codex429GuardEnabled = ref(true)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
@@ -3441,6 +3484,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'session'
+  codex429GuardEnabled.value = true
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
@@ -3497,6 +3541,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
         : 'session')
+      codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled !== false
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined
@@ -4174,13 +4219,20 @@ const openMixedChannelDialog = (opts: {
 }
 
 const withAntigravityConfirmFlag = (payload: Record<string, unknown>) => {
+  const confirmedPayload = { ...payload }
+  const extra = payload.extra as Record<string, unknown> | undefined
+  if (props.account?.platform === 'antigravity' && extra?.allow_overages === true) {
+    confirmedPayload.confirm_overages_risk = true
+  } else {
+    delete confirmedPayload.confirm_overages_risk
+  }
   if (needsMixedChannelCheck() && antigravityMixedChannelConfirmed.value) {
     return {
-      ...payload,
+      ...confirmedPayload,
       confirm_mixed_channel_risk: true
     }
   }
-  const cloned = { ...payload }
+  const cloned = { ...confirmedPayload }
   delete cloned.confirm_mixed_channel_risk
   return cloned
 }
@@ -4850,6 +4902,9 @@ const handleSubmit = async () => {
         } else {
           delete newExtra.codex_fingerprint_mode
         }
+        newExtra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
+      } else {
+        delete newExtra.openai_codex_429_guard_enabled
       }
 
       updatePayload.extra = newExtra

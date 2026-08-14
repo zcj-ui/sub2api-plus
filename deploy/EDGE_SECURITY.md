@@ -1,6 +1,6 @@
 # Edge and HTTP Ingress Security
 
-Sub2API supports long-lived SSE and WebSocket requests. Protect the request
+Sub2API Plus supports long-lived SSE and WebSocket requests. Protect the request
 ingress without imposing a response `WriteTimeout`: a write deadline would
 terminate healthy long generations and streams.
 
@@ -46,7 +46,7 @@ and updates at runtime without a restart. A request snapshots the switch and
 header list together, so one request cannot mix old and new settings. Custom
 headers are ignored completely when the switch is disabled. In that mode Gin's
 `server.trusted_proxies` chain is authoritative: configure only the exact
-CIDR/IP addresses that connect directly to Sub2API. An explicit empty list
+CIDR/IP addresses that connect directly to Sub2API Plus. An explicit empty list
 trusts no forwarded client IPs.
 
 On the first upgrade to this mode, a legacy `false` value is changed to `true`
@@ -129,7 +129,7 @@ server {
 ```
 
 If Nginx gzip is enabled in the `http` block, keep `text/event-stream` out of
-`gzip_types` and do not use `gzip_types *` for Sub2API. The
+`gzip_types` and do not use `gzip_types *` for Sub2API Plus. The
 `proxy_buffering off` setting above prevents proxy buffering, but it does not
 disable the gzip response filter. Use an explicit list for ordinary responses:
 
@@ -189,7 +189,7 @@ api.example.com {
 Replace the documentation ranges with the CDN's published, automatically
 maintained egress ranges. `CF-Connecting-IP` is safe here only because direct
 origin access is blocked and Caddy trusts only those TCP peers. Configure
-Sub2API `server.trusted_proxies` with the Caddy address/private subnet so the
+Sub2API Plus `server.trusted_proxies` with the Caddy address/private subnet so the
 application accepts only Caddy's rewritten headers.
 
 Caddy core does not provide a general request-rate limiter; use a trusted

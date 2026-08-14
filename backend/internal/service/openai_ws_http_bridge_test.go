@@ -657,7 +657,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridgeAndPreservesMa
 		ginCtx.Request = req
 		ginCtx.Set("api_key", &APIKey{ID: 7101})
 
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "access-token", firstMessage, &OpenAIWSIngressHooks{
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "access-token", firstMessage, &OpenAIWSIngressHooks{
 			MapRequestModel: func(_ int, originalModel string) (string, error) {
 				if originalModel == "channel-alias" {
 					return "grok-4.3", nil
@@ -665,6 +665,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridgeAndPreservesMa
 				return originalModel, nil
 			},
 		})
+
 	}))
 	defer wsServer.Close()
 
@@ -843,7 +844,7 @@ func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
 
 		proxyCtx, cancelProxy := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancelProxy()
-		errCh <- svc.ProxyResponsesWebSocketFromClient(proxyCtx, ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(proxyCtx, ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -991,7 +992,7 @@ func TestOpenAIWSHTTPBridgeKeepsContinuationFramesOnHTTPWithoutPreviousResponseI
 		req.Header.Set("User-Agent", "codex_cli_rs/0.135.0")
 		ginCtx.Request = req
 
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -1111,7 +1112,7 @@ func TestOpenAIWSHTTPBridge_IdleTimeoutClosesClientSession(t *testing.T) {
 		rec := httptest.NewRecorder()
 		ginCtx, _ := gin.CreateTestContext(rec)
 		ginCtx.Request = r.Clone(r.Context())
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 

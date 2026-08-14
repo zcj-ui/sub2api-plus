@@ -427,6 +427,14 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		}
 		if escapedSticky {
 			req.PreserveStickyBinding = true
+			excluded := make(map[int64]struct{}, len(req.ExcludedIDs)+1)
+			for accountID := range req.ExcludedIDs {
+				excluded[accountID] = struct{}{}
+			}
+			if req.StickyAccountID > 0 {
+				excluded[req.StickyAccountID] = struct{}{}
+			}
+			req.ExcludedIDs = excluded
 		}
 	}
 
@@ -997,7 +1005,13 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	if plan.topK <= 0 {
 		plan.topK = 1
 	}
-
+	for _, candidate := range candidates {
+		if candidate.account != nil && candidate.account.Concurrency > 0 &&
+			(candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency || candidate.loadInfo.LoadRate >= 100) {
+			plan.includeOverflowFallback = true
+			break
+		}
+	}
 	plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
 	return plan
 }
@@ -1014,7 +1028,37 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		if groupTopK > len(pool) {
 			groupTopK = len(pool)
 		}
-		ranked := selectTopKOpenAICandidates(pool, groupTopK)
+		packedCandidateLess := func(aCandidate, bCandidate openAIAccountCandidateScore) bool {
+			a := accountWithLoad{account: aCandidate.account, loadInfo: aCandidate.loadInfo}
+			b := accountWithLoad{account: bCandidate.account, loadInfo: bCandidate.loadInfo}
+			if a.account.Priority != b.account.Priority {
+				return a.account.Priority < b.account.Priority
+			}
+			aClass := packedAccountLoadClass(a.account, a.loadInfo)
+			bClass := packedAccountLoadClass(b.account, b.loadInfo)
+			if aClass != bClass {
+				return aClass < bClass
+			}
+			if aClass == 0 {
+				if packedActiveAccountUtilizationLess(a, b) {
+					return true
+				}
+				if packedActiveAccountUtilizationLess(b, a) {
+					return false
+				}
+			}
+			if aCandidate.score != bCandidate.score {
+				return aCandidate.score > bCandidate.score
+			}
+			return a.account.ID < b.account.ID
+		}
+		ranked := append([]openAIAccountCandidateScore(nil), pool...)
+		sort.SliceStable(ranked, func(i, j int) bool {
+			return packedCandidateLess(ranked[i], ranked[j])
+		})
+		if len(ranked) > groupTopK {
+			ranked = ranked[:groupTopK]
+		}
 		var primary []openAIAccountCandidateScore
 		if req.StickyWeighted {
 			for _, stickyID := range []int64{req.StickyPreviousAccountID, req.StickyAccountID} {
@@ -1034,7 +1078,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			}
 		}
 		if len(primary) == 0 {
-			primary = buildOpenAIWeightedSelectionOrder(ranked, req)
+			primary = ranked
 		}
 		if !plan.includeOverflowFallback || groupTopK >= len(pool) {
 			return primary
@@ -1050,8 +1094,8 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 				overflow = append(overflow, candidate)
 			}
 		}
-		sort.Slice(overflow, func(i, j int) bool {
-			return isOpenAIAccountCandidateBetter(overflow[i], overflow[j])
+		sort.SliceStable(overflow, func(i, j int) bool {
+			return packedCandidateLess(overflow[i], overflow[j])
 		})
 		return append(primary, overflow...)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -15,6 +16,19 @@ import (
 )
 
 // Proxy management implementations
+func normalizeProxyFallbackMode(mode string) (string, error) {
+	normalized := strings.TrimSpace(mode)
+	if normalized == "" {
+		return FallbackModeNone, nil
+	}
+	switch normalized {
+	case FallbackModeNone, FallbackModeProxy, FallbackModeDirect:
+		return normalized, nil
+	default:
+		return "", infraerrors.BadRequest("PROXY_FALLBACK_MODE_INVALID", "fallback_mode must be one of none, proxy, or direct")
+	}
+}
+
 func (s *adminServiceImpl) ListProxies(ctx context.Context, page, pageSize int, protocol, status, search string, sortBy, sortOrder string) ([]Proxy, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
 	proxies, result, err := s.proxyRepo.ListWithFilters(ctx, params, protocol, status, search)
@@ -57,9 +71,9 @@ func (s *adminServiceImpl) GetProxiesByIDs(ctx context.Context, ids []int64) ([]
 
 func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error) {
 	// 规范化 fallback_mode
-	mode := input.FallbackMode
-	if mode == "" {
-		mode = FallbackModeNone
+	mode, err := normalizeProxyFallbackMode(input.FallbackMode)
+	if err != nil {
+		return nil, err
 	}
 	// 校验：mode=proxy 必须有 backup
 	if mode == FallbackModeProxy && input.BackupProxyID == nil {
@@ -96,9 +110,9 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 		return nil, infraerrors.BadRequest("PROXY_BACKUP_SELF", "backup proxy cannot be itself")
 	}
 	// 规范化 fallback_mode
-	mode := input.FallbackMode
-	if mode == "" {
-		mode = FallbackModeNone
+	mode, err := normalizeProxyFallbackMode(input.FallbackMode)
+	if err != nil {
+		return nil, err
 	}
 	// 校验：mode=proxy 必须有 backup
 	if mode == FallbackModeProxy && input.BackupProxyID == nil {

@@ -56,7 +56,7 @@ func TestProxyExportDataRespectsFilters(t *testing.T) {
 			Host:     "10.0.0.2",
 			Port:     443,
 			Username: "u",
-			Password: "p",
+			Password: "proxy-secret",
 			Status:   service.StatusDisabled,
 		},
 	}
@@ -74,6 +74,8 @@ func TestProxyExportDataRespectsFilters(t *testing.T) {
 	require.Len(t, resp.Data.Proxies, 1)
 	require.Len(t, resp.Data.Accounts, 0)
 	require.Equal(t, "https", resp.Data.Proxies[0].Protocol)
+	require.Contains(t, resp.Data.Proxies[0].ProxyKey, "sha256:")
+	require.NotContains(t, resp.Data.Proxies[0].ProxyKey, "proxy-secret")
 	require.Equal(t, 1, adminSvc.lastListProxies.calls)
 	require.Equal(t, "https", adminSvc.lastListProxies.protocol)
 	require.Equal(t, "id", adminSvc.lastListProxies.sortBy)
@@ -209,7 +211,7 @@ func TestProxyExportDataSortByAccountCountUsesAccountCountListing(t *testing.T) 
 	require.Equal(t, 0, adminSvc.lastListProxies.calls)
 }
 
-func TestProxyImportDataReusesAndTriggersLatencyProbe(t *testing.T) {
+func TestProxyImportDataAcceptsLegacyKeysReusesAndTriggersLatencyProbe(t *testing.T) {
 	router, adminSvc := setupProxyDataRouter()
 
 	adminSvc.proxies = []service.Proxy{
@@ -279,4 +281,87 @@ func TestProxyImportDataReusesAndTriggersLatencyProbe(t *testing.T) {
 		defer adminSvc.mu.Unlock()
 		return len(adminSvc.testedProxyIDs) == 1
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestProxyImportDataResolvesForwardBackupReference(t *testing.T) {
+	router, adminSvc := setupProxyDataRouter()
+	backupKey := buildProxyKey("http", "127.0.0.2", 8081, "backup", "secret")
+	payload := map[string]any{"data": map[string]any{
+		"type": dataType, "version": dataVersion,
+		"proxies": []map[string]any{
+			{
+				"proxy_key": buildProxyKey("http", "127.0.0.1", 8080, "primary", "secret"),
+				"name":      "primary", "protocol": "http", "host": "127.0.0.1", "port": 8080,
+				"username": "primary", "password": "secret", "status": "active",
+				"fallback_mode": service.FallbackModeProxy, "backup_proxy_key": backupKey,
+			},
+			{
+				"proxy_key": backupKey, "name": "backup", "protocol": "http",
+				"host": "127.0.0.2", "port": 8081, "username": "backup", "password": "secret",
+				"status": "active", "fallback_mode": service.FallbackModeNone,
+			},
+		},
+		"accounts": []any{},
+	}}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/proxies/data", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp proxyImportResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, 2, resp.Data.ProxyCreated)
+	require.Zero(t, resp.Data.ProxyFailed)
+
+	adminSvc.mu.Lock()
+	defer adminSvc.mu.Unlock()
+	var primaryUpdate *service.UpdateProxyInput
+	for i, id := range adminSvc.updatedProxyIDs {
+		if id == 400 {
+			primaryUpdate = adminSvc.updatedProxies[i]
+			break
+		}
+	}
+	require.NotNil(t, primaryUpdate)
+	require.Equal(t, service.FallbackModeProxy, primaryUpdate.FallbackMode)
+	require.NotNil(t, primaryUpdate.BackupProxyID)
+	require.Equal(t, int64(401), *primaryUpdate.BackupProxyID)
+}
+
+func TestProxyImportDataUpdatesFallbackWhenStatusIsUnchanged(t *testing.T) {
+	router, adminSvc := setupProxyDataRouter()
+	primary := service.Proxy{ID: 1, Name: "primary", Protocol: "http", Host: "127.0.0.1", Port: 8080, Status: service.StatusActive, FallbackMode: service.FallbackModeNone}
+	backup := service.Proxy{ID: 2, Name: "backup", Protocol: "http", Host: "127.0.0.2", Port: 8081, Status: service.StatusActive, FallbackMode: service.FallbackModeNone}
+	adminSvc.proxies = []service.Proxy{primary, backup}
+	payload := map[string]any{"data": map[string]any{
+		"type": dataType, "version": dataVersion,
+		"proxies": []map[string]any{{
+			"proxy_key": buildProxyKey(primary.Protocol, primary.Host, primary.Port, primary.Username, primary.Password),
+			"name":      primary.Name, "protocol": primary.Protocol, "host": primary.Host, "port": primary.Port,
+			"status": service.StatusActive, "fallback_mode": service.FallbackModeProxy,
+			"backup_proxy_key": buildProxyKey(backup.Protocol, backup.Host, backup.Port, backup.Username, backup.Password),
+		}},
+		"accounts": []any{},
+	}}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/proxies/data", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp proxyImportResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, 1, resp.Data.ProxyReused)
+	require.Zero(t, resp.Data.ProxyFailed)
+	adminSvc.mu.Lock()
+	defer adminSvc.mu.Unlock()
+	require.Len(t, adminSvc.updatedProxies, 1)
+	require.Equal(t, service.FallbackModeProxy, adminSvc.updatedProxies[0].FallbackMode)
+	require.NotNil(t, adminSvc.updatedProxies[0].BackupProxyID)
+	require.Equal(t, int64(2), *adminSvc.updatedProxies[0].BackupProxyID)
 }

@@ -17,18 +17,25 @@ import (
 )
 
 type openAIQuotaWorkflowStub struct {
-	resetResult *service.OpenAIQuotaResetResult
-	resetErr    error
-	queryResult *service.OpenAIQuotaUsage
-	queryErr    error
-	cacheErr    error
+	resetResult   *service.OpenAIQuotaResetResult
+	resetErr      error
+	queryResult   *service.OpenAIQuotaUsage
+	queryErr      error
+	cacheErr      error
+	usageCacheErr error
 
-	resetCalls int
-	queryCalls int
-	cacheCalls int
+	resetCalls      int
+	queryCalls      int
+	cacheCalls      int
+	usageCacheCalls int
 
 	queryCtxErr error
 	cacheCtxErr error
+}
+
+func (s *openAIQuotaWorkflowStub) CacheUsageSnapshot(context.Context, int64, *service.OpenAIQuotaUsage) error {
+	s.usageCacheCalls++
+	return s.usageCacheErr
 }
 
 func (s *openAIQuotaWorkflowStub) ResetCredit(context.Context, int64) (*service.OpenAIQuotaResetResult, error) {
@@ -197,6 +204,7 @@ func TestOpenAIResetQuota_RecoversAccountStateBeforeRefreshingCache(t *testing.T
 	require.True(t, recoverer.lastOptions.InvalidateToken)
 	require.Equal(t, 1, quota.resetCalls)
 	require.Equal(t, 1, quota.queryCalls)
+	require.Equal(t, 1, quota.usageCacheCalls)
 	require.Equal(t, 1, quota.cacheCalls)
 	require.Equal(t, 1, recoverer.calls)
 	require.Equal(t, 1, adminService.calls)
@@ -266,6 +274,7 @@ func TestOpenAIResetQuota_QueryFailureStillRecoversAndReturnsAccount(t *testing.
 	require.Nil(t, envelope.Data.Quota)
 	require.NotNil(t, envelope.Data.Account)
 	require.Equal(t, 1, quota.queryCalls)
+	require.Zero(t, quota.usageCacheCalls)
 	require.Zero(t, quota.cacheCalls)
 	require.Equal(t, 1, recoverer.calls)
 	require.Equal(t, 1, adminService.calls)
@@ -291,6 +300,7 @@ func TestOpenAIResetQuota_CacheFailureStillRecoversAndReturnsAccount(t *testing.
 	require.Nil(t, envelope.Data.Quota)
 	require.NotNil(t, envelope.Data.Account)
 	require.Equal(t, 1, quota.cacheCalls)
+	require.Equal(t, 1, quota.usageCacheCalls)
 	require.Equal(t, 1, adminService.calls)
 }
 
@@ -374,6 +384,7 @@ func TestOpenAIRefreshQuota_PersistsSnapshot(t *testing.T) {
 	require.True(t, envelope.Data.CachePersisted)
 	require.Equal(t, int64(123), envelope.Data.FetchedAt)
 	require.Equal(t, 1, quota.queryCalls)
+	require.Equal(t, 1, quota.usageCacheCalls)
 	require.Equal(t, 1, quota.cacheCalls)
 	require.Zero(t, quota.resetCalls)
 }
@@ -401,7 +412,25 @@ func TestOpenAIRefreshQuota_PersistFailureStillReturnsUsage(t *testing.T) {
 	require.Equal(t, int64(456), envelope.Data.FetchedAt)
 	require.NotNil(t, envelope.Data.RateLimitResetCredits)
 	require.Equal(t, 2, envelope.Data.RateLimitResetCredits.AvailableCount)
+	require.Equal(t, 1, quota.usageCacheCalls)
 	require.Equal(t, 1, quota.cacheCalls)
+}
+
+func TestOpenAIRefreshQuota_UsageSnapshotFailureSkipsResetSnapshot(t *testing.T) {
+	quota := successfulOpenAIQuotaWorkflowStub()
+	quota.usageCacheErr = errors.New("usage snapshot write failed")
+	handler := &OpenAIOAuthHandler{
+		adminService: &openAIResetAdminServiceStub{},
+		quotaService: quota,
+	}
+
+	status, envelope := performOpenAIQuotaRefreshRequest(t, handler)
+
+	require.Equal(t, http.StatusOK, status)
+	require.False(t, envelope.Data.CachePersisted)
+	require.Equal(t, int64(123), envelope.Data.FetchedAt)
+	require.Equal(t, 1, quota.usageCacheCalls)
+	require.Zero(t, quota.cacheCalls)
 }
 
 // An empty-but-successful upstream read must not be dereferenced blindly.

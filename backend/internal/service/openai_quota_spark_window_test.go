@@ -30,6 +30,7 @@ type stubQuotaAccountRepo struct {
 	accounts       map[int64]*Account
 	extraUpdates   map[int64]map[string]any
 	extraUpdateErr error
+	clearedTempIDs []int64
 }
 
 func (r *stubQuotaAccountRepo) GetByID(_ context.Context, id int64) (*Account, error) {
@@ -57,6 +58,11 @@ func (r *stubQuotaAccountRepo) UpdateExtra(_ context.Context, id int64, updates 
 		r.extraUpdates = make(map[int64]map[string]any)
 	}
 	r.extraUpdates[id] = updates
+	return nil
+}
+
+func (r *stubQuotaAccountRepo) ClearTempUnschedulable(_ context.Context, id int64) error {
+	r.clearedTempIDs = append(r.clearedTempIDs, id)
 	return nil
 }
 
@@ -160,6 +166,109 @@ func TestBuildCodexSparkWindowExtraUpdates_NoBengalfox(t *testing.T) {
 	require.Nil(t, buildCodexSparkWindowExtraUpdates(usage, time.Now()))
 }
 
+func TestBuildOpenAIQuotaExtraUpdates_PersistsOrdinaryWindowsAndCredits(t *testing.T) {
+	now := time.Now().UTC()
+	account := &Account{ID: 10, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	usage := &OpenAIQuotaUsage{
+		RateLimit: &OpenAIRateLimit{
+			PrimaryWindow: &OpenAIRateLimitWindow{
+				UsedPercent:        42,
+				LimitWindowSeconds: 18000,
+				ResetAt:            now.Add(2 * time.Hour).Unix(),
+			},
+			SecondaryWindow: &OpenAIRateLimitWindow{
+				UsedPercent:        85,
+				LimitWindowSeconds: 604800,
+				ResetAfterSeconds:  86400,
+			},
+		},
+		Credits: &OpenAICodexCredits{
+			HasCredits: true,
+			Balance:    "1000.0000000000",
+		},
+	}
+
+	updates := buildOpenAIQuotaExtraUpdates(account, usage, now)
+
+	require.Equal(t, 42.0, updates["codex_5h_used_percent"])
+	require.Equal(t, 85.0, updates["codex_7d_used_percent"])
+	require.Equal(t, 7200, updates["codex_5h_reset_after_seconds"])
+	snapshot, ok := updates[openaiQuotaCreditBalanceKey].(*OpenAICodexCreditSnapshot)
+	require.True(t, ok)
+	require.Equal(t, "1000.0000000000", snapshot.Balance)
+	require.True(t, snapshot.HasCredits)
+	require.NotEmpty(t, snapshot.UpdatedAt)
+
+	account.Extra = updates
+	require.True(t, account.HasAvailableCodexCredits())
+}
+
+func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T) {
+	base := func() *Account {
+		return &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				openaiQuotaCreditBalanceKey: map[string]any{
+					"has_credits": true,
+					"balance":     "1000.0000000000",
+					"updated_at":  time.Now().UTC().Format(time.RFC3339),
+				},
+			},
+		}
+	}
+
+	require.True(t, base().HasAvailableCodexCredits())
+	zero := base()
+	zero.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["balance"] = "0"
+	require.False(t, zero.HasAvailableCodexCredits())
+	overage := base()
+	overage.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["overage_limit_reached"] = true
+	require.False(t, overage.HasAvailableCodexCredits())
+	unlimited := base()
+	unlimited.Extra[openaiQuotaCreditBalanceKey] = map[string]any{
+		"unlimited":  true,
+		"balance":    "0",
+		"updated_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	require.True(t, unlimited.HasAvailableCodexCredits())
+
+	parentID := int64(1)
+	shadow := base()
+	shadow.ParentAccountID = &parentID
+	require.False(t, shadow.HasAvailableCodexCredits())
+	dimensionOnlyShadow := base()
+	dimensionOnlyShadow.QuotaDimension = QuotaDimensionSpark
+	require.False(t, dimensionOnlyShadow.HasAvailableCodexCredits())
+
+	stale := base()
+	stale.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["updated_at"] = time.Now().Add(-openAIProbeCacheTTL - time.Minute).UTC().Format(time.RFC3339)
+	require.True(t, stale.HasAvailableCodexCredits(), "a confirmed positive balance remains spendable until a newer probe disproves it")
+}
+
+func TestCacheUsageSnapshotRestoresThresholdPausedAccountWhenCreditsAppear(t *testing.T) {
+	until := time.Now().Add(4 * time.Hour)
+	account := &Account{
+		ID:                      55,
+		Platform:                PlatformOpenAI,
+		Type:                    AccountTypeOAuth,
+		Extra:                   map[string]any{},
+		TempUnschedulableUntil:  &until,
+		TempUnschedulableReason: BuildAccountSchedulingThresholdReason("5h quota threshold reached"),
+	}
+	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{55: account}}
+	svc := &OpenAIQuotaService{accountRepo: repo}
+
+	err := svc.CacheUsageSnapshot(context.Background(), 55, &OpenAIQuotaUsage{
+		Credits: &OpenAICodexCredits{HasCredits: true, Balance: "25"},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []int64{55}, repo.clearedTempIDs)
+	require.Nil(t, account.TempUnschedulableUntil)
+	require.Empty(t, account.TempUnschedulableReason)
+}
+
 // ── Part C: ResetCredit 影子拒绝 ───────────────────────────────────────────
 
 // TestResetCreditShadowRejected 验证:
@@ -228,6 +337,7 @@ func TestResetCreditAgentIdentityUsesAssertionAndRecoversInvalidTaskOnce(t *test
 		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":2}`))
 	}))
 	defer srv.Close()
+	openAITestAccountWithProxyForURL(account, srv.URL)
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = srv.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
@@ -294,6 +404,7 @@ func TestResetCreditAgentIdentityReusesConcurrentlyRecoveredTask(t *testing.T) {
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = srv.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+	openAITestAccountWithProxyForURL(account, srv.URL)
 
 	svc := NewOpenAIQuotaService(repo, nil, nil, newQuotaRedirectingFactory(srv))
 	result, err := svc.ResetCredit(context.Background(), account.ID)
@@ -383,7 +494,7 @@ func TestQueryUsageAgentIdentityUsesAssertionWithoutOAuthToken(t *testing.T) {
 		accountHeader = r.Header.Get("chatgpt-account-id")
 		fedrampHeader = r.Header.Get("x-openai-fedramp")
 		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true}}`))
+		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":3600}}}`))
 	}))
 	defer srv.Close()
 	svc := NewOpenAIQuotaService(repo, nil, nil, newQuotaRedirectingFactory(srv))
@@ -432,9 +543,10 @@ func TestQueryUsageAgentIdentityRecoversInvalidTaskOnce(t *testing.T) {
 			_, _ = w.Write([]byte(`{"error":{"code":"invalid_task_id"}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true}}`))
+		_, _ = w.Write([]byte(`{"plan_type":"pro","rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"reset_after_seconds":3600}}}`))
 	}))
 	defer srv.Close()
+	openAITestAccountWithProxyForURL(account, srv.URL)
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = srv.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
@@ -501,6 +613,7 @@ func TestParseOpenAIRateLimitResetCreditDetails_CompatibleContainers(t *testing.
 
 func TestQueryUsageIncludesResetCreditExpirations_EndToEnd(t *testing.T) {
 	ctx := context.Background()
+	applicableCount := 0
 	account := &Account{
 		ID:       100,
 		Platform: PlatformOpenAI,
@@ -523,7 +636,11 @@ func TestQueryUsageIncludesResetCreditExpirations_EndToEnd(t *testing.T) {
 		switch r.URL.Path {
 		case "/backend-api/wham/usage":
 			_ = json.NewEncoder(w).Encode(OpenAIQuotaUsage{
-				RateLimitResetCredits: &OpenAIRateLimitResetCredits{AvailableCount: 2},
+				RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 18000, ResetAfterSeconds: 3600}},
+				RateLimitResetCredits: &OpenAIRateLimitResetCredits{
+					AvailableCount:           2,
+					ApplicableAvailableCount: &applicableCount,
+				},
 			})
 		case "/backend-api/wham/rate-limit-reset-credits":
 			detailCalls++
@@ -542,6 +659,8 @@ func TestQueryUsageIncludesResetCreditExpirations_EndToEnd(t *testing.T) {
 	require.NotNil(t, usage)
 	require.NotNil(t, usage.RateLimitResetCredits)
 	require.Equal(t, 2, usage.RateLimitResetCredits.AvailableCount)
+	require.NotNil(t, usage.RateLimitResetCredits.ApplicableAvailableCount)
+	require.Zero(t, *usage.RateLimitResetCredits.ApplicableAvailableCount)
 	require.Equal(t, 1, detailCalls)
 	require.Equal(t, openaiQuotaCodexBeta, capturedBeta)
 	require.Equal(t, []OpenAIRateLimitResetCreditDetail{
@@ -550,7 +669,8 @@ func TestQueryUsageIncludesResetCreditExpirations_EndToEnd(t *testing.T) {
 	}, usage.RateLimitResetCredits.Credits)
 	require.NoError(t, svc.CacheResetCreditsSnapshot(ctx, 100, usage.RateLimitResetCredits))
 	require.Equal(t, &OpenAIRateLimitResetCredits{
-		AvailableCount: 2,
+		AvailableCount:           2,
+		ApplicableAvailableCount: &applicableCount,
 		Credits: []OpenAIRateLimitResetCreditDetail{
 			{ExpiresAt: "2026-07-03T04:05:06Z"},
 			{ExpiresAt: "2026-07-04T04:05:06Z"},
@@ -585,6 +705,7 @@ func TestQueryUsageResetCreditDetails401NonFatal(t *testing.T) {
 		switch r.URL.Path {
 		case "/backend-api/wham/usage":
 			_ = json.NewEncoder(w).Encode(OpenAIQuotaUsage{
+				RateLimit:             &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 18000, ResetAfterSeconds: 3600}},
 				RateLimitResetCredits: &OpenAIRateLimitResetCredits{AvailableCount: 1},
 			})
 		case "/backend-api/wham/rate-limit-reset-credits":
@@ -610,6 +731,62 @@ func TestQueryUsageResetCreditDetails401NonFatal(t *testing.T) {
 	// never age it out), and the previous snapshot must survive untouched.
 	require.Error(t, svc.CacheResetCreditsSnapshot(ctx, 100, usage.RateLimitResetCredits))
 	require.Empty(t, repo.extraUpdates)
+}
+
+func TestQueryUsageForHealthResetCreditDetails401Fatal(t *testing.T) {
+	ctx := context.Background()
+	proxyID := int64(41)
+	account := &Account{
+		ID:       101,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Status:   StatusActive,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1082},
+		Credentials: map[string]any{
+			"chatgpt_account_id": "org-health-probe",
+		},
+	}
+	repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{101: account}}
+	tokenCache := &stubQuotaTokenCache{tokens: map[string]string{
+		OpenAITokenCacheKey(account): "fake-token",
+	}}
+	tokenProvider := NewOpenAITokenProvider(repo, tokenCache, nil)
+
+	var usageCalls, detailCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			usageCalls++
+			_ = json.NewEncoder(w).Encode(OpenAIQuotaUsage{
+				RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 18000, ResetAfterSeconds: 3600}},
+				Credits:   &OpenAICodexCredits{HasCredits: true, Balance: "25"},
+			})
+		case "/backend-api/wham/rate-limit-reset-credits":
+			detailCalls++
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	var factoryProxyURL string
+	redirectingFactory := newQuotaRedirectingFactory(srv)
+	svc := NewOpenAIQuotaService(repo, nil, tokenProvider, func(proxyURL string) (*req.Client, error) {
+		factoryProxyURL = proxyURL
+		return redirectingFactory(proxyURL)
+	})
+	usage, err := svc.QueryUsageForHealth(ctx, 101)
+
+	require.Error(t, err)
+	require.Nil(t, usage)
+	require.Contains(t, err.Error(), "reset-credit query failed")
+	require.Equal(t, 1, usageCalls)
+	require.Equal(t, 1, detailCalls)
+	require.Equal(t, "http://127.0.0.1:1082", factoryProxyURL)
 }
 
 func TestCacheResetCreditsSnapshot(t *testing.T) {
@@ -710,12 +887,14 @@ func TestQueryUsageShadowResolve_EndToEnd(t *testing.T) {
 	}}
 	tokenProvider := NewOpenAITokenProvider(repo, tokenCache, nil)
 
-	// httptest server 记录收到的 chatgpt-account-id header，返回空 usage JSON
+	// httptest server 记录收到的 chatgpt-account-id header，返回有效 usage JSON
 	var capturedAccountID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedAccountID = r.Header.Get("chatgpt-account-id")
 		w.Header().Set("content-type", "application/json")
-		_ = json.NewEncoder(w).Encode(OpenAIQuotaUsage{})
+		_ = json.NewEncoder(w).Encode(OpenAIQuotaUsage{
+			RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 18000, ResetAfterSeconds: 3600}},
+		})
 	}))
 	defer srv.Close()
 
@@ -725,4 +904,54 @@ func TestQueryUsageShadowResolve_EndToEnd(t *testing.T) {
 	require.NotNil(t, usage)
 	require.Equal(t, "org-e2e-parent", capturedAccountID,
 		"upstream should receive parent's chatgpt-account-id; got: %s", capturedAccountID)
+}
+
+func TestQueryUsageRejectsSuccessWithoutValidRateLimitWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty object", body: `{}`},
+		{name: "empty rate limit", body: `{"rate_limit":{}}`},
+		{name: "window without timing", body: `{"rate_limit":{"primary_window":{"used_percent":42}}}`},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accountID := int64(910 + i)
+			account := &Account{
+				ID:       accountID,
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				Status:   StatusActive,
+				Credentials: map[string]any{
+					"chatgpt_account_id": "org-invalid-usage",
+				},
+			}
+			repo := &stubQuotaAccountRepo{accounts: map[int64]*Account{accountID: account}}
+			tokenCache := &stubQuotaTokenCache{tokens: map[string]string{
+				OpenAITokenCacheKey(account): "fake-token",
+			}}
+			tokenProvider := NewOpenAITokenProvider(repo, tokenCache, nil)
+			resetCreditCalls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("content-type", "application/json")
+				if r.URL.Path == "/backend-api/wham/usage" {
+					_, _ = w.Write([]byte(tt.body))
+					return
+				}
+				resetCreditCalls++
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+
+			svc := NewOpenAIQuotaService(repo, nil, tokenProvider, newQuotaRedirectingFactory(srv))
+			usage, err := svc.QueryUsage(context.Background(), accountID)
+
+			require.Error(t, err)
+			require.Nil(t, usage)
+			require.Contains(t, err.Error(), "valid rate-limit window")
+			require.Zero(t, resetCreditCalls, "invalid usage must fail before querying reset credits")
+		})
+	}
 }

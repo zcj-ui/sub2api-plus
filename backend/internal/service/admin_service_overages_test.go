@@ -85,6 +85,89 @@ func TestUpdateAccount_DisableOveragesClearsAICreditsKey(t *testing.T) {
 	require.True(t, exists, "普通模型限流应保留")
 }
 
+func TestUpdateAccount_EnableOveragesRequiresExplicitConfirmation(t *testing.T) {
+	accountID := int64(105)
+	repo := &updateAccountOveragesRepoStub{
+		account: &Account{
+			ID:       accountID,
+			Platform: PlatformAntigravity,
+			Type:     AccountTypeOAuth,
+			Status:   StatusActive,
+			Extra:    map[string]any{},
+		},
+	}
+
+	svc := &adminServiceImpl{accountRepo: repo}
+	updated, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
+		Extra: map[string]any{"allow_overages": true},
+	})
+
+	require.ErrorIs(t, err, ErrOveragesConfirmationRequired)
+	require.Nil(t, updated)
+	require.Zero(t, repo.updateCalls)
+	require.False(t, repo.account.IsOveragesEnabled())
+}
+
+func TestUpdateAccount_ExistingOveragesDoesNotRequireRepeatedConfirmation(t *testing.T) {
+	accountID := int64(106)
+	repo := &updateAccountOveragesRepoStub{
+		account: &Account{
+			ID:       accountID,
+			Platform: PlatformAntigravity,
+			Type:     AccountTypeOAuth,
+			Status:   StatusActive,
+			Extra:    map[string]any{"allow_overages": true},
+		},
+	}
+
+	svc := &adminServiceImpl{accountRepo: repo}
+	updated, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
+		Extra: map[string]any{"allow_overages": true, "mixed_scheduling": true},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	require.Equal(t, 1, repo.updateCalls)
+	require.True(t, updated.IsOveragesEnabled())
+}
+
+func TestCreateAccount_EnableOveragesRequiresExplicitConfirmation(t *testing.T) {
+	repo := &longContextBillingRepoStub{}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	created, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+		Name:                 "paid-antigravity",
+		Platform:             PlatformAntigravity,
+		Type:                 AccountTypeOAuth,
+		Credentials:          map[string]any{"access_token": "test"},
+		Extra:                map[string]any{"allow_overages": true},
+		SkipDefaultGroupBind: true,
+	})
+
+	require.ErrorIs(t, err, ErrOveragesConfirmationRequired)
+	require.Nil(t, created)
+	require.Nil(t, repo.createdAccount)
+}
+
+func TestCreateAccount_EnableOveragesWithConfirmation(t *testing.T) {
+	repo := &longContextBillingRepoStub{}
+	svc := &adminServiceImpl{accountRepo: repo}
+
+	created, err := svc.CreateAccount(context.Background(), &CreateAccountInput{
+		Name:                 "paid-antigravity",
+		Platform:             PlatformAntigravity,
+		Type:                 AccountTypeOAuth,
+		Credentials:          map[string]any{"access_token": "test"},
+		Extra:                map[string]any{"allow_overages": true},
+		SkipDefaultGroupBind: true,
+		ConfirmOveragesRisk:  true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	require.True(t, created.IsOveragesEnabled())
+}
+
 func TestUpdateAccount_EnableOveragesClearsModelRateLimitsBeforePersist(t *testing.T) {
 	accountID := int64(102)
 	repo := &updateAccountOveragesRepoStub{
@@ -107,6 +190,7 @@ func TestUpdateAccount_EnableOveragesClearsModelRateLimitsBeforePersist(t *testi
 
 	svc := &adminServiceImpl{accountRepo: repo}
 	updated, err := svc.UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
+		ConfirmOveragesRisk: true,
 		Extra: map[string]any{
 			"mixed_scheduling": true,
 			"allow_overages":   true,

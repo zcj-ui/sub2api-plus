@@ -1,5 +1,5 @@
 # =============================================================================
-# Sub2API Docker Compose - Local Development Build
+# Sub2API Plus Docker Compose - Local Development Build
 # =============================================================================
 # Build from local source code for testing changes.
 #
@@ -15,6 +15,10 @@ services:
       dockerfile: Dockerfile
       args:
         NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmmirror.com}
+        VERSION: ${SUB2API_BUILD_VERSION:-0.0.0-dev}
+        BUILD_TYPE: dev
+        UPDATE_REPO: ${SUB2API_UPDATE_REPO:-zcj-ui/sub2api-plus}
+        REPOSITORY_URL: ${SUB2API_REPOSITORY_URL:-https://github.com/zcj-ui/sub2api-plus}
     container_name: sub2api-dev
     restart: unless-stopped
     security_opt:
@@ -30,6 +34,7 @@ services:
       - SERVER_MODE=debug
       - ENABLE_SERVER_TIMING=${ENABLE_SERVER_TIMING:-false}
       - RUN_MODE=${RUN_MODE:-standard}
+      - SUB2API_UPDATE_REPO=${SUB2API_UPDATE_REPO:-}
       - DATABASE_HOST=postgres
       - DATABASE_PORT=5432
       - DATABASE_USER=${POSTGRES_USER:-sub2api}

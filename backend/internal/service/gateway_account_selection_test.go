@@ -151,6 +151,22 @@ func TestFilterByMinLoadRate_SelectsMinLoadRate(t *testing.T) {
 	require.Equal(t, int64(3), result[1].account.ID)
 }
 
+func TestAccountHasImmediateConcurrencySlotUsesHardConcurrency(t *testing.T) {
+	loadFactor := 1
+	account := &Account{ID: 1, Concurrency: 4, LoadFactor: &loadFactor}
+
+	require.True(t, accountHasImmediateConcurrencySlot(account, &AccountLoadInfo{
+		AccountID:          account.ID,
+		CurrentConcurrency: 1,
+		LoadRate:           25,
+	}), "a saturated soft load factor must not hide free hard concurrency slots")
+	require.False(t, accountHasImmediateConcurrencySlot(account, &AccountLoadInfo{
+		AccountID:          account.ID,
+		CurrentConcurrency: 4,
+		LoadRate:           25,
+	}), "a low load rate must not make a hard-full account immediately available")
+}
+
 // --- selectByLRU ---
 
 func TestSelectByLRU_Empty(t *testing.T) {

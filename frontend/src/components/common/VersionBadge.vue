@@ -651,9 +651,8 @@ import {
 import { useClipboard } from '@/composables/useClipboard'
 import Icon from '@/components/icons/Icon.vue'
 
-const GITHUB_REPO = 'Wei-Shaw/sub2api'
-// Docker Hub image published by CI (tags carry no "v" prefix, e.g. weishaw/sub2api:0.1.146)
-const DOCKER_IMAGE = 'weishaw/sub2api'
+const GITHUB_REPO = 'zcj-ui/sub2api-plus'
+const DOCKER_IMAGE = 'ghcr.io/zcj-ui/sub2api-plus'
 
 const { t } = useI18n()
 
@@ -728,8 +727,8 @@ const activeManualCommand = computed(() =>
   manualTab.value === 'docker' ? dockerRollbackCommand.value : scriptRollbackCommand.value
 )
 
-// Only show update check for release builds (binary/docker deployment)
-const isReleaseBuild = computed(() => buildType.value === 'release')
+// Development snapshots and stable releases are both packaged binaries.
+const isReleaseBuild = computed(() => buildType.value === 'release' || buildType.value === 'dev')
 
 function toggleDropdown() {
   dropdownOpen.value = !dropdownOpen.value

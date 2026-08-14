@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 // ForwardUpstream 使用 base_url + /v1/messages + 双 header 认证透传上游 Claude 请求
@@ -30,8 +31,6 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 	if baseURL == "" || apiKey == "" {
 		return nil, fmt.Errorf("upstream account missing base_url or api_key")
 	}
-	baseURL = strings.TrimSuffix(baseURL, "/")
-
 	// 解析请求获取模型信息
 	var claudeReq antigravity.ClaudeRequest
 	if err := json.Unmarshal(body, &claudeReq); err != nil {
@@ -41,9 +40,19 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 		return nil, fmt.Errorf("missing model")
 	}
 	originalModel := claudeReq.Model
+	mappedModel := account.GetMappedModel(originalModel)
+	if mappedModel != originalModel {
+		updatedBody, mapErr := sjson.SetBytes(body, "model", mappedModel)
+		if mapErr != nil {
+			return nil, fmt.Errorf("apply upstream model mapping: %w", mapErr)
+		}
+		body = updatedBody
+		claudeReq.Model = mappedModel
+	}
 
-	// 构建上游请求 URL
-	upstreamURL := baseURL + "/v1/messages"
+	// The configured base may be a root, /v1, /v1/messages, or a reverse
+	// proxy prefix. Build it idempotently so relay URLs are never duplicated.
+	upstreamURL := buildAnthropicRelayEndpointURL(baseURL, "/v1/messages")
 
 	// 能力维度 sanitize：Anthropic-compatible 上游透传路径也需要保证 body↔beta header
 	// 对称。客户端 anthropic-beta header 不含 context-management-2025-06-27 但 body 带
@@ -59,23 +68,34 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 		return nil, fmt.Errorf("create upstream request: %w", err)
 	}
 
-	// 设置请求头
+	// Preserve the same Claude/Claude Code compatibility headers accepted by
+	// the regular Anthropic path, then pin relay authentication from account
+	// credentials. Header overrides are applied last for supported accounts.
+	if c != nil && c.Request != nil {
+		for key, values := range c.Request.Header {
+			if !allowedHeaders[strings.ToLower(key)] {
+				continue
+			}
+			for _, value := range values {
+				req.Header.Add(resolveWireCasing(key), value)
+			}
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("x-api-key", apiKey) // Claude API 兼容
+	req.Header.Set("x-api-key", apiKey)
 
-	// 透传 Claude 相关 headers
-	if v := c.GetHeader("anthropic-version"); v != "" {
-		req.Header.Set("anthropic-version", v)
+	if req.Header.Get("anthropic-version") == "" {
+		req.Header.Set("anthropic-version", "2023-06-01")
 	}
-	if v := clientBeta; v != "" {
-		req.Header.Set("anthropic-beta", v)
+	if clientBeta != "" {
+		req.Header.Set("anthropic-beta", clientBeta)
 	}
+	account.ApplyHeaderOverrides(req.Header)
 
-	// 代理 URL
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, fmt.Errorf("resolve upstream proxy: %w", proxyErr)
 	}
 
 	// 发送请求
@@ -90,9 +110,19 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 	if resp.StatusCode >= 400 {
 		respBody := s.readUpstreamErrorBody(resp)
 
-		// 429 错误时标记账号限流
-		if resp.StatusCode == http.StatusTooManyRequests {
-			s.handleUpstreamError(ctx, prefix, account, resp.StatusCode, resp.Header, respBody, originalModel, 0, "", false)
+		// An upstream relay is not the native Antigravity quota endpoint. Use
+		// generic account error handling and leave native OAuth quota semantics
+		// untouched.
+		if s.rateLimitService != nil {
+			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, mappedModel)
+		}
+		if s.shouldFailoverUpstreamError(resp.StatusCode) {
+			return nil, &UpstreamFailoverError{
+				StatusCode:        resp.StatusCode,
+				ResponseBody:      respBody,
+				ResponseHeaders:   resp.Header.Clone(),
+				NextAccountAction: NextAccountRetry,
+			}
 		}
 
 		// 透传上游错误
@@ -100,9 +130,7 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 		c.Status(resp.StatusCode)
 		_, _ = c.Writer.Write(respBody)
 
-		return &ForwardResult{
-			Model: originalModel,
-		}, nil
+		return nil, fmt.Errorf("upstream error: %d", resp.StatusCode)
 	}
 
 	// 处理成功响应（流式/非流式）
@@ -110,9 +138,10 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 	var firstTokenMs *int
 	var clientDisconnect bool
 
-	if claudeReq.Stream {
+	upstreamStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	if upstreamStream {
 		// 流式响应：透传
-		c.Header("Content-Type", "text/event-stream")
+		c.Header("Content-Type", resp.Header.Get("Content-Type"))
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("X-Accel-Buffering", "no")
@@ -133,8 +162,12 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 		upstreamResponseModelObserverFromContext(c).ObserveAnthropic(respBody)
 		usage = s.extractClaudeUsage(respBody)
 
-		c.Header("Content-Type", resp.Header.Get("Content-Type"))
-		c.Status(http.StatusOK)
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		c.Header("Content-Type", contentType)
+		c.Status(resp.StatusCode)
 		_, _ = c.Writer.Write(respBody)
 	}
 
@@ -143,10 +176,12 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
 	logger.LegacyPrintf("service.antigravity_gateway", "%s status=success duration_ms=%d", prefix, duration.Milliseconds())
 
 	return &ForwardResult{
+		RequestID:                     strings.TrimSpace(resp.Header.Get("x-request-id")),
 		Model:                         originalModel,
+		UpstreamModel:                 mappedModel,
 		UpstreamResponseModel:         observedUpstreamResponseModel(c),
 		UpstreamResponseModelConflict: observedUpstreamResponseModelConflict(c),
-		Stream:                        claudeReq.Stream,
+		Stream:                        upstreamStream,
 		Duration:                      duration,
 		FirstTokenMs:                  firstTokenMs,
 		ClientDisconnect:              clientDisconnect,

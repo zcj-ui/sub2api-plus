@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,18 +14,264 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOpenAI429FastPath_MarksOAuthAccountCoolingDown(t *testing.T) {
+func TestOpenAI429FastPath_RequiresTwoOAuthResponsesBeforeCoolingDown(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	apiKeyAccount := &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 
-	shouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+	firstShouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
 	apiKeyShouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), apiKeyAccount, http.StatusTooManyRequests, http.Header{}, nil)
 
-	require.False(t, shouldDisable)
+	require.False(t, firstShouldDisable)
 	require.False(t, apiKeyShouldDisable)
-	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(apiKeyAccount))
+
+	secondShouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+	require.False(t, secondShouldDisable)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAI429FastPath_ConfirmationExpiresAndSuccessClearsIt(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	account := &Account{ID: 44, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now))
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now.Add(openAIOAuth429ConfirmationWindow+time.Second)))
+	svc.clearOpenAIOAuth429Streak(account.ID)
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now.Add(openAIOAuth429ConfirmationWindow+2*time.Second)))
+}
+
+func TestOpenAI429FastPath_ConcurrentConfirmationIsAtomic(t *testing.T) {
+	svc := &OpenAIGatewayService{rateLimitService: NewRateLimitService(nil, nil, nil, nil, nil)}
+	now := time.Now()
+	results := make(chan bool, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- svc.confirmOpenAIOAuth429(440, now)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	confirmed := 0
+	for result := range results {
+		if result {
+			confirmed++
+		}
+	}
+	require.Equal(t, 1, confirmed, "exactly one of two concurrent 429 responses should confirm the cooldown")
+}
+
+type sharedOpenAI429CounterCache struct {
+	mu     sync.Mutex
+	counts map[int64]int64
+	err    error
+}
+
+func (c *sharedOpenAI429CounterCache) IncrementOpenAI429Count(_ context.Context, accountID int64, _ time.Duration) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, c.err
+	}
+	if c.counts == nil {
+		c.counts = make(map[int64]int64)
+	}
+	c.counts[accountID]++
+	count := c.counts[accountID]
+	if count >= 2 {
+		delete(c.counts, accountID)
+	}
+	return count, nil
+}
+
+func (c *sharedOpenAI429CounterCache) ResetOpenAI429Count(_ context.Context, accountID int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return c.err
+	}
+	delete(c.counts, accountID)
+	return nil
+}
+
+func TestOpenAI429FastPath_ConfirmationIsSharedAcrossInstances(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{}
+	firstRateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	firstRateLimit.SetOpenAI429CounterCache(counter)
+	secondRateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	secondRateLimit.SetOpenAI429CounterCache(counter)
+
+	first := &OpenAIGatewayService{rateLimitService: firstRateLimit}
+	second := &OpenAIGatewayService{rateLimitService: secondRateLimit}
+	now := time.Now()
+	require.False(t, first.confirmOpenAIOAuth429(441, now))
+	require.True(t, second.confirmOpenAIOAuth429(441, now.Add(time.Second)))
+}
+
+func TestOpenAI429FastPath_CacheFailureUsesLocalMirror(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{}
+	rateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	rateLimit.SetOpenAI429CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimit}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(442, now))
+	counter.err = errors.New("redis unavailable")
+	require.True(t, svc.confirmOpenAIOAuth429(442, now.Add(time.Second)))
+}
+
+func TestOpenAI429FastPath_CacheFailureThenRecoveryConfirmsSecondResponse(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{err: errors.New("redis unavailable")}
+	rateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	rateLimit.SetOpenAI429CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimit}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(443, now))
+	counter.mu.Lock()
+	counter.err = nil
+	counter.mu.Unlock()
+	require.True(t, svc.confirmOpenAIOAuth429(443, now.Add(time.Second)), "the recovered Redis count must not replace the first local observation")
+}
+
+func TestOpenAI429FastPath_ResetFailureStartsFreshRemoteGenerationAfterRecovery(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{}
+	rateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	rateLimit.SetOpenAI429CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimit}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(444, now))
+	counter.mu.Lock()
+	counter.err = errors.New("redis unavailable during reset")
+	counter.mu.Unlock()
+	svc.clearOpenAIOAuth429Streak(444)
+
+	counter.mu.Lock()
+	counter.err = nil
+	counter.mu.Unlock()
+	require.False(t, svc.confirmOpenAIOAuth429(444, now.Add(time.Second)), "the first 429 after recovery must start a new generation")
+	require.True(t, svc.confirmOpenAIOAuth429(444, now.Add(2*time.Second)))
+}
+
+func TestOpenAI429FastPath_ResetRecoveryOnSecondNewResponseStillConfirms(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{}
+	rateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	rateLimit.SetOpenAI429CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimit}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(445, now))
+	counter.mu.Lock()
+	counter.err = errors.New("redis unavailable during reset")
+	counter.mu.Unlock()
+	svc.clearOpenAIOAuth429Streak(445)
+
+	require.False(t, svc.confirmOpenAIOAuth429(445, now.Add(time.Second)))
+	counter.mu.Lock()
+	counter.err = nil
+	counter.mu.Unlock()
+	require.True(t, svc.confirmOpenAIOAuth429(445, now.Add(2*time.Second)), "Redis recovery must not discard the first locally observed 429 in the new generation")
+}
+
+func TestOpenAI429FastPath_FirstResponsePersistsObservationBeforeSecondFreezes(t *testing.T) {
+	repo := &openAI429SnapshotRepo{}
+	rateLimitService := NewRateLimitService(repo, nil, nil, nil, nil)
+	svc := &OpenAIGatewayService{accountRepo: repo, rateLimitService: rateLimitService}
+	rateLimitService.SetAccountRuntimeBlocker(svc)
+	account := &Account{
+		ID:          45,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "plus"},
+	}
+	headers := http.Header{
+		"X-Codex-Primary-Used-Percent":        []string{"100"},
+		"X-Codex-Primary-Reset-After-Seconds": []string{"3600"},
+		"X-Codex-Primary-Window-Minutes":      []string{"300"},
+	}
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"limit reached","plan_type":"free","resets_in_seconds":3600}}`)
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, body)
+	require.Zero(t, repo.rateLimitedID)
+	require.NotEmpty(t, repo.updatedExtra, "the first 429 should refresh quota data without freezing the account")
+	require.Equal(t, 1, repo.updatedExtraCalls)
+	require.Equal(t, 1, repo.bulkUpdateCalls)
+	require.Equal(t, []int64{account.ID}, repo.bulkUpdatedIDs)
+	require.Equal(t, "free", repo.bulkUpdatedPayload.Credentials["plan_type"])
+	require.Equal(t, "free", account.Credentials["plan_type"])
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, body)
+	require.Equal(t, account.ID, repo.rateLimitedID)
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.Equal(t, 2, repo.updatedExtraCalls)
+	require.Equal(t, 1, repo.bulkUpdateCalls, "the unchanged observed plan must not be persisted twice")
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAI429FastPath_FirstResponseUsesGatewayRepositoryWithoutRateLimitService(t *testing.T) {
+	repo := &openAI429SnapshotRepo{}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+	account := &Account{
+		ID:          452,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"plan_type": "plus"},
+	}
+	headers := http.Header{
+		"X-Codex-Primary-Used-Percent":        []string{"100"},
+		"X-Codex-Primary-Reset-After-Seconds": []string{"3600"},
+		"X-Codex-Primary-Window-Minutes":      []string{"300"},
+	}
+	body := []byte(`{"error":{"type":"usage_limit_reached","plan_type":"pro"}}`)
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, body)
+
+	require.Equal(t, 1, repo.updatedExtraCalls)
+	require.Equal(t, 1, repo.bulkUpdateCalls)
+	require.Equal(t, "pro", account.Credentials["plan_type"])
+	require.Zero(t, repo.rateLimitedCalls)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAI429FastPath_ConfirmationPrecedesCustomTempRule(t *testing.T) {
+	repo := &errorPolicyRepoStub{}
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimitService}
+	rateLimitService.SetAccountRuntimeBlocker(svc)
+	account := &Account{
+		ID:          451,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{
+			"temp_unschedulable_enabled": true,
+			"temp_unschedulable_rules": []any{
+				map[string]any{
+					"error_code":       float64(http.StatusTooManyRequests),
+					"keywords":         []any{"rate limit"},
+					"duration_minutes": float64(10),
+				},
+			},
+		},
+	}
+	body := []byte(`{"error":{"message":"rate limit reached"}}`)
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, body)
+	require.Zero(t, repo.tempCalls, "the first 429 must not match a custom cooldown rule")
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, body)
+	require.Equal(t, 1, repo.tempCalls)
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
 // TestOpenAI429FastPath_SkipsSparkShadow 外审第8轮 P1:spark 影子被选中后若 /responses 返回 429,
@@ -39,6 +286,12 @@ func TestOpenAI429FastPath_SkipsSparkShadow(t *testing.T) {
 		ParentAccountID: &parentID,
 		QuotaDimension:  QuotaDimensionSpark,
 	}
+	dimensionOnlyShadow := &Account{
+		ID:             803,
+		Platform:       PlatformOpenAI,
+		Type:           AccountTypeOAuth,
+		QuotaDimension: QuotaDimensionSpark,
+	}
 	normal := &Account{ID: 802, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 
 	headers := http.Header{}
@@ -47,9 +300,13 @@ func TestOpenAI429FastPath_SkipsSparkShadow(t *testing.T) {
 	headers.Set("x-codex-primary-window-minutes", "300")
 
 	svc.markOpenAIOAuth429RateLimited(context.Background(), shadow, headers, nil)
-	svc.markOpenAIOAuth429RateLimited(context.Background(), normal, headers, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), dimensionOnlyShadow, http.StatusTooManyRequests, headers, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), dimensionOnlyShadow, http.StatusTooManyRequests, headers, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), normal, http.StatusTooManyRequests, headers, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), normal, http.StatusTooManyRequests, headers, nil)
 
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(shadow), "spark shadow must not be runtime-blocked by /responses global 429")
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(dimensionOnlyShadow), "spark quota dimension must be excluded even when parent linkage is missing")
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(normal), "normal OpenAI OAuth account should still be runtime-blocked")
 }
 
@@ -69,6 +326,35 @@ func TestOpenAIRuntimeBlock_DoesNotApplyToOtherPlatforms(t *testing.T) {
 	svc.BlockAccountScheduling(account, time.Time{}, "custom_error_code")
 
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAIRuntimeBlock_CreditsOnlyOverrideLocalThresholdReason(t *testing.T) {
+	account := &Account{
+		ID:          46,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			openaiQuotaCreditBalanceKey: map[string]any{
+				"has_credits": true,
+				"balance":     "25",
+				"updated_at":  time.Now().Format(time.RFC3339),
+			},
+		},
+	}
+	require.True(t, account.HasAvailableCodexCredits())
+
+	thresholdSvc := &OpenAIGatewayService{}
+	thresholdSvc.BlockAccountScheduling(account, time.Now().Add(time.Hour), "account_scheduling_threshold")
+	thresholdReason, ok := thresholdSvc.openaiAccountRuntimeBlockReason.Load(account.ID)
+	require.True(t, ok)
+	require.Equal(t, "account_scheduling_threshold", thresholdReason)
+	require.False(t, thresholdSvc.isOpenAIAccountRuntimeBlocked(account))
+
+	upstreamSvc := &OpenAIGatewayService{}
+	upstreamSvc.BlockAccountScheduling(account, time.Now().Add(time.Hour), "429")
+	require.True(t, upstreamSvc.isOpenAIAccountRuntimeBlocked(account))
 }
 
 func TestOpenAIRuntimeBlocker_IgnoresNonOpenAIFromRateLimitService(t *testing.T) {
@@ -315,6 +601,17 @@ func TestOpenAIOAuth429_MatchingModelTempRuleAvoidsAccountRuntimeBlock(t *testin
 		[]byte(`{"error":{"message":"model quota exhausted"}}`),
 		"gpt-5.4",
 	)
+	require.False(t, shouldDisable)
+	require.Empty(t, repo.modelRateLimitCalls)
+
+	shouldDisable = svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusTooManyRequests,
+		http.Header{},
+		[]byte(`{"error":{"message":"model quota exhausted"}}`),
+		"gpt-5.4",
+	)
 
 	require.True(t, shouldDisable)
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
@@ -346,6 +643,16 @@ func TestOpenAIOAuth429_NonmatchingModelTempRuleKeepsAccountRuntimeBlock(t *test
 		"gpt-5.4",
 	)
 
+	require.False(t, shouldDisable)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	shouldDisable = svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusTooManyRequests,
+		http.Header{},
+		[]byte(`{"error":{"message":"global rate limit"}}`),
+		"gpt-5.4",
+	)
 	require.False(t, shouldDisable)
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 	require.Empty(t, repo.modelRateLimitCalls)

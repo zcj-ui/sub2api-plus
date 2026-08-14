@@ -1,10 +1,22 @@
-.PHONY: build generate test test-unit test-integration test-e2e
+.PHONY: build build-dev build-release generate test test-unit test-integration test-e2e
 
 VERSION ?= $(shell ./scripts/resolve-version.sh)
-LDFLAGS ?= -s -w -X main.Version=$(VERSION)
+COMMIT ?= $(shell git rev-parse --short=8 HEAD 2>/dev/null || printf unknown)
+DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+BUILD_TYPE ?= source
+UPDATE_REPO ?= zcj-ui/sub2api-plus
+DEV_VERSION ?= $(VERSION)-dev.$(COMMIT)
+GO_BUILD_FLAGS ?=
+LDFLAGS ?= -s -w -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.Date=$(DATE) -X main.BuildType=$(BUILD_TYPE) -X main.UpdateRepo=$(UPDATE_REPO)
 
 build:
-	CGO_ENABLED=0 go build -ldflags="$(LDFLAGS)" -trimpath -o bin/server ./cmd/server
+	CGO_ENABLED=0 go build $(GO_BUILD_FLAGS) -ldflags="$(LDFLAGS)" -trimpath -o bin/server ./cmd/server
+
+build-dev:
+	@$(MAKE) build VERSION=$(DEV_VERSION) BUILD_TYPE=dev GO_BUILD_FLAGS="-tags=embed"
+
+build-release:
+	@$(MAKE) build BUILD_TYPE=release GO_BUILD_FLAGS="-tags=embed"
 
 generate:
 	go generate ./ent

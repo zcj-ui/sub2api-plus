@@ -128,6 +128,13 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 			return nil, sessionResolution, fmt.Errorf("resolve chatgpt account headers: %w", err)
 		}
 		headers.Set("originator", resolveOpenAIUpstreamOriginator(c, isCodexCLI))
+		if c != nil {
+			if fpIDs, ok := c.Get(codexFingerprintIDsContextKey); ok {
+				if ids, ok := fpIDs.(*codexFingerprintIDs); ok {
+					applyCodexFingerprintHeaders(headers, ids)
+				}
+			}
+		}
 	}
 
 	betaValue := openAIWSBetaV2Value
@@ -552,7 +559,8 @@ func openAIWSRawItemsHasPrefix(items []json.RawMessage, prefix []json.RawMessage
 
 func openAIWSRawItemsHasFunctionCallOutput(items []json.RawMessage) bool {
 	for _, item := range items {
-		if isCodexToolCallOutputItemType(gjson.GetBytes(item, "type").String()) {
+		parsed := gjson.ParseBytes(item)
+		if !isCodexSyntheticAgentContextJSONItem(parsed) && isCodexToolCallOutputItemType(parsed.Get("type").String()) {
 			return true
 		}
 	}
@@ -566,8 +574,12 @@ func openAIWSRawItemsHaveToolCallContextForOutputs(items []json.RawMessage) bool
 	contextCallIDs := make(map[string]struct{})
 	outputCallIDs := make(map[string]struct{})
 	for _, item := range items {
-		itemType := gjson.GetBytes(item, "type").String()
-		callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+		parsed := gjson.ParseBytes(item)
+		if isCodexSyntheticAgentContextJSONItem(parsed) {
+			continue
+		}
+		itemType := parsed.Get("type").String()
+		callID := strings.TrimSpace(parsed.Get("call_id").String())
 		switch {
 		case isCodexToolCallContextItemType(itemType):
 			if callID != "" {
@@ -601,14 +613,14 @@ func openAIWSRawPayloadHasToolCallOutput(payload []byte) bool {
 	}
 	if input.IsArray() {
 		for _, item := range input.Array() {
-			if isCodexToolCallOutputItemType(item.Get("type").String()) {
+			if !isCodexSyntheticAgentContextJSONItem(item) && isCodexToolCallOutputItemType(item.Get("type").String()) {
 				return true
 			}
 		}
 		return false
 	}
 	if input.Type == gjson.JSON {
-		return isCodexToolCallOutputItemType(input.Get("type").String())
+		return !isCodexSyntheticAgentContextJSONItem(input) && isCodexToolCallOutputItemType(input.Get("type").String())
 	}
 	return false
 }

@@ -26,6 +26,7 @@ type OpenAIOAuthHandler struct {
 
 type openAIQuotaService interface {
 	QueryUsage(ctx context.Context, accountID int64) (*service.OpenAIQuotaUsage, error)
+	CacheUsageSnapshot(ctx context.Context, accountID int64, usage *service.OpenAIQuotaUsage) error
 	CacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *service.OpenAIRateLimitResetCredits) error
 	ResetCredit(ctx context.Context, accountID int64) (*service.OpenAIQuotaResetResult, error)
 }
@@ -212,9 +213,15 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 	var proxyURL string
 	if req.ProxyID != nil {
 		proxy, err := h.adminService.GetProxy(c.Request.Context(), *req.ProxyID)
-		if err == nil && proxy != nil {
-			proxyURL = proxy.URL()
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
 		}
+		if proxy == nil || strings.TrimSpace(proxy.URL()) == "" {
+			response.BadRequest(c, "configured proxy is unavailable")
+			return
+		}
+		proxyURL = proxy.URL()
 	}
 
 	// 未指定 client_id 时，根据请求路径平台自动设置默认值，避免 repository 层盲猜
@@ -399,9 +406,11 @@ func (h *OpenAIOAuthHandler) CreateAccountFromCodexPAT(c *gin.Context) {
 			response.ErrorFrom(c, err)
 			return
 		}
-		if proxy != nil {
-			proxyURL = proxy.URL()
+		if proxy == nil || strings.TrimSpace(proxy.URL()) == "" {
+			response.BadRequest(c, "configured proxy is unavailable")
+			return
 		}
+		proxyURL = proxy.URL()
 	}
 
 	tokenInfo, err := h.openaiOAuthService.ValidateCodexPersonalAccessToken(c.Request.Context(), req.AccessToken, proxyURL)
@@ -525,6 +534,11 @@ func (h *OpenAIOAuthHandler) RefreshQuota(c *gin.Context) {
 	}
 
 	refreshResponse := openAIQuotaRefreshResponse{OpenAIQuotaUsage: *usage}
+	if err := h.quotaService.CacheUsageSnapshot(c.Request.Context(), accountID, usage); err != nil {
+		slog.Warn("openai_quota_usage_cache_persist_failed", "account_id", accountID, "error", err)
+		response.Success(c, refreshResponse)
+		return
+	}
 	// A failed snapshot write leaves the previous cache intact — report it as a
 	// partial success instead of discarding the usage payload we just fetched,
 	// which would leave the card without a credit count at all.
@@ -628,7 +642,10 @@ func (h *OpenAIOAuthHandler) ResetQuota(c *gin.Context) {
 		slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error", usageErr)
 		resetResponse.WarningCode = openAIQuotaResetWarningCacheRefreshFailed
 	default:
-		if err := h.quotaService.CacheResetCreditsSnapshot(postCtx, accountID, usage.RateLimitResetCredits); err != nil {
+		if err := h.quotaService.CacheUsageSnapshot(postCtx, accountID, usage); err != nil {
+			slog.Warn("openai_quota_usage_cache_refresh_failed", "account_id", accountID, "error", err)
+			resetResponse.WarningCode = openAIQuotaResetWarningCacheRefreshFailed
+		} else if err := h.quotaService.CacheResetCreditsSnapshot(postCtx, accountID, usage.RateLimitResetCredits); err != nil {
 			slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error", err)
 			resetResponse.WarningCode = openAIQuotaResetWarningCacheRefreshFailed
 		} else {

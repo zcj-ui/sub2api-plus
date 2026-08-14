@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,10 +13,11 @@ import (
 func TestParseOpenAIRateLimitResetCreditDetails_PreservesAvailableCreditOrder(t *testing.T) {
 	body := []byte(`{
 		"availableCount":"2",
+		"applicableAvailableCount":"1",
 		"credits":[
 			{"reset_type":"codex_rate_limits","status":"redeemed","expires_at":"2026-07-01T04:05:06Z"},
-			{"reset_type":"codex_rate_limits","status":"available","expires_at":"2026-07-04T04:05:06Z"},
-			{"resetType":"codex_rate_limits","status":"available","expiresAt":"2026-07-03T04:05:06Z"},
+			{"reset_type":"codex_rate_limits","status":"available","consumable_until":"2026-07-05T04:05:06Z","expires_at":"2026-07-04T04:05:06Z"},
+			{"resetType":"codex_rate_limits","status":"available","consumableUntil":"2026-07-06T04:05:06Z","expiresAt":"2026-07-03T04:05:06Z"},
 			{"reset_type":"other","status":"available","expires_at":"2026-07-02T04:05:06Z"}
 		]
 	}`)
@@ -24,9 +26,11 @@ func TestParseOpenAIRateLimitResetCreditDetails_PreservesAvailableCreditOrder(t 
 	require.NoError(t, err)
 	require.NotNil(t, details.AvailableCount)
 	require.Equal(t, 2, *details.AvailableCount)
+	require.NotNil(t, details.ApplicableAvailableCount)
+	require.Equal(t, 1, *details.ApplicableAvailableCount)
 	require.Equal(t, []OpenAIRateLimitResetCreditDetail{
-		{ExpiresAt: "2026-07-04T04:05:06Z"},
-		{ExpiresAt: "2026-07-03T04:05:06Z"},
+		{ExpiresAt: "2026-07-05T04:05:06Z"},
+		{ExpiresAt: "2026-07-06T04:05:06Z"},
 	}, details.Credits)
 }
 
@@ -141,6 +145,7 @@ func TestQueryUsageResetCreditCountPrecedence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			usageBody := withValidOpenAIQuotaWindow(t, tt.usageBody)
 			account := &Account{
 				ID:       100,
 				Platform: PlatformOpenAI,
@@ -161,7 +166,7 @@ func TestQueryUsageResetCreditCountPrecedence(t *testing.T) {
 				w.Header().Set("content-type", "application/json")
 				switch r.URL.Path {
 				case "/backend-api/wham/usage":
-					_, _ = w.Write([]byte(tt.usageBody))
+					_, _ = w.Write([]byte(usageBody))
 				case "/backend-api/wham/rate-limit-reset-credits":
 					detailCalls++
 					_, _ = w.Write([]byte(tt.detailBody))
@@ -185,4 +190,20 @@ func TestQueryUsageResetCreditCountPrecedence(t *testing.T) {
 			require.Len(t, usage.RateLimitResetCredits.Credits, tt.wantCredits)
 		})
 	}
+}
+
+func withValidOpenAIQuotaWindow(t *testing.T, body string) string {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(body), &payload))
+	payload["rate_limit"] = map[string]any{
+		"allowed": true,
+		"primary_window": map[string]any{
+			"limit_window_seconds": 18000,
+			"reset_after_seconds":  3600,
+		},
+	}
+	encoded, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return string(encoded)
 }

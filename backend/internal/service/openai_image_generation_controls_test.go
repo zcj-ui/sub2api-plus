@@ -738,6 +738,7 @@ func newOpenAIImageGenerationControlTestContext(allowImages bool, userAgent stri
 }
 
 func newOpenAIImageGenerationControlTestAccount() *Account {
+	proxyID := int64(8151)
 	return &Account{
 		ID:          5151,
 		Name:        "openai-image-controls",
@@ -746,6 +747,8 @@ func newOpenAIImageGenerationControlTestAccount() *Account {
 		Status:      StatusActive,
 		Schedulable: true,
 		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials: map[string]any{
 			"api_key": "sk-test",
 		},

@@ -3,9 +3,39 @@ package service
 import (
 	"context"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestAccountUsageServiceProbeOpenAICodexSnapshotFailsClosedForConfiguredProxy(t *testing.T) {
+	proxyID := int64(71)
+	tests := []struct {
+		name  string
+		proxy *Proxy
+	}{
+		{name: "missing relation"},
+		{name: "mismatched relation", proxy: &Proxy{ID: proxyID + 1, Protocol: "http", Host: "127.0.0.1", Port: 8080}},
+		{name: "invalid URL", proxy: &Proxy{ID: proxyID}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			account := &Account{
+				Platform:    PlatformOpenAI,
+				Type:        AccountTypeOAuth,
+				Credentials: map[string]any{"access_token": "fixture"},
+				ProxyID:     &proxyID,
+				Proxy:       tt.proxy,
+			}
+			_, err := (&AccountUsageService{}).probeOpenAICodexSnapshot(context.Background(), account)
+			if err == nil || !strings.Contains(err.Error(), "resolve openai probe proxy") {
+				t.Fatalf("probeOpenAICodexSnapshot() error = %v, want configured proxy failure", err)
+			}
+		})
+	}
+}
 
 type accountUsageCodexProbeRepo struct {
 	stubOpenAIAccountRepo
@@ -110,8 +140,31 @@ func TestShouldRefreshOpenAICodexSnapshot_SparkShadowIgnoresWSv2(t *testing.T) {
 		Type:     AccountTypeOAuth,
 		Extra:    map[string]any{"codex_usage_updated_at": staleAt},
 	}
-	if shouldRefreshOpenAICodexSnapshot(normalNoWS, usage, now) {
-		t.Fatal("expected non-WSv2 normal account to skip codex probe refresh")
+	if !shouldRefreshOpenAICodexSnapshot(normalNoWS, usage, now) {
+		t.Fatal("expected stale normal account to refresh from wham without WSv2")
+	}
+}
+
+func TestShouldRefreshOpenAICodexSnapshot_QueriesWhamWhenCreditSnapshotMissing(t *testing.T) {
+	now := time.Now()
+	usage := &UsageInfo{FiveHour: &UsageProgress{}, SevenDay: &UsageProgress{}}
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			"codex_usage_updated_at": now.Format(time.RFC3339),
+		},
+	}
+
+	if !shouldRefreshOpenAICodexSnapshot(account, usage, now) {
+		t.Fatal("expected missing credit snapshot to trigger an initial wham query")
+	}
+	account.Extra[openaiQuotaCreditBalanceKey] = map[string]any{
+		"balance":    "0",
+		"updated_at": now.Format(time.RFC3339),
+	}
+	if shouldRefreshOpenAICodexSnapshot(account, usage, now) {
+		t.Fatal("expected fresh wham credit snapshot to satisfy the refresh check")
 	}
 }
 
@@ -149,10 +202,13 @@ func TestAccountUsageService_PersistOpenAICodexProbeSnapshotOnlyUpdatesExtra(t *
 		rateLimitCh:   make(chan time.Time, 1),
 	}
 	svc := &AccountUsageService{accountRepo: repo}
-	svc.persistOpenAICodexProbeSnapshot(321, map[string]any{
+	err := svc.persistOpenAICodexProbeSnapshot(context.Background(), 321, map[string]any{
 		"codex_7d_used_percent": 100.0,
 		"codex_7d_reset_at":     time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second).Format(time.RFC3339),
 	})
+	if err != nil {
+		t.Fatalf("persistOpenAICodexProbeSnapshot() error = %v", err)
+	}
 
 	select {
 	case updates := <-repo.updateExtraCh:
@@ -167,6 +223,78 @@ func TestAccountUsageService_PersistOpenAICodexProbeSnapshotOnlyUpdatesExtra(t *
 	case got := <-repo.rateLimitCh:
 		t.Fatalf("不应将探测快照写入运行时限流状态: %v", got)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestAccountUsageService_GetOpenAIUsageReleasesProbeCacheAfterFailure(t *testing.T) {
+	proxyID := int64(71)
+	cache := NewUsageCache()
+	svc := &AccountUsageService{cache: cache}
+	account := &Account{
+		ID:          711,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"access_token": "fixture"},
+		ProxyID:     &proxyID,
+	}
+
+	_, err := svc.getOpenAIUsage(context.Background(), account, false)
+	if err != nil {
+		t.Fatalf("getOpenAIUsage() error = %v", err)
+	}
+	if _, blocked := cache.openAIProbeCache.Load(account.ID); blocked {
+		t.Fatal("failed quota probe must be immediately retryable")
+	}
+	if !svc.shouldProbeOpenAICodexSnapshot(account.ID, time.Now()) {
+		t.Fatal("expected retry admission after failed quota probe")
+	}
+}
+
+func TestAccountUsageService_ReleaseOpenAIProbeDoesNotDeleteNewerReservation(t *testing.T) {
+	cache := NewUsageCache()
+	svc := &AccountUsageService{cache: cache}
+	accountID := int64(712)
+	first := time.Now().Add(-time.Second)
+	second := time.Now()
+
+	if !svc.shouldProbeOpenAICodexSnapshot(accountID, first, true) {
+		t.Fatal("expected first forced probe reservation")
+	}
+	if !svc.shouldProbeOpenAICodexSnapshot(accountID, second, true) {
+		t.Fatal("expected second forced probe reservation")
+	}
+	svc.releaseOpenAICodexProbe(accountID, first)
+
+	got, ok := cache.openAIProbeCache.Load(accountID)
+	if !ok || got != second {
+		t.Fatalf("newer reservation = %v, %v; want %v, true", got, ok, second)
+	}
+}
+
+func TestAccountUsageService_OpenAIProbeAdmissionIsAtomic(t *testing.T) {
+	cache := NewUsageCache()
+	svc := &AccountUsageService{cache: cache}
+	now := time.Now()
+	results := make(chan bool, 32)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- svc.shouldProbeOpenAICodexSnapshot(713, now)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	admitted := 0
+	for result := range results {
+		if result {
+			admitted++
+		}
+	}
+	if admitted != 1 {
+		t.Fatalf("admitted probes = %d, want 1", admitted)
 	}
 }
 

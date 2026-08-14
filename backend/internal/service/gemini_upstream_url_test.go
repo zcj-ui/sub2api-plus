@@ -20,6 +20,14 @@ func TestBuildGeminiAIStudioModelActionURL(t *testing.T) {
 	got, err = buildGeminiAIStudioModelActionURL(base, "gemini-2.5-pro", "countTokens", false)
 	require.NoError(t, err)
 	require.Equal(t, base+"/v1beta/models/gemini-2.5-pro:countTokens", got)
+
+	got, err = buildGeminiAIStudioModelActionURL("https://relay.example/prefix/v1beta", "gemini-2.5-pro", "generateContent", false)
+	require.NoError(t, err)
+	require.Equal(t, "https://relay.example/prefix/v1beta/models/gemini-2.5-pro:generateContent", got)
+
+	got, err = buildGeminiAIStudioModelActionURL("https://relay.example/prefix/v1beta?key=relay-key", "gemini-2.5-pro", "streamGenerateContent", true)
+	require.NoError(t, err)
+	require.Equal(t, "https://relay.example/prefix/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=relay-key", got)
 }
 
 // TestBuildGeminiAIStudioModelActionURLRejectsNonConformingModel 锁定不变式：

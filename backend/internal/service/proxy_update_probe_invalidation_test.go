@@ -69,3 +69,31 @@ func TestBothProxyUpdateServicesUseRepositoryUpdateBoundary(t *testing.T) {
 		require.Equal(t, "new.example", repo.proxy.Host)
 	})
 }
+
+func TestAdminProxyServiceRejectsInvalidFallbackMode(t *testing.T) {
+	svc := &adminServiceImpl{}
+
+	_, err := svc.CreateProxy(context.Background(), &CreateProxyInput{FallbackMode: "random"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "fallback_mode")
+
+	_, err = svc.UpdateProxy(context.Background(), 9, &UpdateProxyInput{FallbackMode: "random"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "fallback_mode")
+}
+
+func TestNormalizeProxyFallbackModeAcceptsDocumentedModes(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: FallbackModeNone},
+		{input: " none ", want: FallbackModeNone},
+		{input: FallbackModeProxy, want: FallbackModeProxy},
+		{input: FallbackModeDirect, want: FallbackModeDirect},
+	} {
+		got, err := normalizeProxyFallbackMode(test.input)
+		require.NoError(t, err)
+		require.Equal(t, test.want, got)
+	}
+}

@@ -18,7 +18,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuthSuccessPersi
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -31,7 +31,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuthSuccessPersi
 			"chatgpt_account_id":         "chatgpt-acc",
 			"chatgpt_account_is_fedramp": true,
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -74,7 +74,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuth404MarksUnsu
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          2,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -86,7 +86,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuth404MarksUnsu
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-acc",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -118,7 +118,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesCompact
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          3,
 		Name:        "openai-apikey",
 		Platform:    PlatformOpenAI,
@@ -131,7 +131,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesCompact
 			"base_url":              "https://example.com/v1",
 			"compact_model_mapping": map[string]any{"gpt-5.4": "gpt-5.4-openai-compact"},
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -165,7 +165,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          4,
 		Name:        "openai-apikey-default",
 		Platform:    PlatformOpenAI,
@@ -176,7 +176,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 		Credentials: map[string]any{
 			"api_key": "sk-test",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -200,4 +200,16 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 	require.NoError(t, err)
 	require.Equal(t, "https://api.openai.com/v1/responses/compact", upstream.lastReq.URL.String())
 	<-updateCalls
+}
+
+func openAICompactTestAccountWithProxy(account Account) Account {
+	proxyID := int64(7000 + account.ID)
+	account.ProxyID = &proxyID
+	account.Proxy = &Proxy{
+		ID:       proxyID,
+		Protocol: "http",
+		Host:     "127.0.0.1",
+		Port:     1080,
+	}
+	return account
 }

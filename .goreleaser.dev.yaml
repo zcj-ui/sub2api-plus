@@ -1,0 +1,63 @@
+version: 2
+
+project_name: sub2api-plus
+
+before:
+  hooks:
+    - go -C backend mod download
+
+snapshot:
+  version_template: "{{ .Env.DEV_VERSION }}"
+
+builds:
+  - id: sub2api-dev
+    dir: backend
+    main: ./cmd/server
+    binary: sub2api
+    flags:
+      - -tags=embed
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.Commit}}
+      - -X main.Date={{.Date}}
+      - -X main.BuildType=dev
+      - -X main.UpdateRepo={{.Env.GITHUB_REPOSITORY}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE*
+      - NOTICE*
+      - DISCLAIMER*
+      - README*
+      - deploy/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  disable: true

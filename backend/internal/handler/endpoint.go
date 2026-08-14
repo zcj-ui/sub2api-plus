@@ -326,3 +326,14 @@ func shouldUseAntigravityCompat(account *service.Account) bool {
 		account.Platform == service.PlatformAntigravity &&
 		account.Type == service.AccountTypeOAuth
 }
+
+// shouldUseNativeAntigravityGeminiTransport separates native OAuth/CRS
+// accounts from API-key relays. Relay accounts expose standard Gemini or
+// Anthropic-compatible endpoints and must not be forced through project-id
+// token handling.
+func shouldUseNativeAntigravityGeminiTransport(account *service.Account) bool {
+	return account != nil &&
+		account.Platform == service.PlatformAntigravity &&
+		account.Type != service.AccountTypeAPIKey &&
+		account.Type != service.AccountTypeUpstream
+}

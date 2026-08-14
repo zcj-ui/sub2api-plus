@@ -119,6 +119,7 @@ func TestRegisterAgentIdentityTaskAcceptsPlaintextAndEncryptedResponses(t *testi
 		"agent_runtime_id":  key.runtimeID,
 		"agent_private_key": privateKey,
 	}}
+	bindOpenAITestProxyToServer(t, account, server.URL)
 	taskID, err := registerAgentIdentityTask(context.Background(), account)
 	require.NoError(t, err)
 	require.Equal(t, "task-plain", taskID)
@@ -144,6 +145,7 @@ func TestEnsureAgentIdentityTaskPersistsAndRedactsCredentials(t *testing.T) {
 		"agent_private_key":  privateKey,
 		"chatgpt_account_id": "account-test",
 	}}
+	bindOpenAITestProxyToServer(t, account, server.URL)
 	service := &OpenAIGatewayService{accountRepo: repo}
 	require.NoError(t, service.ensureAgentIdentityTask(context.Background(), account, ""))
 	require.Equal(t, "task-persisted", account.GetCredential("task_id"))
@@ -175,6 +177,7 @@ func TestEnsureAgentIdentityTaskSharesLockAcrossServicesForSameAccount(t *testin
 		_, _ = w.Write([]byte(`{"task_id":"task-shared"}`))
 	}))
 	defer server.Close()
+	bindOpenAITestProxyToServer(t, account, server.URL)
 	oldBase := openAIAgentIdentityAuthAPIBaseURL
 	openAIAgentIdentityAuthAPIBaseURL = server.URL
 	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
