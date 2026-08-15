@@ -15,6 +15,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -1756,14 +1757,52 @@ func sleepGeminiBackoff(attempt int) {
 
 var (
 	sensitiveQueryParamRegex = regexp.MustCompile(`(?i)([?&](?:key|client_secret|access_token|refresh_token)=)[^&"\s]+`)
+	upstreamURLRegex         = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
+	upstreamHostPortRegex    = regexp.MustCompile(`(?i)\b(?:(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9-]+\.[a-z0-9.-]+|localhost):\d{1,5}\b`)
 	retryInRegex             = regexp.MustCompile(`Please retry in ([0-9.]+)s`)
 )
+
+var officialUpstreamHostSuffixes = []string{
+	"openai.com",
+	"chatgpt.com",
+	"anthropic.com",
+	"x.ai",
+	"googleapis.com",
+	"google.com",
+	"groq.com",
+	"deepseek.com",
+	"mistral.ai",
+	"cohere.com",
+	"moonshot.ai",
+}
+
+func isOfficialUpstreamHost(hostname string) bool {
+	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	for _, suffix := range officialUpstreamHostSuffixes {
+		if hostname == suffix || strings.HasSuffix(hostname, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeUpstreamURLHosts(msg string) string {
+	msg = upstreamURLRegex.ReplaceAllStringFunc(msg, func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || isOfficialUpstreamHost(u.Hostname()) {
+			return raw
+		}
+		return "<upstream-url>" + u.RequestURI()
+	})
+	return upstreamHostPortRegex.ReplaceAllString(msg, "<upstream-host>")
+}
 
 func sanitizeUpstreamErrorMessage(msg string) string {
 	if msg == "" {
 		return msg
 	}
-	return sensitiveQueryParamRegex.ReplaceAllString(msg, `$1***`)
+	msg = sensitiveQueryParamRegex.ReplaceAllString(msg, `$1***`)
+	return sanitizeUpstreamURLHosts(msg)
 }
 
 func (s *GeminiMessagesCompatService) writeGeminiMappedError(c *gin.Context, account *Account, upstreamStatus int, upstreamRequestID string, body []byte) error {

@@ -37,6 +37,79 @@ func TestApplyErrorPassthroughRule_NoBoundService(t *testing.T) {
 	assert.Equal(t, "Upstream request failed", errMsg)
 }
 
+func TestApplyErrorPassthroughRule_SanitizesUpstreamHost(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+
+	ruleSvc := &ErrorPassthroughService{}
+	responseCode := http.StatusBadGateway
+	ruleSvc.setLocalCache([]*model.ErrorPassthroughRule{{
+		ID:              2,
+		Name:            "host-redaction",
+		Enabled:         true,
+		Priority:        1,
+		ErrorCodes:      []int{http.StatusBadRequest},
+		Keywords:        []string{"internal-gw.example.com"},
+		MatchMode:       model.MatchModeAll,
+		ResponseCode:    &responseCode,
+		PassthroughCode: false,
+		PassthroughBody: true,
+	}})
+	BindErrorPassthroughService(c, ruleSvc)
+
+	status, _, message, matched := applyErrorPassthroughRule(
+		c,
+		PlatformOpenAI,
+		http.StatusBadRequest,
+		[]byte(`{"error":{"message":"Post \"https://internal-gw.example.com/v1/responses\": context deadline exceeded"}}`),
+		http.StatusBadGateway,
+		"upstream_error",
+		"Upstream request failed",
+	)
+	require.True(t, matched)
+	require.Equal(t, http.StatusBadGateway, status)
+	require.NotContains(t, message, "internal-gw.example.com")
+	require.Contains(t, message, "<upstream-url>")
+}
+
+func TestSanitizeUpstreamErrorMessage_PreservesOfficialAndRedactsPrivateHosts(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		mustKeep   string
+		mustRemove string
+	}{
+		{
+			name:       "official provider URL",
+			input:      `Post "https://api.openai.com/v1/responses": context deadline exceeded`,
+			mustKeep:   "api.openai.com",
+			mustRemove: "",
+		},
+		{
+			name:       "private URL",
+			input:      `Post "https://internal-gw.example.com/v1/responses": context deadline exceeded`,
+			mustKeep:   "<upstream-url>",
+			mustRemove: "internal-gw.example.com",
+		},
+		{
+			name:       "private host port",
+			input:      "dial tcp 10.0.0.5:18182: connect: connection refused",
+			mustKeep:   "<upstream-host>",
+			mustRemove: "10.0.0.5:18182",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeUpstreamErrorMessage(tt.input)
+			require.Contains(t, got, tt.mustKeep)
+			if tt.mustRemove != "" {
+				require.NotContains(t, got, tt.mustRemove)
+			}
+		})
+	}
+}
+
 func TestGatewayHandleErrorResponse_NoRuleKeepsDefault(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()

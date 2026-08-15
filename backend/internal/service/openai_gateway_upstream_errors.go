@@ -132,9 +132,6 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 	if len(upstreamBody) > 0 && hasOpenAIServerOverloadedCode(upstreamBody) {
 		return true
 	}
-	if upstreamStatusCode != http.StatusBadRequest {
-		return false
-	}
 
 	match := func(text string) bool {
 		lower := strings.ToLower(strings.TrimSpace(text))
@@ -145,6 +142,10 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 			return true
 		}
 		if strings.Contains(lower, "selected model is at capacity") {
+			return true
+		}
+		if strings.Contains(lower, "our servers are currently overloaded") ||
+			strings.Contains(lower, "servers are currently overloaded") {
 			return true
 		}
 		return strings.Contains(lower, "you can retry your request") &&
