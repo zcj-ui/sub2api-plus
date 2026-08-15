@@ -45,7 +45,7 @@ docker compose -f docker-compose.yml up -d
 
 ## ソースビルド
 
-必要環境：Go `1.26.5`、Node.js `20+`、pnpm `9`、PostgreSQL、Redis。
+必要環境：Go `1.26.6`、Node.js `20+`、pnpm `9`、PostgreSQL、Redis。
 
 ```bash
 git clone https://github.com/zcj-ui/sub2api-plus.git

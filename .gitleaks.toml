@@ -6,6 +6,7 @@ description = "Generated caches and documented public OAuth clients"
 paths = [
   '''(^|[/\\])\.gomodcache([/\\]|$)''',
   '''(^|[/\\])\.gocache([/\\]|$)''',
+  '''(^|[/\\])\.pnpm-store([/\\]|$)''',
   '''(^|[/\\])tmp([/\\]|$)''',
   '''(^|[/\\])release([/\\]|$)''',
   '''(^|[/\\])frontend[/\\]node_modules([/\\]|$)''',

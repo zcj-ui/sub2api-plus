@@ -111,14 +111,26 @@
 - 修复代理专用导入仅在状态变化时才同步 fallback 配置的问题。
 - 修复安全审计异常检查器在 Python 3.8 启动阶段因类型注解语法失败的问题。
 
+### 依赖与验证链加固
+
+- 构建基线升级到 Go `1.26.6`，并同步根目录、后端和部署镜像以及三语源码构建文档。
+- 升级 gRPC `1.82.1`、OpenTelemetry `1.43.0` 和 Protobuf `1.36.11`，消除对应的 Critical/High 依赖告警。
+- 前端升级到 Vite `6.4.3`、Vitest `3.2.7`、DOMPurify `3.4.13`，并通过精确 override 修补 Mermaid、Rollup、ws、yaml、lodash、minimatch 等间接依赖。
+- 修正 Vitest 3 覆盖率阈值配置，启用可执行的全局基线棘轮；当前阈值为语句/行 `69%`、分支 `70%`、函数 `45%`，后续覆盖率只能逐步提高。
+- 修复支付提供商测试中的异步动态导入遗留，以及并发 release 测试依赖固定休眠导致的偶发不稳定。
+- 后端 CI 与安全扫描工作流新增手动触发入口，便于发布前对指定分支重新验收。
+- npm 生产依赖审计仅剩 `xlsx` 的两个 High 公告；上游 npm 包暂无修复版本，继续由 `.github/audit-exceptions.yml` 的限时例外约束至 `2026-10-06`，到期前必须复查或替换。
+
 ## 验证记录
 
-- Go `internal/service` 与 `internal/repository` 全量单元测试通过。
+- Go 1.26.6 下除本机执行受限包外的 105 个后端包强制单元测试通过，包含 `internal/service`、`internal/repository`、handler、server 与 OpenAI WS。
 - Go handler、server 及 OpenAI WS 定向测试通过；本机 Defender 会隔离 Windows `internal/middleware` 测试二进制，该包保留给 Linux CI 执行。
 - OpenAI 429、额度探针缓存和账户调度定向 `-race` 测试通过。
 - 前端 Vitest：228 个测试文件、1587 个测试通过。
+- 前端覆盖率门禁通过：语句与行 `69.33%`、分支 `70.8%`、函数 `45.96%`。
 - `vue-tsc --noEmit` 通过。
 - 前端生产构建通过。
+- `govulncheck ./...` 对实际调用路径报告 0 个漏洞；生产依赖审计例外检查通过。
 - `git diff --check` 通过，变更 Go 文件均通过 `gofmt` 检查。
 - 真实链路 `Sub2API Plus -> Antigravity ForwardUpstream -> 反代上游` 的 Claude Code 风格 Anthropic SSE 请求已验证成功。
 - Gitleaks 当前树与完整 Git 历史扫描均为零未豁免命中；历史 fixture 仅按 commit fingerprint 记录。

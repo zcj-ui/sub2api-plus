@@ -4,7 +4,7 @@
 
 ## 环境
 
-- Go `1.26.5`
+- Go `1.26.6`
 - Node.js `20+`
 - pnpm `9`
 - 可用的 PostgreSQL 和 Redis，或 Docker/Compose

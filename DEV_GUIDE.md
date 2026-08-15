@@ -16,7 +16,7 @@
 
 | 模块 | 技术 |
 |---|---|
-| 后端 | Go 1.26.5、Gin、Ent |
+| 后端 | Go 1.26.6、Gin、Ent |
 | 前端 | Vue 3、TypeScript、Vite、Pinia、pnpm 9 |
 | 数据 | PostgreSQL、Redis |
 | 发布 | GitHub Actions、GoReleaser、GHCR |

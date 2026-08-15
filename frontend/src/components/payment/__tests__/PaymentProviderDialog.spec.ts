@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import PaymentProviderDialog from '@/components/payment/PaymentProviderDialog.vue'
 import { STRIPE_SDK_API_VERSION } from '@/components/payment/providerConfig'
@@ -34,6 +34,10 @@ vi.mock('vue-i18n', () => ({
       )
     },
   }),
+}))
+
+vi.mock('@/stores', () => ({
+  useAppStore: () => ({ showError: vi.fn() }),
 }))
 
 function providerFactory(overrides: Partial<ProviderInstance> = {}): ProviderInstance {
@@ -243,6 +247,7 @@ describe('PaymentProviderDialog payment guide', () => {
     await upstreamTypeInput.setValue('hkpay')
     await displayNameInput.setValue('Hong Kong Alipay')
     await wrapper.find('form').trigger('submit.prevent')
+    await flushPromises()
 
     expect(wrapper.emitted('save')).toBeUndefined()
   })

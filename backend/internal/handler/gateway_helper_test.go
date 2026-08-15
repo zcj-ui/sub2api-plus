@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,12 +133,17 @@ func TestWrapReleaseOnDone_ConcurrentCalls(t *testing.T) {
 
 	// 并发调用 release
 	const numGoroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
-		go release()
+		go func() {
+			defer wg.Done()
+			release()
+		}()
 	}
 
 	// 等待所有 goroutine 完成
-	time.Sleep(200 * time.Millisecond)
+	wg.Wait()
 
 	// 验证只释放一次
 	if count := atomic.LoadInt32(&releaseCount); count != 1 {
