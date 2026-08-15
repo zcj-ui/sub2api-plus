@@ -75,7 +75,10 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 		ID:       901,
 		Platform: PlatformOpenAI,
 		Type:     AccountTypeOAuth,
-		Extra:    map[string]any{"openai_device_id": "device-901"},
+		Extra: map[string]any{
+			"openai_device_id":           "device-901",
+			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+		},
 	}
 	ids := resolveCodexFingerprintIDsForRequest(account, c.Request.Header, body, 0)
 	c.Set(codexFingerprintIDsContextKey, ids)

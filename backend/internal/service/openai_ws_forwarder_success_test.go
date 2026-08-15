@@ -733,6 +733,7 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthStoreFalseByDefault(t *testing.T
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
+			codexFingerprintModeExtraKey:      string(codexFingerprintSession),
 		},
 	}
 
@@ -969,6 +970,7 @@ func TestOpenAIGatewayService_Forward_WSv2_HeaderSessionFallbackFromPromptCacheK
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
+			codexFingerprintModeExtraKey:      string(codexFingerprintSession),
 		},
 	}
 

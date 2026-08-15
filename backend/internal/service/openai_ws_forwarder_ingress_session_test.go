@@ -1153,6 +1153,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 		},
 		Extra: map[string]any{
 			"openai_oauth_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
+			codexFingerprintModeExtraKey:                string(codexFingerprintSession),
 		},
 	}
 

@@ -100,6 +100,7 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 			"access_token":  "oauth-token",
 			"refresh_token": "oauth-refresh-token",
 		},
+		Extra:       map[string]any{codexFingerprintModeExtraKey: string(codexFingerprintSession)},
 		Status:      StatusActive,
 		Schedulable: true,
 	}
