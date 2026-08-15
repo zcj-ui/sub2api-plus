@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -139,10 +140,11 @@ func buildCompatCompactResponse(resp *apicompat.ChatCompletionsResponse, model s
 		id = "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
 	out := &apicompat.ResponsesResponse{
-		ID:     id,
-		Object: "response",
-		Model:  model,
-		Status: "completed",
+		ID:        id,
+		Object:    "response",
+		CreatedAt: time.Now().Unix(),
+		Model:     model,
+		Status:    "completed",
 		Output: []apicompat.ResponsesOutput{{
 			Type:   "compaction",
 			ID:     "cmp_" + strings.ReplaceAll(uuid.NewString(), "-", ""),

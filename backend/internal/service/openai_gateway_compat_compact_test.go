@@ -85,6 +85,7 @@ func TestBuildCompatCompactResponse_SingleCompactionItem(t *testing.T) {
 	out, err := buildCompatCompactResponse(resp, "gpt-5.6-sol")
 	require.NoError(t, err)
 	require.Equal(t, "gpt-5.6-sol", out.Model)
+	require.Positive(t, out.CreatedAt)
 	require.Equal(t, "completed", out.Status)
 	require.Len(t, out.Output, 1, "Codex 要求 output 里恰好一个 compaction item")
 	require.Equal(t, "compaction", out.Output[0].Type)
