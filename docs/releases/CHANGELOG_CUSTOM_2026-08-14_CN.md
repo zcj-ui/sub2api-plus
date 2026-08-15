@@ -1,10 +1,26 @@
 # Sub2API Plus 更新日志
 
-当前准备版本：`0.2.0`
+当前准备版本：`0.2.1`
 
-发布日期：2026-08-14
+发布日期：2026-08-15
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
+
+## 0.2.1 OpenAI/Codex 兼容性修复
+
+- 对齐上游 PR #5668：回传并按账户隔离 `x-codex-turn-state`，补齐 remote compaction v2 探测和 beta feature 恢复；Codex 指纹收敛改为显式 opt-in，缺省保持 `off`。
+- API Key 和第三方 OpenAI 兼容上游恢复 custom/freeform 工具调用，流式参数增量不再输出空工具名，旧式 `tool_choice.function.name` 自动转换为 Responses 标准形态。
+- 为只支持 Chat Completions 的兼容上游桥接 Codex remote compaction v2：请求侧保留压缩历史并注入总结指令，响应侧生成唯一 `compaction` item，兼容 JSON 和 SSE 客户端。
+- 所有网关合成的 Responses 对象和失败事件补齐必填 `created_at`，避免严格 Rust/Codex 客户端因字段缺失而终止反序列化。
+- 识别纯 message 形态的 `Our servers are currently overloaded`，覆盖 HTTP 400/503 和流式错误；空 WebSocket `error` 对象会补充可重试错误详情，不再向客户端暴露无意义的 `{}`。
+- OpenCode Go 兼容上游的 `GoUsageLimitError` 会解析 `Resets in 4hr 59min` 等单段或组合时长，账户保持冷却到真实重置时间。
+- OpenAI OAuth 账户的空 `openai_capabilities` 容器按未配置处理，避免导入或历史数据导致健康账户被调度器静默排除。
+- 调度 Redis 快照补齐预加载前账户元数据并升级缓存命名空间，避免账户优先级、并发和扩展字段在缓存路径丢失。
+- 非官方上游 URL、私有 IP 和 host:port 从下游错误文案中脱敏；官方 provider host 保留，error passthrough 路径使用同一规则。
+
+本轮审查了官方仓近期 OpenAI/Codex、Responses、429、调度、代理和安全相关 Issues/PR。Anthropic/Claude Code 专属改动、支付/国产供应商新功能、OpenAI Team 联动熔断及大范围流式 failover 重构未纳入本版本，避免扩大回归面。
+
+验证结果：Go 1.26.6 下 `internal/service` 全量测试、其余后端包测试、`go vet -tags=unit ./...`、middleware 测试程序单独编译、前端 `vue-tsc --noEmit`、完整 Vitest 和 Vite 生产构建均通过。Windows 本机策略会阻止执行临时目录中的 `internal/middleware` 测试程序；该包已成功编译，完整执行继续由 Linux CI 覆盖。
 
 ## 2026-08-15 仓库与发布流程更新
 
