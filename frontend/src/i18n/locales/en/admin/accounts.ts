@@ -612,10 +612,10 @@ export default {
         codexCLIOnlyAppServerDesc:
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
-        codexFingerprintModeDesc: 'Recommended mode keeps one stable device per OAuth account, derives a separate stable session for each conversation, and creates a new request ID per request. Full convergence is the only mode that shares one session across the account. Off passes client identifiers through.',
-        codexFingerprintOff: 'Off (passthrough)',
+        codexFingerprintModeDesc: 'Off by default and passes client identifiers through unchanged. Explicit modes can stabilize the account device and converge session identifiers; some accounts reported quota shrinkage or risk controls after enabling convergence, so enable it only after measurement.',
+        codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
-        codexFingerprintSession: 'One device + session per conversation (recommended)',
+        codexFingerprintSession: 'One device + session per conversation',
         codexFingerprintFull: 'Full convergence (one account session)',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:

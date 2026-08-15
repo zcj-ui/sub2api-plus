@@ -3022,7 +3022,7 @@ const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OF
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
-const codexFingerprintMode = ref<CodexFingerprintMode>('session')
+const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codex429GuardEnabled = ref(true)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
@@ -3483,7 +3483,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   openaiAPIKeyResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_OFF
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
-  codexFingerprintMode.value = 'session'
+  codexFingerprintMode.value = 'off'
   codex429GuardEnabled.value = true
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
@@ -3538,9 +3538,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
     if (newAccount.type === 'oauth') {
       const fpMode = extra?.codex_fingerprint_mode as string | undefined
+      // 缺省/非法值按 off 呈现，与后端 GetCodexFingerprintMode 的 opt-in 语义一致（#5610）
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
-        : 'session')
+        : 'off')
       codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled !== false
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
@@ -4895,9 +4896,10 @@ const handleSubmit = async () => {
         }
       }
 
-      // 指纹收敛模式：默认 session，不写入；非默认值显式写入（包括 off）
+      // 指纹收敛模式：默认 off（不写入）；device/session/full 是显式 opt-in，
+      // 必须落键，否则管理员的选择会被后端当作"未设置"而回落到 off（#5610）。
       if (props.account.type === 'oauth') {
-        if (codexFingerprintMode.value !== 'session') {
+        if (codexFingerprintMode.value !== 'off') {
           newExtra.codex_fingerprint_mode = codexFingerprintMode.value
         } else {
           delete newExtra.codex_fingerprint_mode
