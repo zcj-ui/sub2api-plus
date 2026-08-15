@@ -200,7 +200,7 @@ func (a *Account) IsSchedulable() bool {
 		return false
 	}
 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
-		if !(a.HasAvailableCodexCredits() && IsAccountSchedulingThresholdReason(a.TempUnschedulableReason)) {
+		if !a.HasAvailableCodexCredits() || !IsAccountSchedulingThresholdReason(a.TempUnschedulableReason) {
 			return false
 		}
 	}

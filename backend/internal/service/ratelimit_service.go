@@ -95,10 +95,6 @@ func NewRateLimitService(accountRepo AccountRepository, usageRepo UsageLogReposi
 	}
 }
 
-func (s *RateLimitService) confirmOpenAIOAuth429(accountID int64, now time.Time) bool {
-	return s.confirmOpenAIOAuth429Context(context.Background(), accountID, now)
-}
-
 func (s *RateLimitService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
 	if s == nil || accountID <= 0 {
 		return false
@@ -159,7 +155,11 @@ func (s *RateLimitService) confirmOpenAIOAuth429Context(ctx context.Context, acc
 
 func (s *RateLimitService) openAI429AccountLock(accountID int64) *sync.Mutex {
 	lock, _ := s.openAI429Locks.LoadOrStore(accountID, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+	mu, ok := lock.(*sync.Mutex)
+	if !ok {
+		panic("openAI429Locks contains a non-mutex value")
+	}
+	return mu
 }
 
 func (s *RateLimitService) clearOpenAIOAuth429Streak(accountID int64) {

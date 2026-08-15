@@ -119,6 +119,8 @@
 - 修正 Vitest 3 覆盖率阈值配置，启用可执行的全局基线棘轮；当前阈值为语句/行 `69%`、分支 `70%`、函数 `45%`，后续覆盖率只能逐步提高。
 - 修复支付提供商测试中的异步动态导入遗留，以及并发 release 测试依赖固定休眠导致的偶发不稳定。
 - 后端 CI 与安全扫描工作流新增手动触发入口，便于发布前对指定分支重新验收。
+- 修复安装脚本测试依赖 GNU `head -n -1` 导致 macOS runner 失败的问题，并清理全部 golangci-lint 2.9 报告项。
+- 为旧版 Gitleaks Action 补充精确到提交、文件、规则和行号的历史测试夹具指纹；当前源码和新提交仍按完整规则扫描。
 - npm 生产依赖审计仅剩 `xlsx` 的两个 High 公告；上游 npm 包暂无修复版本，继续由 `.github/audit-exceptions.yml` 的限时例外约束至 `2026-10-06`，到期前必须复查或替换。
 
 ## 验证记录
@@ -131,6 +133,7 @@
 - `vue-tsc --noEmit` 通过。
 - 前端生产构建通过。
 - `govulncheck ./...` 对实际调用路径报告 0 个漏洞；生产依赖审计例外检查通过。
+- golangci-lint `v2.9.0` 完整扫描为 0 项，安装脚本测试兼容 macOS runner。
 - `git diff --check` 通过，变更 Go 文件均通过 `gofmt` 检查。
 - 真实链路 `Sub2API Plus -> Antigravity ForwardUpstream -> 反代上游` 的 Claude Code 风格 Anthropic SSE 请求已验证成功。
 - Gitleaks 当前树与完整 Git 历史扫描均为零未豁免命中；历史 fixture 仅按 commit fingerprint 记录。

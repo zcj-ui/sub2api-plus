@@ -105,9 +105,9 @@ func buildProxyKey(protocol, host string, port int, username, password string) s
 	fields := []string{strings.TrimSpace(protocol), strings.TrimSpace(host), strconv.Itoa(port), strings.TrimSpace(username), strings.TrimSpace(password)}
 	var canonical strings.Builder
 	for _, field := range fields {
-		canonical.WriteString(strconv.Itoa(len(field)))
-		canonical.WriteByte(':')
-		canonical.WriteString(field)
+		_, _ = canonical.WriteString(strconv.Itoa(len(field)))
+		_ = canonical.WriteByte(':')
+		_, _ = canonical.WriteString(field)
 	}
 	sum := sha256.Sum256([]byte(canonical.String()))
 	return "sha256:" + hex.EncodeToString(sum[:])

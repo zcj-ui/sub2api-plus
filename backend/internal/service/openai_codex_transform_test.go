@@ -9,6 +9,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func requireCodexTestSlice(t *testing.T, value any) []any {
+	t.Helper()
+	result, ok := value.([]any)
+	require.True(t, ok)
+	return result
+}
+
+func requireCodexTestMap(t *testing.T, value any) map[string]any {
+	t.Helper()
+	result, ok := value.(map[string]any)
+	require.True(t, ok)
+	return result
+}
+
+func requireCodexTestString(t *testing.T, value any) string {
+	t.Helper()
+	result, ok := value.(string)
+	require.True(t, ok)
+	return result
+}
+
 func TestApplyCodexOAuthTransform_AppendsSyntheticAgentContextPair(t *testing.T) {
 	reqBody := map[string]any{
 		"model": "gpt-5.4",
@@ -35,12 +56,12 @@ func TestApplyCodexOAuthTransform_AppendsSyntheticAgentContextPair(t *testing.T)
 	require.Equal(t, "custom_tool_call_output", output["type"])
 	require.Equal(t, []map[string]string{{"type": "input_text", "text": codexSyntheticAgentContextOutputText}}, output["output"])
 	require.Equal(t, call["call_id"], output["call_id"])
-	require.LessOrEqual(t, len(call["call_id"].(string)), codexCallIDMaxLength)
+	require.LessOrEqual(t, len(requireCodexTestString(t, call["call_id"])), codexCallIDMaxLength)
 
 	tools, ok := reqBody["tools"].([]any)
 	require.True(t, ok)
 	require.Len(t, tools, 1, "synthetic checkpoint is history-only and must not be declared as an available tool")
-	require.Equal(t, "shell", tools[0].(map[string]any)["name"])
+	require.Equal(t, "shell", requireCodexTestMap(t, tools[0])["name"])
 	require.False(t, HasFunctionCallOutput(reqBody), "synthetic output must not masquerade as a real continuation")
 }
 
@@ -55,13 +76,13 @@ func TestAppendCodexSyntheticAgentContextPair_UsesRandomIDsAndIsIdempotent(t *te
 	require.True(t, appendCodexSyntheticAgentContextPair(first))
 	require.True(t, appendCodexSyntheticAgentContextPair(second))
 
-	firstInput := first["input"].([]any)
-	secondInput := second["input"].([]any)
-	firstID := firstInput[1].(map[string]any)["call_id"]
-	require.NotEqual(t, firstID, secondInput[1].(map[string]any)["call_id"])
-	require.Contains(t, firstID.(string), "call_sub2api_overdraft_")
+	firstInput := requireCodexTestSlice(t, first["input"])
+	secondInput := requireCodexTestSlice(t, second["input"])
+	firstID := requireCodexTestMap(t, firstInput[1])["call_id"]
+	require.NotEqual(t, firstID, requireCodexTestMap(t, secondInput[1])["call_id"])
+	require.Contains(t, requireCodexTestString(t, firstID), "call_sub2api_overdraft_")
 	require.False(t, appendCodexSyntheticAgentContextPair(first))
-	require.Len(t, first["input"].([]any), 3)
+	require.Len(t, requireCodexTestSlice(t, first["input"]), 3)
 }
 
 func TestAppendCodexSyntheticAgentContextPair_DoesNotReinjectEarlierHistoryPair(t *testing.T) {
@@ -69,12 +90,12 @@ func TestAppendCodexSyntheticAgentContextPair_DoesNotReinjectEarlierHistoryPair(
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "first"}},
 	}
 	require.True(t, appendCodexSyntheticAgentContextPair(reqBody))
-	items := reqBody["input"].([]any)
+	items := requireCodexTestSlice(t, reqBody["input"])
 	items = append(items, map[string]any{"type": "message", "role": "user", "content": "follow-up"})
 	reqBody["input"] = items
 
 	require.False(t, appendCodexSyntheticAgentContextPair(reqBody))
-	require.Len(t, reqBody["input"].([]any), 4)
+	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 4)
 }
 
 func TestAppendCodexSyntheticAgentContextPairToBodyMatchesReferenceGuards(t *testing.T) {
@@ -118,9 +139,9 @@ func TestAppendCodexSyntheticAgentContextPairToBodyNormalizesStringAndObjectInpu
 			input, ok := payload["input"].([]any)
 			require.True(t, ok)
 			require.Len(t, input, 3)
-			require.Equal(t, "message", input[0].(map[string]any)["type"])
-			require.Equal(t, "custom_tool_call", input[1].(map[string]any)["type"])
-			require.Equal(t, "custom_tool_call_output", input[2].(map[string]any)["type"])
+			require.Equal(t, "message", requireCodexTestMap(t, input[0])["type"])
+			require.Equal(t, "custom_tool_call", requireCodexTestMap(t, input[1])["type"])
+			require.Equal(t, "custom_tool_call_output", requireCodexTestMap(t, input[2])["type"])
 		})
 	}
 }
@@ -170,7 +191,7 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSkipsToolHistoryAndCo
 				"input": []any{map[string]any{"type": itemType, "call_id": "call_real", "name": "real_tool"}},
 			}
 			applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
-			require.Len(t, reqBody["input"].([]any), 1)
+			require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 1)
 		})
 	}
 
@@ -179,7 +200,7 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSkipsToolHistoryAndCo
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "compact"}},
 	}
 	applyCodexOAuthTransformWithOptions(compact, codexOAuthTransformOptions{IsCompact: true, Codex429GuardEnabled: true})
-	require.Len(t, compact["input"].([]any), 1)
+	require.Len(t, requireCodexTestSlice(t, compact["input"]), 1)
 }
 
 func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSupportsStringAndObjectInput(t *testing.T) {
@@ -189,10 +210,10 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSupportsStringAndObje
 	} {
 		reqBody := map[string]any{"model": "gpt-5.4", "input": input}
 		applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
-		items := reqBody["input"].([]any)
+		items := requireCodexTestSlice(t, reqBody["input"])
 		require.Len(t, items, 3)
-		require.Equal(t, "custom_tool_call", items[1].(map[string]any)["type"])
-		require.Equal(t, "custom_tool_call_output", items[2].(map[string]any)["type"])
+		require.Equal(t, "custom_tool_call", requireCodexTestMap(t, items[1])["type"])
+		require.Equal(t, "custom_tool_call_output", requireCodexTestMap(t, items[2])["type"])
 	}
 }
 
@@ -206,7 +227,7 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairRequiresUserTail(t *t
 	}
 
 	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
-	require.Len(t, reqBody["input"].([]any), 2)
+	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 2)
 }
 
 func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSkipsClaudeCodeBridge(t *testing.T) {
@@ -221,7 +242,7 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSkipsClaudeCodeBridge
 	}
 
 	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
-	require.Len(t, reqBody["input"].([]any), 1)
+	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 1)
 }
 
 func TestApplyCodexOAuthTransform_Codex429GuardDisabledDoesNotAppend(t *testing.T) {
@@ -230,7 +251,7 @@ func TestApplyCodexOAuthTransform_Codex429GuardDisabledDoesNotAppend(t *testing.
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "hello"}},
 	}
 	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: false})
-	require.Len(t, reqBody["input"].([]any), 1)
+	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 1)
 }
 
 func TestApplyCodexOAuthTransform_ToolContinuationPreservesInput(t *testing.T) {

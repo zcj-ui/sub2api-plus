@@ -41,6 +41,7 @@ func bindOpenAITestProxyToServer(t testing.TB, account *Account, rawURL string) 
 	t.Helper()
 	if account == nil {
 		t.Fatal("OpenAI test account is nil")
+		return
 	}
 	openAITestAccountWithProxyForURL(account, rawURL)
 	if account.Proxy == nil || account.Proxy.Port <= 0 {

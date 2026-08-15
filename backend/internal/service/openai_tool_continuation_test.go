@@ -73,7 +73,9 @@ func TestSyntheticAgentContextPairDoesNotTriggerToolContinuationSignals(t *testi
 	require.Equal(t, ToolCallOutputContextCoverage{}, AnalyzeToolCallOutputContextCoverageBytes(body))
 
 	realOutput := map[string]any{"type": "function_call_output", "call_id": codexSyntheticAgentContextCallPrefix + "client_value", "output": "client result"}
-	reqBody["input"] = append(reqBody["input"].([]any), realOutput)
+	input, ok := reqBody["input"].([]any)
+	require.True(t, ok)
+	reqBody["input"] = append(input, realOutput)
 	require.True(t, HasFunctionCallOutput(reqBody), "an unrelated real output must not be hidden by the reserved prefix alone")
 }
 

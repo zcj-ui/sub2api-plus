@@ -499,34 +499,6 @@ func codexInputContainsSyntheticAgentContextCall(input []any) bool {
 	return false
 }
 
-func codexInputEndsWithToolHistory(input []any) bool {
-	if len(input) == 0 {
-		return false
-	}
-	item, ok := input[len(input)-1].(map[string]any)
-	if !ok {
-		return false
-	}
-	if strings.EqualFold(strings.TrimSpace(firstNonEmptyString(item["role"])), "tool") {
-		return true
-	}
-	itemType := strings.TrimSpace(firstNonEmptyString(item["type"]))
-	if isCodexToolCallItemType(itemType) || itemType == "item_reference" {
-		return true
-	}
-	return strings.HasSuffix(itemType, "_call") || strings.HasSuffix(itemType, "_call_output")
-}
-
-func codexInputEndsWithSyntheticAgentContextPair(input []any) bool {
-	if len(input) < 2 {
-		return false
-	}
-	call, callOK := input[len(input)-2].(map[string]any)
-	output, outputOK := input[len(input)-1].(map[string]any)
-	return callOK && outputOK && isCodexSyntheticAgentContextCall(call) && isCodexSyntheticAgentContextOutput(output) &&
-		strings.TrimSpace(firstNonEmptyString(call["call_id"])) == strings.TrimSpace(firstNonEmptyString(output["call_id"]))
-}
-
 func isCodexSyntheticAgentContextCall(item map[string]any) bool {
 	return item != nil && strings.TrimSpace(firstNonEmptyString(item["type"])) == "custom_tool_call" &&
 		strings.TrimSpace(firstNonEmptyString(item["name"])) == codexSyntheticAgentContextToolName &&

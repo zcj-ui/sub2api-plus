@@ -220,10 +220,14 @@ func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T)
 
 	require.True(t, base().HasAvailableCodexCredits())
 	zero := base()
-	zero.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["balance"] = "0"
+	zeroCredits, ok := zero.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	zeroCredits["balance"] = "0"
 	require.False(t, zero.HasAvailableCodexCredits())
 	overage := base()
-	overage.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["overage_limit_reached"] = true
+	overageCredits, ok := overage.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	overageCredits["overage_limit_reached"] = true
 	require.False(t, overage.HasAvailableCodexCredits())
 	unlimited := base()
 	unlimited.Extra[openaiQuotaCreditBalanceKey] = map[string]any{
@@ -242,7 +246,9 @@ func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T)
 	require.False(t, dimensionOnlyShadow.HasAvailableCodexCredits())
 
 	stale := base()
-	stale.Extra[openaiQuotaCreditBalanceKey].(map[string]any)["updated_at"] = time.Now().Add(-openAIProbeCacheTTL - time.Minute).UTC().Format(time.RFC3339)
+	staleCredits, ok := stale.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	staleCredits["updated_at"] = time.Now().Add(-openAIProbeCacheTTL - time.Minute).UTC().Format(time.RFC3339)
 	require.True(t, stale.HasAvailableCodexCredits(), "a confirmed positive balance remains spendable until a newer probe disproves it")
 }
 
