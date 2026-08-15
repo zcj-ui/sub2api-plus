@@ -97,30 +97,30 @@ func TestNormalizeOpenAIResponsesCompactRequest_CodexDirectAliasPromoted(t *test
 	require.Equal(t, "/backend-api/codex/responses/compact", c.Request.URL.Path)
 }
 
-func TestNormalizeOpenAIResponsesCompactRequest_NonRemoteV2BodySignalPromoted(t *testing.T) {
+func TestNormalizeOpenAIResponsesCompactRequest_NativeV2DoesNotDependOnBetaHeader(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	tests := []struct {
 		name       string
 		body       []byte
 		betaHeader string
-		wantMarked bool
+		wantNative bool
 	}{
 		{
 			name:       "no_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
-			wantMarked: true,
+			wantNative: true,
 		},
 		{
 			name:       "unrelated_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "responses_websockets_v2",
-			wantMarked: true,
+			wantNative: true,
 		},
 		{
 			name:       "wrong_case_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "REMOTE_COMPACTION_V2",
-			wantMarked: true,
+			wantNative: true,
 		},
 		{
 			name:       "stream_false",
@@ -143,13 +143,17 @@ func TestNormalizeOpenAIResponsesCompactRequest_NonRemoteV2BodySignalPromoted(t 
 
 			normalized, ok := h.normalizeOpenAIResponsesCompactRequest(c, zap.NewNop(), tt.body)
 			require.True(t, ok)
-			require.Equal(t, "/v1/responses/compact", c.Request.URL.Path)
-			require.False(t, gjson.GetBytes(normalized, "stream").Exists())
-
-			marked, exists := c.Get(service.OpenAICompactClientStreamKeyForTest())
-			require.Equal(t, tt.wantMarked, exists)
-			if tt.wantMarked {
-				require.Equal(t, true, marked)
+			if tt.wantNative {
+				require.Equal(t, "/v1/responses", c.Request.URL.Path)
+				require.Equal(t, tt.body, normalized)
+				require.True(t, gjson.GetBytes(normalized, "stream").Bool())
+				_, marked := c.Get(service.OpenAICompactClientStreamKeyForTest())
+				require.False(t, marked)
+			} else {
+				require.Equal(t, "/v1/responses/compact", c.Request.URL.Path)
+				require.False(t, gjson.GetBytes(normalized, "stream").Exists())
+				_, marked := c.Get(service.OpenAICompactClientStreamKeyForTest())
+				require.False(t, marked)
 			}
 		})
 	}

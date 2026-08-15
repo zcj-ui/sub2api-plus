@@ -90,27 +90,6 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		reqStream = gjson.GetBytes(body, "stream").Bool()
 
-		// 指纹收敛：与非透传路径同门控（仅 OAuth、legacy compact 形态跳过）。
-		// 一次性解析收敛 ID：请求体 client_metadata 在此改写（raw 字节外科
-		// 手术，透传热路径禁全量 Unmarshal），出站头改写由请求构造器读取
-		// context 中的同一份 IDs 完成（turn_id 等随机字段两侧必须一致）。
-		if !isOpenAIResponsesCompactPath(c) {
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			fpIDs := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
-			if fpIDs != nil {
-				fpBody, fpChanged, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
-				if fpErr != nil {
-					return nil, fpErr
-				}
-				if fpChanged {
-					body = fpBody
-				}
-			}
-			stageCodexFingerprintIDs(c, fpIDs)
-		}
 	}
 
 	sanitizedBody, sanitized, err := sanitizeEmptyBase64InputImagesInOpenAIBody(body)
@@ -141,21 +120,22 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 	body = updatedBody
 
-	// OAuth passthrough still represents one account-scoped Codex installation.
-	// Normalize the same device/session hierarchy used by the regular Responses
-	// path so passthrough cannot leak a different client identity for the account.
+	// Resolve convergence once, after body policy has settled. The raw client
+	// metadata rewrite and staged outbound headers share this exact ID set.
 	if account.IsOpenAIOAuth() && !isOpenAIResponsesCompactPath(c) {
 		var clientHeaders http.Header
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
 		fpIDs := resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c))
-		if nextBody, changed := applyCodexFingerprintToBodyBytes(body, fpIDs); changed {
+		nextBody, changed, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
+		if fpErr != nil {
+			return nil, fpErr
+		}
+		if changed {
 			body = nextBody
 		}
-		if c != nil && fpIDs != nil {
-			c.Set(codexFingerprintIDsContextKey, fpIDs)
-		}
+		stageCodexFingerprintIDs(c, fpIDs)
 	}
 
 	apiKey := getAPIKeyFromContext(c)

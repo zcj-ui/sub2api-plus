@@ -315,8 +315,10 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 
 	require.NoError(t, svc.TestAccountConnection(c, account.ID, "gpt-5.4", "", AccountTestModeCompact))
 
-	// 显式 session 收敛模式：出站身份 = 账号级收敛值
-	converged := resolveConvergedSessionID(&account)
+	// Explicit session convergence keeps one stable conversation identity for
+	// the account's stable compact-probe session, without collapsing all turns
+	// on the account into the full-convergence identity.
+	converged := resolveCodexConversationSessionID(&account, compactProbeSessionID(account.ID))
 	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
 	require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
 	require.Equal(t, resolveConvergedInstallationID(&account), upstream.lastReq.Header.Get("x-codex-installation-id"),

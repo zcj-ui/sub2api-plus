@@ -280,6 +280,13 @@ func IsOpenAIResponsesCompactPathForTest(c *gin.Context) bool {
 	return isOpenAIResponsesCompactPath(c)
 }
 
+// IsOpenAIResponsesCompactPath reports whether the current request targets the
+// legacy /responses/compact wire. Native remote compaction v2 stays on
+// /responses and must not be classified as legacy compact traffic.
+func IsOpenAIResponsesCompactPath(c *gin.Context) bool {
+	return isOpenAIResponsesCompactPath(c)
+}
+
 func OpenAICompactSessionSeedKeyForTest() string {
 	return openAICompactSessionSeedKey
 }

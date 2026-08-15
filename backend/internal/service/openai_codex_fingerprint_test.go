@@ -122,7 +122,7 @@ func TestResolveCodexConversationSessionID_PerConversation(t *testing.T) {
 }
 
 func TestResolveCodexFingerprintIDsForRequest_UsesStableBodyAnchor(t *testing.T) {
-	account := newTestOAuthAccount(1, nil)
+	account := newTestOAuthAccount(1, map[string]any{codexFingerprintModeExtraKey: "session"})
 	round1 := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]}]}`)
 	round2 := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"follow up"}]}]}`)
 	other := []byte(`{"model":"gpt-5.3-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"different opener"}]}]}`)
@@ -280,7 +280,7 @@ func TestApplyCodexFingerprintHeaders_SessionMode_DifferentClients(t *testing.T)
 }
 
 func TestApplyCodexFingerprintHeaders_RequestIDChangesPerAttempt(t *testing.T) {
-	account := newTestOAuthAccount(1, nil)
+	account := newTestOAuthAccount(1, map[string]any{codexFingerprintModeExtraKey: "session"})
 	clientHeaders := http.Header{"session-id": []string{"client-session"}}
 	ids := resolveCodexFingerprintIDsFromRequest(account, clientHeaders)
 	h1 := http.Header{}
@@ -670,7 +670,11 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesStagedFingerprint(t *testi
 	assert.Equal(t, ids.sessionID, req.Header.Get("session_id"), "session 模式下出站 session_id 应为账号级收敛值")
 	assert.Equal(t, ids.installationID, req.Header.Get("x-codex-installation-id"))
 	assert.Equal(t, ids.windowID, req.Header.Get("x-codex-window-id"))
-	assert.Equal(t, ids.threadID, req.Header.Get("x-client-request-id"))
+	requestID := req.Header.Get("x-client-request-id")
+	require.NotEmpty(t, requestID)
+	_, requestIDErr := uuid.Parse(requestID)
+	require.NoError(t, requestIDErr)
+	assert.NotEqual(t, ids.threadID, requestID, "request IDs identify attempts, not conversation threads")
 	turnMetadata := req.Header.Get("x-codex-turn-metadata")
 	require.NotEmpty(t, turnMetadata)
 	assert.Contains(t, turnMetadata, ids.sessionID, "turn-metadata JSON 中的 session_id 应被收敛")
