@@ -13,13 +13,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v6
+      - name: Set up modern Bash
+        run: brew list bash >/dev/null 2>&1 || brew install bash
       - name: Check deployment scripts
         run: |
-          /bin/bash -n deploy/install.sh
-          /bin/bash -n deploy/docker-deploy.sh
-          /bin/bash deploy/tests/install-github-token-test.sh
-          /bin/bash -n deploy/apple-container.sh
-          /bin/bash deploy/tests/apple-container-test.sh
+          BASH_BIN="$(brew --prefix)/bin/bash"
+          export PATH="$(dirname "$BASH_BIN"):$PATH"
+          "$BASH_BIN" -n deploy/install.sh
+          "$BASH_BIN" -n deploy/docker-deploy.sh
+          "$BASH_BIN" deploy/tests/install-github-token-test.sh
+          "$BASH_BIN" -n deploy/apple-container.sh
+          "$BASH_BIN" deploy/tests/apple-container-test.sh
           /bin/sh deploy/tests/docker-compose-security-test.sh
           /bin/sh deploy/tests/docker-runtime-resources-test.sh
           /bin/sh deploy/test-caddyfile-cache.sh
