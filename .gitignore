@@ -136,6 +136,7 @@ vite.config.js
 docs/*
 !docs/releases/
 !docs/releases/*.md
+!docs/HANDOVER*.md
 !docs/README.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
