@@ -5,9 +5,13 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,6 +76,17 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrNoUpdateAvailable))
 	require.ErrorIs(t, err, ErrNoUpdateAvailable)
+}
+
+func TestUpdateFilesystemPermissionErrorIsActionable(t *testing.T) {
+	directory := filepath.Join("opt", "sub2api")
+	err := updateFilesystemError("failed to create update temp directory", directory, os.ErrPermission)
+
+	require.Equal(t, http.StatusConflict, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_DIRECTORY_NOT_WRITABLE", infraerrors.Reason(err))
+	require.Contains(t, infraerrors.Message(err), filepath.Clean(directory))
+	require.Contains(t, infraerrors.Message(err), "fix its ownership or permissions")
+	require.ErrorIs(t, err, os.ErrPermission)
 }
 
 func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {

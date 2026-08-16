@@ -356,7 +356,17 @@ const statusClass = computed(() => {
   return 'badge-success'
 })
 
+// 已知后端账号状态；其余（含缺失/未知）统一显示 unknown，避免渲染出原始 i18n 键名。
+// active/inactive 由面板写入；disabled/expired 为 domain 常量与历史数据；error 由 SetError 写入。
+const knownAccountStatuses = new Set(['active', 'inactive', 'disabled', 'error', 'expired'])
+
 // Computed: status text
+const resolveStatusTextByKey = (status: string) => {
+  return knownAccountStatuses.has(status)
+    ? t(`admin.accounts.status.${status}`)
+    : t('admin.accounts.status.unknown')
+}
+
 const statusText = computed(() => {
   if (healthProbeFailed.value) {
     return t('admin.accounts.status.healthDead')
@@ -368,7 +378,7 @@ const statusText = computed(() => {
     return t('admin.accounts.status.tempUnschedulable')
   }
   if (props.account.status !== 'active') {
-    return t(`admin.accounts.status.${props.account.status}`)
+    return resolveStatusTextByKey(props.account.status || 'unknown')
   }
   if (isQuotaExceeded.value) {
     return t('admin.accounts.status.quotaExceeded')
@@ -376,7 +386,7 @@ const statusText = computed(() => {
   if (!props.account.schedulable) {
     return t('admin.accounts.status.paused')
   }
-  return t(`admin.accounts.status.${props.account.status}`)
+  return t('admin.accounts.status.active')
 })
 
 const handleTempUnschedClick = () => {

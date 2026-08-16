@@ -1166,8 +1166,6 @@ const resetAutoRefreshCache = () => {
   autoRefreshETag.value = null
 }
 
-const isFirstLoad = ref(true)
-
 function markUpstreamBillingSortRefresh() {
   if (sortState.sort_by === 'upstream_billing_rate') {
     lastUpstreamBillingSortRefreshMinute = Math.floor(Date.now() / 60_000)
@@ -1175,20 +1173,12 @@ function markUpstreamBillingSortRefresh() {
 }
 
 const load = async () => {
-  const requestParams = params as any
   markUpstreamBillingSortRefresh()
   syncAccountListDerivedParams()
   hasPendingListSync.value = false
   resetAutoRefreshCache()
   pendingTodayStatsRefresh.value = false
-  if (isFirstLoad.value) {
-    requestParams.lite = '1'
-  }
   await baseLoad()
-  if (isFirstLoad.value) {
-    isFirstLoad.value = false
-    delete requestParams.lite
-  }
   await refreshTodayStatsBatch()
 }
 

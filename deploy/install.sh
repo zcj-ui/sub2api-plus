@@ -884,8 +884,10 @@ upgrade() {
     get_latest_version
     download_and_extract
 
-    # Set permissions
-    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/sub2api"
+    # Set permissions. The service performs atomic in-place updates, so its
+    # runtime user must be able to create and rename files in INSTALL_DIR.
+    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$INSTALL_DIR/sub2api"
+    chmod u+rwx "$INSTALL_DIR"
 
     # Start service
     print_info "$(msg 'starting_service')"
@@ -946,8 +948,9 @@ install_version() {
     # Download and install
     download_and_extract
 
-    # Set permissions
-    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/sub2api"
+    # Keep the parent directory writable for future web-based updates.
+    chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$INSTALL_DIR/sub2api"
+    chmod u+rwx "$INSTALL_DIR"
 
     # Start service
     print_info "$(msg 'starting_service')"

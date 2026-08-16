@@ -130,8 +130,11 @@ export default {
       accountSchedulingThresholdOverrideDisabledHint:
         'Use 1-100. The account becomes temporarily unschedulable after reaching this usage percent; 100 disables it for this account.',
       status: {
+        unknown: 'Unknown',
         active: 'Active',
         inactive: 'Inactive',
+        disabled: 'Disabled',
+        expired: 'Expired',
         error: 'Error',
         healthDead: 'Health Dead',
         healthDeadUnknown: 'Health probe failed twice consecutively',

@@ -396,14 +396,22 @@ curl -sSL https://raw.githubusercontent.com/zcj-ui/sub2api-plus/main/deploy/inst
 
 1. Download the latest release from [GitHub Releases](https://github.com/zcj-ui/sub2api-plus/releases)
 2. Extract and copy the binary to `/opt/sub2api/`
-3. Copy `sub2api.service` to `/etc/systemd/system/`
-4. Run:
+3. Create the service user and grant it write access to the installation directory. The web updater creates a temporary directory and atomically renames the binary in this directory:
+   ```bash
+   id -u sub2api >/dev/null 2>&1 || sudo useradd --system --home /opt/sub2api --shell /bin/sh sub2api
+   sudo chown root:sub2api /opt/sub2api
+   sudo chmod 0775 /opt/sub2api
+   sudo chown sub2api:sub2api /opt/sub2api/sub2api
+   sudo chmod 0755 /opt/sub2api/sub2api
+   ```
+4. Copy `sub2api.service` to `/etc/systemd/system/`
+5. Run:
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable sub2api
    sudo systemctl start sub2api
    ```
-5. Open the Setup Wizard in your browser to complete configuration
+6. Open the Setup Wizard in your browser to complete configuration
 
 ### Commands
 

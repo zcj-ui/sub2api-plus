@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -45,6 +46,17 @@ const (
 	// Fetch a few extra releases so filtering (current/newer/prerelease) still leaves enough candidates
 	rollbackFetchPageSize = 15
 )
+
+func updateFilesystemError(operation, directory string, err error) error {
+	wrapped := fmt.Errorf("%s: %w", operation, err)
+	if errors.Is(err, os.ErrPermission) {
+		return infraerrors.Conflict(
+			"UPDATE_DIRECTORY_NOT_WRITABLE",
+			fmt.Sprintf("the service user cannot write to the update directory %s; fix its ownership or permissions and retry", filepath.Clean(directory)),
+		).WithCause(wrapped)
+	}
+	return wrapped
+}
 
 // UpdateCache defines cache operations for update service
 type UpdateCache interface {
@@ -228,7 +240,7 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	// This ensures os.Rename is atomic (same filesystem)
 	tempDir, err := os.MkdirTemp(exeDir, ".sub2api-update-*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
+		return updateFilesystemError("failed to create update temp directory", exeDir, err)
 	}
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
@@ -262,12 +274,15 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	// If step 2 fails, restore backup
 	backupPath := exePath + ".backup"
 
-	// Remove old backup if exists
-	_ = os.Remove(backupPath)
+	// Remove old backup if exists. A stale, non-removable backup otherwise makes
+	// the following rename fail with a misleading error.
+	if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return updateFilesystemError("failed to remove the previous update backup", exeDir, err)
+	}
 
 	// Step 1: Move current binary to backup
 	if err := os.Rename(exePath, backupPath); err != nil {
-		return fmt.Errorf("backup failed: %w", err)
+		return updateFilesystemError("failed to back up the current binary", exeDir, err)
 	}
 
 	// Step 2: Move new binary to target location (atomic, same filesystem)
@@ -276,7 +291,7 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 		if restoreErr := os.Rename(backupPath, exePath); restoreErr != nil {
 			return fmt.Errorf("replace failed and restore failed: %w (restore error: %v)", err, restoreErr)
 		}
-		return fmt.Errorf("replace failed (restored backup): %w", err)
+		return updateFilesystemError("failed to replace the binary; the backup was restored", exeDir, err)
 	}
 
 	// Success - backup file is kept for rollback capability
@@ -302,7 +317,7 @@ func (s *UpdateService) Rollback() error {
 
 	// Replace current with backup
 	if err := os.Rename(backupFile, exePath); err != nil {
-		return fmt.Errorf("rollback failed: %w", err)
+		return updateFilesystemError("failed to restore the backup binary", filepath.Dir(exePath), err)
 	}
 
 	return nil

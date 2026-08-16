@@ -333,8 +333,11 @@ export default {
       accountSchedulingThresholdOverrideDisabledHint:
         '1-100，达到该用量百分比后临时不可调度；100 表示禁用当前账号自动停调。',
       status: {
+        unknown: '未知',
         active: '正常',
         inactive: '停用',
+        disabled: '已禁用',
+        expired: '已到期',
         error: '错误',
         healthDead: '测活死亡',
         healthDeadUnknown: '连续两次测活失败',
