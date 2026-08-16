@@ -13,8 +13,9 @@
 - 在线更新失败不再只显示 `internal error`：服务用户对安装目录无写权限时返回结构化 `UPDATE_DIRECTORY_NOT_WRITABLE`（HTTP 409），提示修复目录属主或权限后重试；备份文件无法删除时也会明确报错而不是被静默吞掉。
 - 安装/升级脚本为安装目录补齐运行用户写权限（`chown $SERVICE_USER` + `chmod u+rwx`），手动部署文档同步说明该要求，避免后续面板在线更新踩同样的权限问题。
 - 指纹模拟显示异常确认为上述 lite 根因（列表 `extra` 缺失所致）；指纹收敛的后端派生、编辑/批量编辑写入链路与文案经测试验证保持正常，默认仍为显式 opt-in（`off`）。
+- 修复三个 Codex 用量快照测试在重复运行（`-count>1`）下的偶发失败：测试构造的服务未带独立节流器，落入包级 30 秒快照写入节流窗口；现改为每个用例使用零间隔节流器，生产行为不变。
 
-验证结果：`internal/service` 全量测试、`internal/handler/admin` 测试、前端 `vue-tsc --noEmit`、完整 Vitest（229 个文件 1590 项）均通过；`gofmt` 与 `git diff --check` 干净。
+验证结果：`internal/service` 全量测试、`internal/handler/admin` 测试、前端 `vue-tsc --noEmit`、完整 Vitest（229 个文件 1590 项）均通过；更新器/指纹/快照定向测试以 `-count=3` 重复运行通过；`gofmt` 与 `git diff --check` 干净。
 
 ## 0.2.1 OpenAI/Codex 兼容性修复
 

@@ -401,7 +401,11 @@ func TestOpenAIGatewayService_UpdateCodexUsageSnapshot_ExhaustedSnapshotDoesNotS
 		updateExtraCh: make(chan map[string]any, 1),
 		rateLimitCh:   make(chan time.Time, 1),
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	// 独立零间隔节流器：避免 -count>1 时落入包级 30s 默认节流窗口而偶发失败。
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		codexSnapshotThrottle: newAccountWriteThrottle(0),
+	}
 	snapshot := &OpenAICodexUsageSnapshot{
 		PrimaryUsedPercent:         ptrFloat64WS(100),
 		PrimaryResetAfterSeconds:   ptrIntWS(3600),
@@ -431,7 +435,11 @@ func TestOpenAIGatewayService_UpdateCodexUsageSnapshot_NonExhaustedSnapshotDoesN
 		updateExtraCh: make(chan map[string]any, 1),
 		rateLimitCh:   make(chan time.Time, 1),
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	// 独立零间隔节流器：避免 -count>1 时落入包级 30s 默认节流窗口而偶发失败。
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		codexSnapshotThrottle: newAccountWriteThrottle(0),
+	}
 	snapshot := &OpenAICodexUsageSnapshot{
 		PrimaryUsedPercent:         ptrFloat64WS(94),
 		PrimaryResetAfterSeconds:   ptrIntWS(3600),
