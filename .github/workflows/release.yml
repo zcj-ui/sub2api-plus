@@ -212,6 +212,32 @@ jobs:
           echo "$TAG_MESSAGE" >> "$GITHUB_OUTPUT"
           echo "$DELIMITER" >> "$GITHUB_OUTPUT"
 
+      - name: Extract release notes from changelog
+        id: release_notes
+        env:
+          TAG_MESSAGE: ${{ steps.tag_message.outputs.message }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CHANGELOG_FILE="docs/releases/CHANGELOG_CUSTOM_2026-08-14_CN.md"
+          SECTION=""
+          if [ -f "$CHANGELOG_FILE" ]; then
+            SECTION=$(awk -v ver="$VERSION" '
+              index($0, "## " ver " ") == 1 { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' "$CHANGELOG_FILE")
+          fi
+          if [ -z "$SECTION" ]; then
+            echo "No changelog section found for ${VERSION}; falling back to the tag message."
+            SECTION="$TAG_MESSAGE"
+          fi
+          DELIMITER="NOTES_$(openssl rand -hex 8)"
+          {
+            echo "notes<<$DELIMITER"
+            printf '%s\n' "$SECTION"
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set lowercase owner for GHCR
         id: lowercase
         run: |
@@ -226,6 +252,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_MESSAGE: ${{ steps.tag_message.outputs.message }}
+          RELEASE_NOTES: ${{ steps.release_notes.outputs.notes }}
           GITHUB_REPO_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO_OWNER_LOWER: ${{ steps.lowercase.outputs.owner }}
           GITHUB_REPO_NAME: ${{ github.event.repository.name }}
