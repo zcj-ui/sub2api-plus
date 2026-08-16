@@ -30,9 +30,9 @@ const (
 	// ChatGPT internal API for OAuth accounts
 	chatgptCodexURL = "https://chatgpt.com/backend-api/codex/responses"
 	// OpenAI Platform API for API Key accounts (fallback)
-	openaiPlatformAPIURL            = "https://api.openai.com/v1/responses"
-	openaiPlatformAPIInputTokensURL = "https://api.openai.com/v1/responses/input_tokens"
-	openaiStickySessionTTL          = time.Hour // 粘性会话TTL
+	openaiPlatformAPIURL              = "https://api.openai.com/v1/responses"
+	openaiPlatformAPIInputTokensURL   = "https://api.openai.com/v1/responses/input_tokens"
+	openaiStickySessionIdleTTLDefault = 60 * time.Second // 粘性会话空闲租约默认值；运行时可经设置键调整
 	// 与真实 Codex TUI 的 User-Agent 结构对齐：
 	// {originator}/{version} ({OS} {OS_version}; {arch}) {terminal}
 	// 缺少 OS/架构/终端后缀的形态易被上游指纹识别为非官方客户端。

@@ -6,16 +6,21 @@
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
 
-## 0.2.2 账户列表显示与在线更新修复
+## 0.2.2 账户列表显示、在线更新与调度粘性修复
 
 - 修复账户列表首次加载整表渲染损坏：此前首屏请求使用 `lite=1` 精简响应（仅 `id/name/platform/type/健康快照`），导致 `admin.accounts.status.undefined`、并发显示 `0/`、额度窗口和"从未使用"等列全部异常，需要手动刷新或修改每页数量才恢复。首屏现在始终请求完整字段，`lite` 仅保留给全选元数据这类只读 ID 的场景，并新增回归测试锁定。
-- 账户状态徽标增加兜底：缺失或未知 `status` 统一显示"未知"，不再把原始 i18n 键名渲染到界面上；中英文文案已补齐。
+- 账户状态徽标增加兜底：缺失或未知 `status` 统一显示"未知"，不再把原始 i18n 键名渲染到界面上；补齐 `disabled/expired` 历史状态文案（中英文）。
 - 在线更新失败不再只显示 `internal error`：服务用户对安装目录无写权限时返回结构化 `UPDATE_DIRECTORY_NOT_WRITABLE`（HTTP 409），提示修复目录属主或权限后重试；备份文件无法删除时也会明确报错而不是被静默吞掉。
 - 安装/升级脚本为安装目录补齐运行用户写权限（`chown $SERVICE_USER` + `chmod u+rwx`），手动部署文档同步说明该要求，避免后续面板在线更新踩同样的权限问题。
 - 指纹模拟显示异常确认为上述 lite 根因（列表 `extra` 缺失所致）；指纹收敛的后端派生、编辑/批量编辑写入链路与文案经测试验证保持正常，默认仍为显式 opt-in（`off`）。
+- 调度粘性重做，解决"同一会话被拆到多个账号导致上游 prompt cache 全丢"与"优先级来回跳"：
+  - 粘性账号并发满时不再自动换号，改为在原账号排队等待（受 `StickySessionWaitTimeout/StickySessionMaxWaiting` 约束），会话不再拆号。
+  - 粘性逃逸（TTFT/错误率触发跳号）改为显式 opt-in，默认关闭；TTFT 抖动是高并发常态，不再触发迁移。需要的管理员可通过 `gateway.openai_scheduler.sticky_escape_enabled` 显式开启。
+  - 溢出阀：显式开启逃逸且等待队列饱和时，粘性请求释放到其他有空位的账号并保留原绑定，账号恢复后会话自动回到原号；新会话始终优先选择有立即空位的账号，不会被满号阻塞。
+  - 粘性绑定空闲租约从固定 1 小时改为可配置滑动窗口，默认 60 秒，可通过设置键 `openai_sticky_session_idle_ttl_seconds` 运行时调整（如 10 秒）；每次请求命中都会续期。
 - 修复三个 Codex 用量快照测试在重复运行（`-count>1`）下的偶发失败：测试构造的服务未带独立节流器，落入包级 30 秒快照写入节流窗口；现改为每个用例使用零间隔节流器，生产行为不变。
 
-验证结果：`internal/service` 全量测试、`internal/handler/admin` 测试、前端 `vue-tsc --noEmit`、完整 Vitest（229 个文件 1590 项）均通过；更新器/指纹/快照定向测试以 `-count=3` 重复运行通过；`gofmt` 与 `git diff --check` 干净。
+验证结果：`internal/service` 全量测试、`internal/config` 测试、`internal/handler/admin` 测试、前端 `vue-tsc --noEmit`、完整 Vitest（229 个文件）均通过；更新器/指纹/快照/粘性调度定向测试以 `-count=3` 重复运行通过；`gofmt` 与 `git diff --check` 干净。
 
 ## 0.2.1 OpenAI/Codex 兼容性修复
 

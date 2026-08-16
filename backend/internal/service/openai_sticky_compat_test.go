@@ -54,7 +54,7 @@ func TestSetStickySessionAccountID_DualWriteOldEnabled(t *testing.T) {
 	}
 
 	ctx := withOpenAILegacySessionHash(context.Background(), "legacy-hash")
-	err := svc.setStickySessionAccountID(ctx, nil, "new-hash", 9, openaiStickySessionTTL)
+	err := svc.setStickySessionAccountID(ctx, nil, "new-hash", 9, openaiStickySessionIdleTTLDefault)
 	require.NoError(t, err)
 	require.Equal(t, int64(9), cache.sessionBindings["openai:new-hash"])
 	require.Equal(t, int64(9), cache.sessionBindings["openai:legacy-hash"])
@@ -77,7 +77,7 @@ func TestSetStickySessionAccountID_DualWriteOldDisabled(t *testing.T) {
 	}
 
 	ctx := withOpenAILegacySessionHash(context.Background(), "legacy-hash")
-	err := svc.setStickySessionAccountID(ctx, nil, "new-hash", 9, openaiStickySessionTTL)
+	err := svc.setStickySessionAccountID(ctx, nil, "new-hash", 9, openaiStickySessionIdleTTLDefault)
 	require.NoError(t, err)
 	require.Equal(t, int64(9), cache.sessionBindings["openai:new-hash"])
 	_, exists := cache.sessionBindings["openai:legacy-hash"]

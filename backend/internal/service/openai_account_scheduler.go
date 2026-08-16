@@ -49,6 +49,7 @@ type cachedOpenAIAdvancedSchedulerSetting struct {
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
+	stickyIdleTTLSeconds           int
 	weightOverrides                map[string]float64
 	expiresAt                      int64
 }
@@ -60,6 +61,7 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
+	stickyIdleTTLSeconds           int
 	weightOverrides                map[string]float64
 }
 
@@ -547,16 +549,17 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 
 	cfg := s.service.schedulingConfig()
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
+	//
+	// 并发满时不逃逸：粘性账号打满是"先把一个号打满"的正常结果，直接换号会把同一
+	// 会话拆到多个账号、上游 prompt cache 全部失效。默认返回等待计划，让请求继续
+	// 在粘性账号上排队（受 StickySessionWaitTimeout / StickySessionMaxWaiting 约束）。
 	if s.service.concurrencyService != nil {
-		if escapeCfg.enabled && acquireErr == nil && result != nil && !result.Acquired {
-			errorRate, ttft, _ := s.stats.snapshot(accountID)
-			slog.Info("sticky_escape_triggered",
-				"account_id", accountID,
-				"reason", "concurrency_full",
-				"error_rate", errorRate,
-				"ttft", ttft,
-			)
-			return nil, true, nil
+		// 溢出阀仅属于逃逸语义：管理员显式开启逃逸且配置了等待上限时，等待队列
+		// 饱和的粘性请求才释放到负载均衡（保留绑定）；逃逸关闭或未设上限则一律排队。
+		if escapeCfg.enabled && cfg.StickySessionMaxWaiting > 0 {
+			if waitingCount, waitErr := s.service.concurrencyService.GetAccountWaitingCount(ctx, accountID); waitErr == nil && waitingCount >= cfg.StickySessionMaxWaiting {
+				return nil, true, nil
+			}
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 			Account: account,
@@ -1877,6 +1880,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 				subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
 				lbTopKOverride:                 cached.lbTopKOverride,
+				stickyIdleTTLSeconds:           cached.stickyIdleTTLSeconds,
 				weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 			}
 		}
@@ -1892,6 +1896,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 					stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 					subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
 					lbTopKOverride:                 cached.lbTopKOverride,
+					stickyIdleTTLSeconds:           cached.stickyIdleTTLSeconds,
 					weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 				}, nil
 			}
@@ -1903,6 +1908,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 		stickyWeightedEnabled := false
 		subscriptionPriorityEnabled := false
 		lbTopKOverride := 0
+		stickyIdleTTLSeconds := 0
 		weightOverrides := map[string]float64{}
 		if repo := s.openAIAdvancedSchedulerSettingRepo(); repo != nil {
 			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAdvancedSchedulerSettingDBTimeout)
@@ -1915,6 +1921,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
 				lbTopKOverride = parsePositiveIntOverride(values[SettingKeyOpenAIAdvancedSchedulerLBTopK])
+				stickyIdleTTLSeconds = parsePositiveIntOverride(values[SettingKeyOpenAIStickySessionIdleTTLSeconds])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(values)
 			} else {
 				// 批量读取失败时逐键降级，覆盖全部键（含 TopK/权重），避免只加载布尔开关
@@ -1932,6 +1939,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
 				lbTopKOverride = parsePositiveIntOverride(fallbackValues[SettingKeyOpenAIAdvancedSchedulerLBTopK])
+				stickyIdleTTLSeconds = parsePositiveIntOverride(fallbackValues[SettingKeyOpenAIStickySessionIdleTTLSeconds])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(fallbackValues)
 			}
 		}
@@ -1943,6 +1951,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
 			lbTopKOverride:                 lbTopKOverride,
+			stickyIdleTTLSeconds:           stickyIdleTTLSeconds,
 			weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(weightOverrides),
 			expiresAt:                      time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
 		})
@@ -1953,12 +1962,27 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
 			lbTopKOverride:                 lbTopKOverride,
+			stickyIdleTTLSeconds:           stickyIdleTTLSeconds,
 			weightOverrides:                weightOverrides,
 		}, nil
 	})
 
 	settings, _ := result.(openAIAdvancedSchedulerRuntimeSettings)
 	return settings
+}
+
+// openAIStickySessionIdleTTL 返回粘性会话的空闲租约时长。
+// 会话在该窗口内没有新请求即释放账号绑定；每次请求命中都会续期（滑动窗口）。
+// 默认 60s，可通过设置键 openai_sticky_session_idle_ttl_seconds 运行时调整。
+func (s *OpenAIGatewayService) openAIStickySessionIdleTTL(ctx context.Context) time.Duration {
+	if s == nil {
+		return openaiStickySessionIdleTTLDefault
+	}
+	seconds := s.openAIAdvancedSchedulerRuntimeSettings(ctx).stickyIdleTTLSeconds
+	if seconds <= 0 {
+		seconds = int(openaiStickySessionIdleTTLDefault / time.Second)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Context) bool {
@@ -1992,6 +2016,7 @@ func openAIAdvancedSchedulerRuntimeSettingKeys() []string {
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled,
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
 		SettingKeyOpenAIAdvancedSchedulerLBTopK,
+		SettingKeyOpenAIStickySessionIdleTTLSeconds,
 	}
 	for _, spec := range openAIAdvancedSchedulerWeightOverrideSpecs() {
 		keys = append(keys, spec.key)
@@ -2374,7 +2399,10 @@ func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
 	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds > 0 {
 		return time.Duration(s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds) * time.Second
 	}
-	return openaiStickySessionTTL
+	if s != nil {
+		return s.openAIStickySessionIdleTTL(context.Background())
+	}
+	return openaiStickySessionIdleTTLDefault
 }
 
 func (s *OpenAIGatewayService) openAIWSLBTopK() int {
@@ -2399,34 +2427,26 @@ func (s *OpenAIGatewayService) openAIWSLBTopKForRequest(ctx context.Context) int
 }
 
 func (s *OpenAIGatewayService) openAIStickyEscapeConfig() openAIStickyEscapeConfig {
+	// 逃逸是显式 opt-in：默认关闭。TTFT 抖动与账号打满是高并发下的常态，
+	// 自动逃逸会把会话拆到多个账号、优先级来回跳，并直接摧毁上游 prompt
+	// cache 命中。需要时管理员可通过 sticky_escape_enabled + 阈值显式开启。
 	if s != nil && s.cfg != nil {
 		cfg := s.cfg.Gateway.OpenAIScheduler
-		enabled := cfg.StickyEscapeEnabled
-		if !enabled && cfg.StickyEscapeTTFTMs == 0 && cfg.StickyEscapeErrorRate == 0 {
-			enabled = true
-		}
 		ttftMs := float64(cfg.StickyEscapeTTFTMs)
-		if ttftMs <= 0 {
-			ttftMs = 15000
+		if ttftMs < 0 {
+			ttftMs = 0
 		}
 		errorRate := cfg.StickyEscapeErrorRate
 		if errorRate < 0 || errorRate > 1 {
-			errorRate = 0.5
-		}
-		if errorRate == 0 && cfg.StickyEscapeTTFTMs == 0 && cfg.StickyEscapeErrorRate == 0 {
-			errorRate = 0.5
+			errorRate = 0
 		}
 		return openAIStickyEscapeConfig{
-			enabled:   enabled,
+			enabled:   cfg.StickyEscapeEnabled,
 			ttftMs:    ttftMs,
 			errorRate: errorRate,
 		}
 	}
-	return openAIStickyEscapeConfig{
-		enabled:   true,
-		ttftMs:    15000,
-		errorRate: 0.5,
-	}
+	return openAIStickyEscapeConfig{}
 }
 
 func (s *OpenAIGatewayService) openAIWSSchedulerWeights() GatewayOpenAIWSSchedulerScoreWeightsView {

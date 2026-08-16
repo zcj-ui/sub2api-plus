@@ -111,7 +111,7 @@ func (s *OpenAIGatewayService) openAILegacySessionCacheKey(ctx context.Context, 
 func (s *OpenAIGatewayService) openAIStickyLegacyTTL(ttl time.Duration) time.Duration {
 	legacyTTL := ttl
 	if legacyTTL <= 0 {
-		legacyTTL = openaiStickySessionTTL
+		legacyTTL = openaiStickySessionIdleTTLDefault
 	}
 	if legacyTTL > 10*time.Minute {
 		return 10 * time.Minute

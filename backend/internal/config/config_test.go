@@ -422,8 +422,8 @@ func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	if cfg.Gateway.OpenAIWS.StickySessionTTLSeconds != 3600 {
 		t.Fatalf("Gateway.OpenAIWS.StickySessionTTLSeconds = %d, want 3600", cfg.Gateway.OpenAIWS.StickySessionTTLSeconds)
 	}
-	if !cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled {
-		t.Fatalf("Gateway.OpenAIScheduler.StickyEscapeEnabled = false, want true")
+	if cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled {
+		t.Fatalf("Gateway.OpenAIScheduler.StickyEscapeEnabled = true, want false (escape is opt-in)")
 	}
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs != 15000 {
 		t.Fatalf("Gateway.OpenAIScheduler.StickyEscapeTTFTMs = %d, want 15000", cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs)

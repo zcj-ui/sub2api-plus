@@ -1738,12 +1738,6 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate == 0 {
 		cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
 	}
-	// Kept as a backstop: setEnvReachableDefaults now registers this key with its
-	// effective default (true), so IsSet always reports true and this branch no
-	// longer fires. It still guards the default if that registration is dropped.
-	if !cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled && !viper.IsSet("gateway.openai_scheduler.sticky_escape_enabled") {
-		cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
-	}
 
 	cfg.RunMode = NormalizeRunMode(cfg.RunMode)
 	cfg.Server.Mode = strings.ToLower(strings.TrimSpace(cfg.Server.Mode))
@@ -2480,12 +2474,9 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.user_message_queue.mode", "")
 	viper.SetDefault("update.proxy_url", "")
 
-	// sticky_escape_enabled is the one exception to the zero-value rule: its
-	// effective default is true, applied post-unmarshal via a viper.IsSet guard.
-	// Registering false would make IsSet always report true and permanently
-	// disable sticky escape, so register the effective default instead. An
-	// explicit false in config or env still wins.
-	viper.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", true)
+	// sticky_escape 默认关闭：TTFT 抖动与账号打满是高并发常态，自动逃逸会把
+	// 同一会话拆到多个账号并摧毁上游 prompt cache；需要的管理员显式开启。
+	viper.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", false)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
 
