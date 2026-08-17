@@ -2,12 +2,17 @@ package service
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 
 	"github.com/tidwall/gjson"
 )
+
+// OpenAIPendingConversationItemsAuditMarker is present only on the internal
+// synthetic audit envelope assembled for staged Responses WebSocket items.
+const OpenAIPendingConversationItemsAuditMarker = "__sub2api_pending_conversation_items"
 
 func ExtractContentModerationText(protocol string, body []byte) string {
 	return ExtractContentModerationInput(protocol, body).Text
@@ -25,7 +30,13 @@ func ExtractContentModerationInput(protocol string, body []byte) ContentModerati
 	case ContentModerationProtocolOpenAIChat:
 		collectLastRoleMessage(gjson.GetBytes(body, "messages"), "user", &parts, &images)
 	case ContentModerationProtocolOpenAIResponses:
-		collectLastResponsesInput(gjson.GetBytes(body, "input"), &parts, &images)
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "type").String()), "conversation.item.create") {
+			collectResponsesConversationItem(gjson.GetBytes(body, "item"), &parts, &images)
+		} else if gjson.GetBytes(body, OpenAIPendingConversationItemsAuditMarker).Bool() {
+			collectAllResponsesAuditItems(gjson.GetBytes(body, "input").Array(), &parts, &images)
+		} else {
+			collectLastResponsesInput(gjson.GetBytes(body, "input"), &parts, &images)
+		}
 	case ContentModerationProtocolGemini:
 		collectLastGeminiContent(gjson.GetBytes(body, "contents"), &parts, &images)
 	case ContentModerationProtocolOpenAIImages:
@@ -147,6 +158,63 @@ func collectLastResponsesInput(input gjson.Result, parts *[]string, images *[]st
 				collectContentValue(input, parts, images)
 			}
 		}
+	}
+}
+
+// collectAllResponsesAuditItems is used only for the internal pending-item
+// audit envelope. Ordinary Responses moderation deliberately keeps its
+// latest-user semantics; the marker prevents a staged malicious item from
+// being hidden behind a benign tail item without broadening every request.
+func collectAllResponsesAuditItems(items []gjson.Result, parts *[]string, images *[]string) {
+	for _, item := range items {
+		if !item.Exists() {
+			continue
+		}
+		if item.Type == gjson.String {
+			addModerationText(parts, item.String())
+			continue
+		}
+		for _, field := range []string{"content", "text", "input"} {
+			value := item.Get(field)
+			if !value.Exists() {
+				continue
+			}
+			collectContentValue(value, parts, images)
+		}
+		for _, field := range []string{"input", "arguments", "output"} {
+			value := item.Get(field)
+			if !value.Exists() {
+				continue
+			}
+			if value.Type == gjson.String {
+				addModerationText(parts, value.String())
+				continue
+			}
+			if raw := strings.TrimSpace(value.Raw); raw != "" {
+				var compact any
+				if err := json.Unmarshal([]byte(raw), &compact); err == nil {
+					if encoded, encodeErr := json.Marshal(compact); encodeErr == nil {
+						addModerationText(parts, string(encoded))
+					}
+				} else {
+					addModerationText(parts, raw)
+				}
+			}
+		}
+	}
+}
+
+// collectResponsesConversationItem handles the incremental Responses WebSocket
+// shape: {"type":"conversation.item.create","item":{...}}. It deliberately
+// keeps the legacy moderator's user-message semantics while making staged
+// content visible before an empty response.create can consume it upstream.
+func collectResponsesConversationItem(item gjson.Result, parts *[]string, images *[]string) {
+	if !item.Exists() || !isResponsesUserTextItem(item) {
+		return
+	}
+	collectContentValue(item.Get("content"), parts, images)
+	if item.Get("type").String() == "input_text" || item.Get("text").Exists() {
+		collectContentValue(item, parts, images)
 	}
 }
 

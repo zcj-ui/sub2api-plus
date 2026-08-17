@@ -11,7 +11,11 @@ describe('fetchAccountSelectionMetadata selected-account paging', () => {
 
     const metadata = await fetchAccountSelectionMetadata(fetchPage, {}, [1])
 
-    expect(metadata).toEqual({ platforms: ['openai'], types: ['oauth'] })
+    expect(metadata).toEqual({
+      platforms: ['openai'],
+      types: ['oauth'],
+      hasCredentialShadows: false
+    })
     expect(fetchPage).toHaveBeenCalledTimes(1)
   })
 })

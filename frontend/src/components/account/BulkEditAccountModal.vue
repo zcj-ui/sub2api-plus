@@ -914,7 +914,7 @@
       </div>
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
-      <div v-if="allOpenAIOAuth" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+      <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintMode') }}</label>
           <input
@@ -1419,6 +1419,7 @@ interface Props {
     previewCount?: number
     selectedPlatforms?: AccountPlatform[]
     selectedTypes?: AccountType[]
+    hasCredentialShadows?: boolean
   }
   proxies: ProxyConfig[]
   groups: AdminGroup[]
@@ -1438,6 +1439,7 @@ const targetMode = computed(() => props.target?.mode ?? 'selected')
 const targetPreviewCount = computed(() => props.target?.previewCount ?? props.accountIds.length)
 const targetSelectedPlatforms = computed(() => props.target?.selectedPlatforms ?? props.selectedPlatforms)
 const targetSelectedTypes = computed(() => props.target?.selectedTypes ?? props.selectedTypes)
+const targetHasCredentialShadows = computed(() => props.target?.hasCredentialShadows === true)
 // Grok 快捷端点仅在所选账号全部为 grok 平台时展示（其他平台不显示）
 const allTargetsGrok = computed(
   () =>
@@ -1472,6 +1474,7 @@ const allOpenAIOAuth = computed(() => {
 // 严格 OAuth（不含 setup-token）：namespace 摊平兼容开关只对 OAuth 账号生效
 const allOpenAIOAuthOnly = computed(() => {
   return (
+    !targetHasCredentialShadows.value &&
     targetSelectedPlatforms.value.length === 1 &&
     targetSelectedPlatforms.value[0] === 'openai' &&
     targetSelectedTypes.value.length > 0 &&
@@ -1608,14 +1611,14 @@ const handleBulkAllowOveragesChange = (enabled: boolean) => {
   // because the lightweight selection metadata intentionally excludes secrets.
   allowOveragesEnabled.value = window.confirm(t('admin.accounts.allowOveragesProConfirm'))
 }
-type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
+// Only device convergence is protocol-compatible without a stateful session
+// graph; session/full remain backend legacy values and are not selectable.
+type CodexFingerprintMode = 'off' | 'device'
 const enableCodexFingerprintMode = ref(false)
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
-  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
-  { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
-  { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
+  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') }
 ])
 const openAICompactMode = ref<OpenAICompactMode>('auto')
 const openAICompactModelMappings = ref<ModelMapping[]>([])
@@ -1902,14 +1905,14 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     extra.codex_cli_only_allow_app_server = codexCLIOnlyAppServerEnabled.value
   }
 
-  if (enableCodexFingerprintMode.value) {
+  if (enableCodexFingerprintMode.value && allOpenAIOAuthOnly.value) {
     const extra = ensureExtra()
-    // off = 默认值，清键即可；device/session/full 是显式 opt-in，必须落键（#5610）。
-    if (codexFingerprintMode.value !== 'off') {
-      extra.codex_fingerprint_mode = codexFingerprintMode.value
-    } else {
-      delete extra.codex_fingerprint_mode
-    }
+    // Bulk updates use JSONB merge semantics. A null value is an explicit
+    // delete instruction handled by the repository; writing the string "off"
+    // would leave stale device state in older snapshots.
+    extra.codex_fingerprint_mode = codexFingerprintMode.value === 'off'
+      ? null
+      : codexFingerprintMode.value
   }
 
   if (enableCodex429Guard.value && allOpenAIOAuthOnly.value) {

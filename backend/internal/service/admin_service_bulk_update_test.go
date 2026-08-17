@@ -172,6 +172,7 @@ func TestAdminServiceBulkUpdateCodex429GuardRequiresOpenAIOAuthTargets(t *testin
 		},
 		{name: "api key", value: true, targets: []*Account{{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}}, wantErr: true},
 		{name: "claude", value: true, targets: []*Account{{ID: 1, Platform: PlatformAnthropic, Type: AccountTypeOAuth}}, wantErr: true},
+		{name: "spark shadow", value: true, targets: []*Account{{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, ParentAccountID: int64PtrForCodexGuardTest(9)}}, wantErr: true},
 		{name: "malformed", value: "false", targets: []*Account{{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}}, wantErr: true},
 	}
 

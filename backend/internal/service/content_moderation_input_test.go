@@ -164,6 +164,17 @@ func TestExtractContentModerationInput_ResponsesLastUserMessageExtracted(t *test
 	require.Equal(t, "latest", input.Text)
 }
 
+func TestExtractContentModerationInput_ResponsesWebSocketConversationItemExtracted(t *testing.T) {
+	body := []byte(`{
+		"type":"conversation.item.create",
+		"item":{"type":"message","role":"user","content":[{"type":"input_text","text":"staged websocket user text"}]}
+	}`)
+
+	input := ExtractContentModerationInput(ContentModerationProtocolOpenAIResponses, body)
+
+	require.Equal(t, "staged websocket user text", input.Text)
+}
+
 func TestExtractContentModerationInput_ResponsesLastIsAssistantSkipped(t *testing.T) {
 	body := []byte(`{
 		"input":[

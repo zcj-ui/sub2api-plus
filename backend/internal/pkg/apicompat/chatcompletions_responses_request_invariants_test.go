@@ -119,6 +119,43 @@ func TestRequest_SequentialToolCallsStaySeparate(t *testing.T) {
 	require.Equal(t, 2, assistants)
 }
 
+// A Codex turn may produce one reasoning item followed by multiple sequential
+// tool calls. Reasoning-only upstreams require the same reasoning_content on
+// each assistant call message, even though the Responses history only carries
+// the reasoning item once at the beginning of the turn.
+func TestRequest_ChainedToolCallsReplayTurnReasoning(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "deepseek-reasoner",
+		Input: json.RawMessage(`[
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"turn thinking"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":""}]},
+			{"type":"function_call","call_id":"call_a","name":"exec_command","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_a","output":"ok"},
+			{"type":"function_call","call_id":"call_b","name":"exec_command","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_b","output":"ok"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"second turn"}]},
+			{"type":"function_call","call_id":"call_c","name":"exec_command","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_c","output":"ok"}
+		]`),
+	}
+
+	out, err := ResponsesToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	assertChatInvariants(t, out.Messages)
+
+	byCallID := map[string]ChatMessage{}
+	for _, message := range out.Messages {
+		for _, toolCall := range message.ToolCalls {
+			byCallID[toolCall.ID] = message
+		}
+	}
+	require.Len(t, byCallID, 3)
+	require.Equal(t, "turn thinking", byCallID["call_a"].ReasoningContent)
+	require.Equal(t, "turn thinking", byCallID["call_b"].ReasoningContent)
+	require.Equal(t, "second turn", byCallID["call_c"].ReasoningContent)
+}
+
 // Golden sample: codex injects a message (e.g. an "Approved command prefix
 // saved" notice) between a function_call and its output. The intervening message
 // must be moved after the tool reply so the assistant tool_calls is immediately

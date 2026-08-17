@@ -522,8 +522,8 @@ func TestImportDataAppliesCodex429GuardOnlyToOpenAIOAuth(t *testing.T) {
 			"proxies": []any{},
 			"accounts": []map[string]any{
 				{"name": "codex", "platform": service.PlatformOpenAI, "type": service.AccountTypeOAuth, "credentials": map[string]any{"token": "x"}, "concurrency": 1, "priority": 1},
-				{"name": "openai-key", "platform": service.PlatformOpenAI, "type": service.AccountTypeAPIKey, "credentials": map[string]any{"api_key": "x"}, "extra": map[string]any{"keep": true}, "concurrency": 1, "priority": 1},
-				{"name": "claude", "platform": service.PlatformAnthropic, "type": service.AccountTypeOAuth, "credentials": map[string]any{"token": "x"}, "extra": map[string]any{"keep": true}, "concurrency": 1, "priority": 1},
+				{"name": "openai-key", "platform": service.PlatformOpenAI, "type": service.AccountTypeAPIKey, "credentials": map[string]any{"api_key": "x"}, "extra": map[string]any{"keep": true, service.OpenAICodex429GuardEnabledExtraKey: true}, "concurrency": 1, "priority": 1},
+				{"name": "claude", "platform": service.PlatformAnthropic, "type": service.AccountTypeOAuth, "credentials": map[string]any{"token": "x"}, "extra": map[string]any{"keep": true, service.OpenAICodex429GuardEnabledExtraKey: true}, "concurrency": 1, "priority": 1},
 			},
 		},
 		"skip_default_group_bind": true,
@@ -540,4 +540,6 @@ func TestImportDataAppliesCodex429GuardOnlyToOpenAIOAuth(t *testing.T) {
 	require.Equal(t, false, adminSvc.createdAccounts[0].Extra[service.OpenAICodex429GuardEnabledExtraKey])
 	require.NotContains(t, adminSvc.createdAccounts[1].Extra, service.OpenAICodex429GuardEnabledExtraKey)
 	require.NotContains(t, adminSvc.createdAccounts[2].Extra, service.OpenAICodex429GuardEnabledExtraKey)
+	require.Equal(t, true, adminSvc.createdAccounts[1].Extra["keep"])
+	require.Equal(t, true, adminSvc.createdAccounts[2].Extra["keep"])
 }

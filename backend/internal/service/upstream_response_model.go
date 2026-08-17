@@ -167,8 +167,31 @@ func upstreamModelMismatch(sentModel, responseModel string) *bool {
 		return nil
 	}
 	sentModel = strings.TrimSpace(sentModel)
-	mismatch := sentModel == "" || !strings.EqualFold(sentModel, responseModel)
+	mismatch := sentModel == "" || !upstreamModelsMatchForAudit(sentModel, responseModel)
 	return &mismatch
+}
+
+// upstreamModelsMatchForAudit tolerates provider runtime aliases while keeping
+// the observed response model unchanged for billing and diagnostics. xAI
+// returns a build identifier for the public Grok aliases, so literal
+// comparison would incorrectly flag successful requests as mismatches.
+func upstreamModelsMatchForAudit(sentModel, responseModel string) bool {
+	if strings.EqualFold(sentModel, responseModel) {
+		return true
+	}
+	sentGrokModel := canonicalGrokBuildRuntimeModel(sentModel)
+	return sentGrokModel != "" && sentGrokModel == canonicalGrokBuildRuntimeModel(responseModel)
+}
+
+func canonicalGrokBuildRuntimeModel(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "grok-4.5", "grok-4.5-latest", "grok-4.5-build":
+		return "grok-4.5-build"
+	case "grok-4.6", "grok-4.6-latest", "grok-4.6-build":
+		return "grok-4.6-build"
+	default:
+		return ""
+	}
 }
 
 func upstreamSentModel(requestedModel, upstreamModel string) string {

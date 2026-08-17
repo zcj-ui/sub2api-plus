@@ -1965,12 +1965,12 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 		t.Fatal("等待 passthrough websocket 结束超时")
 	}
 
-	conversationSeed := resolveCodexConversationSeed(nil, []byte(`{"prompt_cache_key":"pcache_passthrough"}`), 0)
-	wantSession := resolveCodexConversationSessionID(account, conversationSeed)
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("conversation_id"))
-	require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
-	require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
+	require.Equal(t, "pcache_passthrough", captureDialer.lastHeaders.Get("session_id"))
+	require.Equal(t, "pcache_passthrough", captureDialer.lastHeaders.Get("conversation_id"))
+	// The synthetic test turn metadata is intentionally malformed; the gateway
+	// skips the entire fingerprint projection instead of mixing partial fields.
+	require.Empty(t, captureDialer.lastHeaders.Get("x-codex-installation-id"))
+	require.Empty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
 	require.Equal(t, "turn-state-1", captureDialer.lastHeaders.Get(openAIWSTurnStateHeader))
 	require.Equal(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader))
 	require.Len(t, upstreamConn.writes, 1)

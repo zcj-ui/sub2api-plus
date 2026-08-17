@@ -84,7 +84,15 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	}
 
 	sessionResolution := resolveOpenAIWSSessionHeaders(c, promptCacheKey)
+	canonicalSessionID := ""
+	canonicalThreadID := ""
+	canonicalRequestID := ""
+	canonicalConversationID := ""
 	if c != nil && c.Request != nil {
+		canonicalSessionID = firstHeaderValue(c.Request.Header, "session-id", "session_id")
+		canonicalThreadID = firstHeaderValue(c.Request.Header, "thread-id", "thread_id")
+		canonicalRequestID = firstHeaderValue(c.Request.Header, "x-client-request-id")
+		canonicalConversationID = firstHeaderValue(c.Request.Header, "conversation_id")
 		if v := strings.TrimSpace(c.Request.Header.Get("accept-language")); v != "" {
 			headers.Set("accept-language", v)
 		}
@@ -93,7 +101,15 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 				headers.Add("x-codex-beta-features", value)
 			}
 		}
-		for _, name := range [...]string{"x-codex-window-id", "x-codex-installation-id"} {
+		for _, name := range [...]string{
+			"x-codex-window-id",
+			"x-codex-installation-id",
+			"x-codex-parent-thread-id",
+			"x-openai-subagent",
+			"session-id",
+			"thread-id",
+			"x-client-request-id",
+		} {
 			if value := c.Request.Header.Get(name); strings.TrimSpace(value) != "" {
 				headers.Set(name, value)
 			}
@@ -108,11 +124,40 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	// OAuth 账号：将 apiKeyID 混入 session 标识符，防止跨用户会话碰撞。
 	if account != nil && account.Type == AccountTypeOAuth {
 		apiKeyID := getAPIKeyIDFromContext(c)
-		if sessionResolution.SessionID != "" {
-			headers.Set("session_id", isolateOpenAISessionID(apiKeyID, sessionResolution.SessionID))
-		}
-		if sessionResolution.ConversationID != "" {
-			headers.Set("conversation_id", isolateOpenAISessionID(apiKeyID, sessionResolution.ConversationID))
+		if shouldPreserveCodexClientSessionIdentity(account) {
+			sessionID := canonicalSessionID
+			if sessionID == "" {
+				sessionID = sessionResolution.SessionID
+			}
+			if sessionID != "" {
+				headers.Set("session-id", sessionID)
+				headers.Set("session_id", sessionID)
+			}
+			threadID := canonicalThreadID
+			if threadID == "" {
+				threadID = sessionID
+			}
+			if threadID != "" {
+				headers.Set("thread-id", threadID)
+				headers.Set("thread_id", threadID)
+			}
+			if canonicalRequestID != "" {
+				headers.Set("x-client-request-id", canonicalRequestID)
+			}
+			conversationID := canonicalConversationID
+			if conversationID == "" {
+				conversationID = sessionResolution.ConversationID
+			}
+			if conversationID != "" {
+				headers.Set("conversation_id", conversationID)
+			}
+		} else {
+			if sessionResolution.SessionID != "" {
+				headers.Set("session_id", isolateOpenAISessionID(apiKeyID, sessionResolution.SessionID))
+			}
+			if sessionResolution.ConversationID != "" {
+				headers.Set("conversation_id", isolateOpenAISessionID(apiKeyID, sessionResolution.ConversationID))
+			}
 		}
 	} else {
 		if sessionResolution.SessionID != "" {
@@ -120,6 +165,40 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 		}
 		if sessionResolution.ConversationID != "" {
 			headers.Set("conversation_id", sessionResolution.ConversationID)
+		}
+	}
+	// Keep a usable root session even when the caller supplied only a body cache
+	// key and the session resolver had no header-level signal.
+	if strings.TrimSpace(headers.Get("session_id")) == "" {
+		fallbackSession := strings.TrimSpace(sessionResolution.SessionID)
+		if fallbackSession == "" {
+			fallbackSession = strings.TrimSpace(promptCacheKey)
+		}
+		if fallbackSession != "" {
+			if account != nil && account.Type == AccountTypeOAuth && !shouldPreserveCodexClientSessionIdentity(account) {
+				fallbackSession = isolateOpenAISessionID(getAPIKeyIDFromContext(c), fallbackSession)
+			}
+			headers.Set("session_id", fallbackSession)
+		}
+	}
+	if strings.TrimSpace(headers.Get("conversation_id")) == "" {
+		fallbackConversation := strings.TrimSpace(sessionResolution.ConversationID)
+		if fallbackConversation == "" && shouldPreserveCodexClientSessionIdentity(account) {
+			fallbackConversation = strings.TrimSpace(headers.Get("session_id"))
+		}
+		if fallbackConversation != "" {
+			headers.Set("conversation_id", fallbackConversation)
+		}
+	}
+	if shouldPreserveCodexClientSessionIdentity(account) {
+		if strings.TrimSpace(headers.Get("session-id")) == "" {
+			headers.Set("session-id", headers.Get("session_id"))
+		}
+		if strings.TrimSpace(headers.Get("thread-id")) == "" {
+			headers.Set("thread-id", headers.Get("session_id"))
+		}
+		if strings.TrimSpace(headers.Get("thread_id")) == "" {
+			headers.Set("thread_id", headers.Get("thread-id"))
 		}
 	}
 	if state := strings.TrimSpace(turnState); state != "" {
@@ -134,12 +213,18 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 			return nil, sessionResolution, fmt.Errorf("resolve chatgpt account headers: %w", err)
 		}
 		headers.Set("originator", resolveOpenAIUpstreamOriginator(c, isCodexCLI))
-		if c != nil {
-			if fpIDs, ok := c.Get(codexFingerprintIDsContextKey); ok {
-				if ids, ok := fpIDs.(*codexFingerprintIDs); ok {
-					applyCodexFingerprintHeaders(headers, ids)
-				}
-			}
+		if ids := stagedCodexFingerprintIDs(c, account); ids != nil {
+			applyCodexFingerprintHeaders(headers, ids)
+		}
+		if !shouldPreserveCodexClientSessionIdentity(account) {
+			normalizeOpenAIOAuthSessionHeadersForIsolation(
+				headers,
+				getAPIKeyIDFromContext(c),
+				canonicalSessionID,
+				canonicalThreadID,
+				canonicalRequestID,
+				canonicalConversationID,
+			)
 		}
 	}
 

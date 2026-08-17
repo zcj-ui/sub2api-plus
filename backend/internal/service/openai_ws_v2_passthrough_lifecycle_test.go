@@ -24,17 +24,19 @@ type stagedPassthroughFrame struct {
 }
 
 type stagedPassthroughConn struct {
-	frames    chan stagedPassthroughFrame
-	writes    chan []byte
-	closed    chan struct{}
-	closeOnce sync.Once
+	frames     chan stagedPassthroughFrame
+	writes     chan []byte
+	writeTypes chan coderws.MessageType
+	closed     chan struct{}
+	closeOnce  sync.Once
 }
 
 func newStagedPassthroughConn() *stagedPassthroughConn {
 	return &stagedPassthroughConn{
-		frames: make(chan stagedPassthroughFrame, 4),
-		writes: make(chan []byte, 4),
-		closed: make(chan struct{}),
+		frames:     make(chan stagedPassthroughFrame, 4),
+		writes:     make(chan []byte, 4),
+		writeTypes: make(chan coderws.MessageType, 4),
+		closed:     make(chan struct{}),
 	}
 }
 
@@ -65,7 +67,7 @@ func (c *stagedPassthroughConn) ReadFrame(ctx context.Context) (coderws.MessageT
 	}
 }
 
-func (c *stagedPassthroughConn) WriteFrame(ctx context.Context, _ coderws.MessageType, payload []byte) error {
+func (c *stagedPassthroughConn) WriteFrame(ctx context.Context, msgType coderws.MessageType, payload []byte) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -86,6 +88,10 @@ func (c *stagedPassthroughConn) WriteFrame(ctx context.Context, _ coderws.Messag
 		return ctx.Err()
 	case <-c.closed:
 		return errOpenAIWSConnClosed
+	}
+	select {
+	case c.writeTypes <- msgType:
+	default:
 	}
 	return nil
 }

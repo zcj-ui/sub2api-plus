@@ -167,7 +167,10 @@ func (s *defaultOpenAIWSStateStore) BindResponseAccount(ctx context.Context, gro
 		return nil
 	}
 	cacheKey := openAIWSResponseAccountCacheKey(id)
-	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	// A response can finish after the downstream request has been canceled. Keep
+	// the durable account binding write alive long enough to support continuation
+	// routing after reconnect, while retaining request values for tracing.
+	cacheCtx, cancel := withOpenAIWSStateStoreRedisWriteTimeout(ctx)
 	defer cancel()
 	return s.cache.SetSessionAccountID(cacheCtx, groupID, cacheKey, accountID, ttl)
 }
@@ -889,6 +892,15 @@ func openAIWSSessionTurnStateKey(groupID int64, sessionHash string) string {
 func withOpenAIWSStateStoreRedisTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, openAIWSStateStoreRedisTimeout)
+}
+
+func withOpenAIWSStateStoreRedisWriteTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
 	}
 	return context.WithTimeout(ctx, openAIWSStateStoreRedisTimeout)
 }

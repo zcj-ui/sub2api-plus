@@ -375,6 +375,9 @@ type CreateAccountInput struct {
 	ProbeEnabled       *bool
 	// SkipDefaultGroupBind prevents auto-binding to platform default group when GroupIDs is empty.
 	SkipDefaultGroupBind bool
+	// PreserveCodexFingerprintSeed is reserved for trusted backup/data restore
+	// flows. Ordinary creates and duplicates always receive a fresh seed.
+	PreserveCodexFingerprintSeed bool
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
 	// This should only be set when the caller has explicitly confirmed the risk.
 	SkipMixedChannelCheck bool

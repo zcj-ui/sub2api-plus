@@ -17,7 +17,6 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
-	"github.com/google/uuid"
 )
 
 // Account management implementations
@@ -380,6 +379,13 @@ func (s *adminServiceImpl) DuplicateAccount(ctx context.Context, id int64, actor
 	if err != nil {
 		return nil, fmt.Errorf("clone account extra configuration: %w", err)
 	}
+	// A duplicate is a new Codex installation. Never carry the source account's
+	// system-owned seed into the copied record; backup import is the separate
+	// path that intentionally preserves it.
+	if source.IsOpenAIOAuth() {
+		delete(extra, codexFingerprintSeedExtraKey)
+		delete(extra, "openai_device_id")
+	}
 	if operationID != "" {
 		if extra == nil {
 			extra = make(map[string]any, 1)
@@ -532,6 +538,23 @@ func normalizeOpenAILongContextBillingUpdateExtra(account *Account, input *Updat
 // Grok media eligibility helpers live in account_grok_media_eligibility.go.
 
 func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]any) (*Account, error) {
+	// CreateAccountInput is also used by the trusted data-restore path. Clone
+	// the map before stripping system-owned fields so a caller's export object is
+	// never mutated while deciding whether its seed may be preserved.
+	preservedSeed := ""
+	if input != nil && input.PreserveCodexFingerprintSeed && input.Platform == PlatformOpenAI && input.Type == AccountTypeOAuth {
+		candidate := extraStringValue(accountExtra, codexFingerprintSeedExtraKey)
+		if isCodexFingerprintSeed(candidate) {
+			preservedSeed = strings.TrimSpace(candidate)
+		}
+	}
+	if accountExtra != nil {
+		cloned := make(map[string]any, len(accountExtra))
+		for key, value := range accountExtra {
+			cloned[key] = value
+		}
+		accountExtra = cloned
+	}
 	// Probe/session state is system-managed. New accounts always start with automatic refresh disabled.
 	delete(accountExtra, UpstreamBillingProbeEnabledExtraKey)
 	delete(accountExtra, UpstreamBillingRateSyncEnabledExtraKey)
@@ -539,7 +562,26 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	delete(accountExtra, OllamaCloudUsageSessionExtraKey)
 	delete(accountExtra, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(accountExtra, OllamaCloudUsageSnapshotExtraKey)
-	accountExtra = ensureCodexFingerprintSeed(input.Platform, input.Type, accountExtra)
+	delete(accountExtra, codexFingerprintSeedExtraKey)
+	// Imports may carry records created before OAuth-only Codex identity state
+	// was scrubbed on a type transition.  An API-key/setup-token record has no
+	// valid use for this device/session identity, and retaining it would let a
+	// later switch back to OAuth silently revive stale state.
+	if input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth {
+		delete(accountExtra, codexFingerprintModeExtraKey)
+		delete(accountExtra, "openai_device_id")
+		delete(accountExtra, "openai_session_id")
+		delete(accountExtra, OpenAICodex429GuardEnabledExtraKey)
+	}
+	accountExtra = normalizeCodexFingerprintModeForStorage(accountExtra)
+	if preservedSeed != "" {
+		if accountExtra == nil {
+			accountExtra = make(map[string]any)
+		}
+		accountExtra[codexFingerprintSeedExtraKey] = preservedSeed
+	} else {
+		accountExtra = ensureCodexFingerprintSeed(input.Platform, input.Type, accountExtra)
+	}
 	account := &Account{
 		Name:        input.Name,
 		Notes:       normalizeAccountNotes(input.Notes),
@@ -595,6 +637,9 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 }
 
 func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccountInput) (*Account, error) {
+	if err := ValidateCodexFingerprintExtra(input.Platform, input.Type, input.Extra); err != nil {
+		return nil, infraerrors.BadRequest("OPENAI_FINGERPRINT_ACCOUNT_INVALID", err.Error())
+	}
 	if err := ValidateOpenAICodex429GuardExtra(input.Platform, input.Type, input.Extra); err != nil {
 		return nil, err
 	}
@@ -700,6 +745,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if input.Type != "" {
 			effectiveType = input.Type
 		}
+		if err := ValidateCodexFingerprintExtra(account.Platform, effectiveType, input.Extra); err != nil {
+			return nil, infraerrors.BadRequest("OPENAI_FINGERPRINT_ACCOUNT_INVALID", err.Error())
+		}
 		if err := ValidateOpenAICodex429GuardExtra(account.Platform, effectiveType, input.Extra); err != nil {
 			return nil, err
 		}
@@ -710,6 +758,17 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		normalizedExtra, err = normalizeGrokMediaEligibilityUpdateExtra(account, input, normalizedExtra)
 		if err != nil {
 			return nil, err
+		}
+		normalizedExtra = normalizeCodexFingerprintModeForStorage(normalizedExtra)
+		// codex_fingerprint_seed is system-owned. Editing an account must not
+		// rotate or accept a caller-supplied identity; backup restore is the only
+		// path that intentionally carries it into a new record.
+		delete(normalizedExtra, codexFingerprintSeedExtraKey)
+		if account.IsOpenAIOAuth() && account.getCodexFingerprintSeed() != "" {
+			if normalizedExtra == nil {
+				normalizedExtra = make(map[string]any)
+			}
+			normalizedExtra[codexFingerprintSeedExtraKey] = account.getCodexFingerprintSeed()
 		}
 	}
 	previousProbeIdentity := upstreamBillingProbeIdentity(account)
@@ -727,6 +786,20 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if input.Type != "" && input.Type != account.Type {
 			return nil, infraerrors.Newf(http.StatusBadRequest, "SPARK_SHADOW_IMMUTABLE_TYPE",
 				"spark shadow account type cannot be changed; it must remain an OpenAI OAuth shadow")
+		}
+		if normalizedExtra != nil {
+			if _, requested := normalizedExtra[codexFingerprintModeExtraKey]; requested {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_FINGERPRINT_SHADOW_INVALID",
+					"codex fingerprint mode must be configured on the OpenAI OAuth parent account",
+				)
+			}
+			if _, requested := normalizedExtra[OpenAICodex429GuardEnabledExtraKey]; requested {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_CODEX_429_GUARD_SHADOW_INVALID",
+					"Codex 429 guard must be configured on the OpenAI OAuth parent account",
+				)
+			}
 		}
 	} else if input.Type != "" && input.Type != account.Type && input.Type != AccountTypeOAuth {
 		// 母账号守卫(外审 D/P1):有 spark 影子的账号不能把 type 改出 OpenAI OAuth——影子读透母
@@ -889,7 +962,23 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	// 只在指针非 nil 时更新 Concurrency（支持设置为 0）
 	// Persist a stable seed for legacy OAuth rows the first time they are edited.
 	// This keeps convergence independent of the local auto-increment account ID.
-	account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
+	// These settings identify an OpenAI OAuth installation and have no meaning
+	// once the account changes type. Credential shadows must not retain them
+	// either: the parent owns the installation and a legacy shadow value could
+	// otherwise be selected by a stale scheduler snapshot. Retaining either
+	// case would let a later type switch or shadow update reactivate stale
+	// fingerprint or guard state.
+	if !account.IsOpenAIOAuth() || account.IsCredentialShadow() {
+		delete(account.Extra, codexFingerprintModeExtraKey)
+		delete(account.Extra, codexFingerprintSeedExtraKey)
+		delete(account.Extra, "openai_device_id")
+		delete(account.Extra, "openai_session_id")
+		delete(account.Extra, OpenAICodex429GuardEnabledExtraKey)
+	}
+	account.Extra = normalizeCodexFingerprintModeForStorage(account.Extra)
+	if !account.IsCredentialShadow() {
+		account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
+	}
 	if input.Concurrency != nil {
 		account.Concurrency = normalizeAccountConcurrency(account.Platform, account.Type, *input.Concurrency)
 	}
@@ -1030,6 +1119,24 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 // UpdateAccountExtra 仅对 Extra JSONB 做 key 级合并，避免覆盖其它运行态键
 // （如 model_rate_limits / passive_usage_* 等）。
 func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error {
+	updates = normalizeCodexFingerprintModeForStorage(updates)
+	if _, modeRequested := updates[codexFingerprintModeExtraKey]; modeRequested {
+		accountForValidation, validationErr := s.accountRepo.GetByID(ctx, id)
+		if validationErr != nil {
+			return validationErr
+		}
+		if accountForValidation == nil {
+			return ErrAccountNotFound
+		}
+		if err := ValidateCodexFingerprintExtra(accountForValidation.Platform, accountForValidation.Type, updates); err != nil {
+			return infraerrors.BadRequest("OPENAI_FINGERPRINT_ACCOUNT_INVALID", err.Error())
+		}
+		if accountForValidation.IsCredentialShadow() && updates[codexFingerprintModeExtraKey] != nil {
+			return infraerrors.BadRequest("OPENAI_FINGERPRINT_SHADOW_INVALID", "codex fingerprint mode must be configured on the OpenAI OAuth parent account")
+		}
+	}
+	// The seed is system-owned and cannot be rotated through an extra patch.
+	delete(updates, codexFingerprintSeedExtraKey)
 	delete(updates, UpstreamBillingProbeEnabledExtraKey)
 	delete(updates, UpstreamBillingRateSyncEnabledExtraKey)
 	delete(updates, UpstreamBillingProbeExtraKey)
@@ -1047,9 +1154,24 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 			if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, updates); err != nil {
 				return err
 			}
+			if account.IsCredentialShadow() {
+				return infraerrors.BadRequest(
+					"OPENAI_CODEX_429_GUARD_SHADOW_INVALID",
+					"Codex 429 guard must be configured on the OpenAI OAuth parent account",
+				)
+			}
 		}
-		if codexFingerprintModeEnabledExtra(updates) && account.IsOpenAIOAuth() && account.getCodexFingerprintSeed() == "" {
-			updates[codexFingerprintSeedExtraKey] = uuid.NewString()
+		if _, modeRequested := updates[codexFingerprintModeExtraKey]; modeRequested && account.IsCredentialShadow() {
+			return infraerrors.BadRequest(
+				"OPENAI_FINGERPRINT_SHADOW_INVALID",
+				"codex fingerprint mode must be configured on the OpenAI OAuth parent account",
+			)
+		}
+		if _, modeRequested := updates[codexFingerprintModeExtraKey]; modeRequested && !account.IsOpenAIOAuth() {
+			return infraerrors.BadRequest(
+				"OPENAI_FINGERPRINT_ACCOUNT_INVALID",
+				"codex_fingerprint_mode only applies to OpenAI OAuth accounts",
+			)
 		}
 		accountForInvalidation = account
 	}
@@ -1077,6 +1199,7 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 // BulkUpdateAccounts updates multiple accounts in one request.
 // It merges credentials/extra keys instead of overwriting the whole object.
 func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error) {
+	input.Extra = normalizeCodexFingerprintModeForStorage(input.Extra)
 	// Managed probe/session state may only enter through dedicated typed endpoints.
 	delete(input.Extra, UpstreamBillingProbeEnabledExtraKey)
 	delete(input.Extra, UpstreamBillingRateSyncEnabledExtraKey)
@@ -1114,6 +1237,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	needMixedChannelCheck := input.GroupIDs != nil && !input.SkipMixedChannelCheck
 	_, hasLongContextBillingUpdate := input.Extra[openAILongContextBillingEnabledKey]
 	extraWSSettingChanged := openAIExtraRequiresWSInvalidation(input.Extra)
+	_, hasCodexFingerprintModeChange := input.Extra[codexFingerprintModeExtraKey]
 	hasCodexFingerprintModeUpdate := codexFingerprintModeEnabledExtra(input.Extra)
 	overagesEnabled, hasOveragesUpdate := input.Extra["allow_overages"].(bool)
 	if _, present := input.Extra["allow_overages"]; present && !hasOveragesUpdate {
@@ -1125,7 +1249,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	// 预取所有目标账号，供凭据守卫/代理守卫/混合渠道检查共用，避免多次 DB 查询。
 	var cachedTargets []*Account
-	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || extraWSSettingChanged || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil {
+	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || extraWSSettingChanged || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil || hasCodexFingerprintModeChange {
 		loaded, err := s.accountRepo.GetByIDs(ctx, input.AccountIDs)
 		if err != nil {
 			return nil, err
@@ -1178,26 +1302,34 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 			if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, input.Extra); err != nil {
 				return nil, err
 			}
+			if account.IsCredentialShadow() {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_CODEX_429_GUARD_SHADOW_INVALID",
+					"Codex 429 guard must be configured on the OpenAI OAuth parent account",
+				)
+			}
 		}
 	}
-	if hasCodexFingerprintModeUpdate {
+	if hasCodexFingerprintModeChange {
 		for _, accountID := range input.AccountIDs {
 			account, ok := targetsByID[accountID]
 			if !ok || account == nil {
 				return nil, ErrAccountNotFound
 			}
-			if !account.IsOpenAIOAuth() {
+			if err := ValidateCodexFingerprintExtra(account.Platform, account.Type, input.Extra); err != nil {
+				return nil, infraerrors.BadRequest("OPENAI_FINGERPRINT_ACCOUNT_INVALID", err.Error())
+			}
+			if input.Extra[codexFingerprintModeExtraKey] != nil && !account.IsOpenAIOAuth() {
 				return nil, infraerrors.BadRequest(
 					"OPENAI_FINGERPRINT_ACCOUNT_INVALID",
 					"codex_fingerprint_mode only applies to OpenAI OAuth accounts",
 				)
 			}
-			if account.getCodexFingerprintSeed() == "" {
-				if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
-					codexFingerprintSeedExtraKey: uuid.NewString(),
-				}); err != nil {
-					return nil, err
-				}
+			if input.Extra[codexFingerprintModeExtraKey] != nil && account.IsCredentialShadow() {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_FINGERPRINT_SHADOW_INVALID",
+					"codex fingerprint mode must be configured on the OpenAI OAuth parent account",
+				)
 			}
 		}
 	}
@@ -1281,9 +1413,10 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	// Prepare bulk updates for columns and JSONB fields.
 	repoUpdates := AccountBulkUpdate{
-		Credentials:  input.Credentials,
-		Extra:        input.Extra,
-		ProbeEnabled: input.ProbeEnabled,
+		Credentials:                input.Credentials,
+		Extra:                      input.Extra,
+		ProbeEnabled:               input.ProbeEnabled,
+		EnsureCodexFingerprintSeed: hasCodexFingerprintModeUpdate,
 	}
 	if input.ProbeEnabled != nil {
 		if repoUpdates.Extra == nil {

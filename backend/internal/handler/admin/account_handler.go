@@ -207,6 +207,7 @@ type AccountLiteResponse struct {
 	Name               string `json:"name"`
 	Platform           string `json:"platform"`
 	Type               string `json:"type"`
+	ParentAccountID    *int64 `json:"parent_account_id,omitempty"`
 	AccountHealthProbe any    `json:"account_health_probe,omitempty"`
 }
 
@@ -554,10 +555,11 @@ func (h *AccountHandler) List(c *gin.Context) {
 		for index := range accounts {
 			account := &accounts[index]
 			result[index] = AccountLiteResponse{
-				ID:       account.ID,
-				Name:     account.Name,
-				Platform: account.Platform,
-				Type:     account.Type,
+				ID:              account.ID,
+				Name:            account.Name,
+				Platform:        account.Platform,
+				Type:            account.Type,
+				ParentAccountID: account.ParentAccountID,
 			}
 			if account.Extra != nil {
 				result[index].AccountHealthProbe = account.Extra[service.AccountHealthProbeExtraKey]

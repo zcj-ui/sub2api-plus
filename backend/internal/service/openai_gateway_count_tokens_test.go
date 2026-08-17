@@ -101,7 +101,7 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 			"refresh_token": "oauth-refresh-token",
 		},
 		Extra: map[string]any{
-			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+			codexFingerprintModeExtraKey: string(codexFingerprintDevice),
 			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
 		},
 		Status:      StatusActive,
@@ -169,9 +169,9 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 			require.Equal(t, "Bearer oauth-token", upstream.lastReq.Header.Get("authorization"))
 			require.Empty(t, upstream.lastReq.Header.Get("Chatgpt-Account-Id"))
 			require.NotEmpty(t, upstream.lastReq.Header.Get("x-codex-installation-id"))
-			require.NotEmpty(t, upstream.lastReq.Header.Get("session_id"))
-			require.Equal(t, upstream.lastReq.Header.Get("session_id"), upstream.lastReq.Header.Get("conversation_id"))
-			require.NotEmpty(t, upstream.lastReq.Header.Get("x-client-request-id"))
+			require.Empty(t, upstream.lastReq.Header.Get("session_id"), "device-only convergence does not invent a session")
+			require.Empty(t, upstream.lastReq.Header.Get("conversation_id"), "device-only convergence does not invent a conversation")
+			require.Empty(t, upstream.lastReq.Header.Get("x-client-request-id"), "device-only convergence does not invent a request id")
 			require.Equal(t, openai.CodexDefaultOriginator, upstream.lastReq.Header.Get("originator"))
 			require.Zero(t, repo.tempUnschedCalls, "OAuth input_tokens unsupported errors must not temp-unschedule the account")
 			require.Zero(t, repo.setErrorCalls, "OAuth input_tokens unsupported errors must not mark the account error")

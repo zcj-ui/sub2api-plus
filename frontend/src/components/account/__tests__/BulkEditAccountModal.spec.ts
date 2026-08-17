@@ -313,6 +313,23 @@ describe('BulkEditAccountModal', () => {
     expect(wrapper.find('#bulk-edit-codex-429-guard-enabled').exists()).toBe(false)
   })
 
+  it('hides parent-only Codex controls when the bulk target contains a Spark shadow', () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth'],
+      target: {
+        mode: 'selected',
+        selectedPlatforms: ['openai'],
+        selectedTypes: ['oauth'],
+        hasCredentialShadows: true
+      }
+    })
+
+    expect(wrapper.find('#bulk-edit-openai-flatten-namespaces-enabled').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="bulk-codex-fingerprint-mode-select"]').exists()).toBe(false)
+    expect(wrapper.find('#bulk-edit-codex-429-guard-enabled').exists()).toBe(false)
+  })
+
   it('Antigravity 批量开启超额时强制确认并提交确认凭据', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     const wrapper = mountModal({

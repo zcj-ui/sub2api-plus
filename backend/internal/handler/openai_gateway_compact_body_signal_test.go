@@ -30,11 +30,7 @@ func TestNormalizeOpenAIResponsesCompactRequest_RemoteV2StaysOnResponses(t *test
 		betaHeader string
 		userAgent  string
 	}{
-		{name: "headerless"},
-		{name: "unrelated_header", betaHeader: "responses_websockets_v2"},
-		{name: "wrong_case_header", betaHeader: "REMOTE_COMPACTION_V2"},
 		{name: "declared_header", betaHeader: "remote_compaction_v2"},
-		{name: "codex_cli_user_agent", userAgent: "codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color"},
 		{name: "codex_desktop_user_agent", userAgent: "Codex Desktop/0.139.0 (Mac OS X 14; arm64) unknown"},
 	}
 
@@ -100,6 +96,7 @@ func TestNormalizeOpenAIResponsesCompactRequest_RemoteV2PathAliasesStayOnRespons
 	} {
 		t.Run(path, func(t *testing.T) {
 			c := newCompactBodySignalTestContext(t, path, body)
+			c.Request.Header.Set("User-Agent", "Codex Desktop/0.147.0")
 
 			normalized, ok := h.normalizeOpenAIResponsesCompactRequest(c, zap.NewNop(), body)
 			require.True(t, ok)
@@ -214,6 +211,7 @@ func TestOpenAIResponsesCompactionRoutingFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newCompactBodySignalTestContext(t, tt.path, tt.body)
+			c.Request.Header.Set("User-Agent", "Codex Desktop/0.147.0")
 			legacyBefore := service.IsOpenAIResponsesCompactPath(c)
 			nativeBefore := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(tt.body)
 			require.Equal(t, tt.wantLegacyBefore, legacyBefore)
@@ -254,29 +252,33 @@ func TestNormalizeOpenAIResponsesCompactRequest_CodexDirectAliasPromoted(t *test
 	require.Equal(t, "/backend-api/codex/responses/compact", c.Request.URL.Path)
 }
 
-func TestNormalizeOpenAIResponsesCompactRequest_NativeV2DoesNotDependOnBetaHeader(t *testing.T) {
+func TestNormalizeOpenAIResponsesCompactRequest_NativeV2RequiresHeaderOrModernDesktop(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	tests := []struct {
 		name       string
 		body       []byte
 		betaHeader string
+		userAgent  string
 		wantNative bool
 	}{
 		{
-			name:       "no_header",
-			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
-			wantNative: true,
+			name: "no_header",
+			body: []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 		},
 		{
 			name:       "unrelated_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "responses_websockets_v2",
-			wantNative: true,
 		},
 		{
 			name:       "wrong_case_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "REMOTE_COMPACTION_V2",
+		},
+		{
+			name:       "headerless_modern_desktop",
+			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
+			userAgent:  "Codex Desktop/0.147.0-alpha.6.5 (Mac OS X 14; arm64)",
 			wantNative: true,
 		},
 		{
@@ -305,6 +307,9 @@ func TestNormalizeOpenAIResponsesCompactRequest_NativeV2DoesNotDependOnBetaHeade
 			if tt.betaHeader != "" {
 				c.Request.Header.Set("x-codex-beta-features", tt.betaHeader)
 			}
+			if tt.userAgent != "" {
+				c.Request.Header.Set("User-Agent", tt.userAgent)
+			}
 
 			normalized, ok := h.normalizeOpenAIResponsesCompactRequest(c, zap.NewNop(), tt.body)
 			require.True(t, ok)
@@ -318,7 +323,7 @@ func TestNormalizeOpenAIResponsesCompactRequest_NativeV2DoesNotDependOnBetaHeade
 				require.Equal(t, "/v1/responses/compact", c.Request.URL.Path)
 				require.False(t, gjson.GetBytes(normalized, "stream").Exists())
 				_, marked := c.Get(service.OpenAICompactClientStreamKeyForTest())
-				require.False(t, marked)
+				require.Equal(t, gjson.GetBytes(tt.body, "stream").Bool(), marked)
 			}
 		})
 	}

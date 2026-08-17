@@ -558,7 +558,7 @@ func normalizeGrokResponsesReasoningEffort(body []byte, upstreamModel string) ([
 		if !value.Exists() {
 			continue
 		}
-		normalized, keep := normalizeGrokReasoningEffortValue(value.String())
+		normalized, keep := normalizeGrokReasoningEffortValueForModel(value.String(), upstreamModel)
 		if !supportsEffort || !keep {
 			out, err = sjson.DeleteBytes(out, field)
 		} else {
@@ -569,7 +569,7 @@ func normalizeGrokResponsesReasoningEffort(body []byte, upstreamModel string) ([
 		}
 	}
 	if camel := gjson.GetBytes(out, "reasoningEffort"); camel.Exists() {
-		normalized, keep := normalizeGrokReasoningEffortValue(camel.String())
+		normalized, keep := normalizeGrokReasoningEffortValueForModel(camel.String(), upstreamModel)
 		out, err = sjson.DeleteBytes(out, "reasoningEffort")
 		if err != nil {
 			return nil, fmt.Errorf("remove Grok reasoningEffort: %w", err)
@@ -595,7 +595,7 @@ func normalizeGrokChatReasoningEffort(body []byte, upstreamModel string) ([]byte
 	if raw == "" {
 		raw = strings.TrimSpace(gjson.GetBytes(body, "reasoningEffort").String())
 	}
-	normalized, keep := normalizeGrokReasoningEffortValue(raw)
+	normalized, keep := normalizeGrokReasoningEffortValueForModel(raw, upstreamModel)
 	keep = keep && grokSupportsReasoningEffort(upstreamModel)
 	out := body
 	var err error
@@ -626,6 +626,24 @@ func normalizeGrokReasoningEffortValue(raw string) (string, bool) {
 		return "high", true
 	default:
 		return "", false
+	}
+}
+
+func normalizeGrokReasoningEffortValueForModel(raw, model string) (string, bool) {
+	value := strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(raw)))
+	if value == "xhigh" && grokSupportsXHighReasoningEffort(model) {
+		return "xhigh", true
+	}
+	return normalizeGrokReasoningEffortValue(raw)
+}
+
+func grokSupportsXHighReasoningEffort(model string) bool {
+	model = strings.ToLower(xai.StripGrokProviderPrefix(strings.TrimSpace(model)))
+	switch model {
+	case "grok-4.6", "grok-4.6-latest", "grok-4.6-build":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -772,32 +790,41 @@ func grokResponsesToolDedupKey(tool gjson.Result) string {
 	return "json:" + normalizeCompatSeedJSON(json.RawMessage(tool.Raw))
 }
 
-// sanitizeGrokReasoningNullContent 删除 reasoning 项中的 "content": null。
-// xAI 的 untagged enum 反序列化器拒收该字段，返回 422。
+// sanitizeGrokReasoningNullContent removes explicit JSON null fields from
+// Responses input items. xAI's untagged input enum rejects these fields with
+// 422; the issue affects more than reasoning.content (for example status and
+// encrypted_content on tool and message items).
 func sanitizeGrokReasoningNullContent(body []byte) ([]byte, error) {
+	return stripExplicitNullsFromGrokResponsesInput(body)
+}
+
+func stripExplicitNullsFromGrokResponsesInput(body []byte) ([]byte, error) {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
 		return body, nil
 	}
 
 	items := input.Array()
-	changed := false
-	for i := len(items) - 1; i >= 0; i-- {
+	var paths []string
+	for i := range items {
 		item := items[i]
-		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+		if !item.IsObject() {
 			continue
 		}
-		contentResult := item.Get("content")
-		if contentResult.Exists() && contentResult.Type == gjson.Null {
-			var err error
-			body, err = sjson.DeleteBytes(body, fmt.Sprintf("input.%d.content", i))
-			if err != nil {
-				return nil, err
+		item.ForEach(func(key, value gjson.Result) bool {
+			if value.Type == gjson.Null {
+				paths = append(paths, fmt.Sprintf("input.%d.%s", i, key.String()))
 			}
-			changed = true
-		}
+			return true
+		})
 	}
-	_ = changed
+	for _, path := range paths {
+		next, err := sjson.DeleteBytes(body, path)
+		if err != nil {
+			return nil, err
+		}
+		body = next
+	}
 	return body, nil
 }
 

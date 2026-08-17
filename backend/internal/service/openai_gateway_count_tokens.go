@@ -271,6 +271,25 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 			targetURL = buildOpenAIResponsesInputTokensURL(validatedURL)
 		}
 	}
+	var fingerprintIDs *codexFingerprintIDs
+	if account.IsOpenAIOAuth() {
+		var clientHeaders http.Header
+		if c != nil && c.Request != nil {
+			clientHeaders = c.Request.Header
+		}
+		if !codexFingerprintProjectionMalformed(clientHeaders, body) {
+			fingerprintIDs = resolveCodexFingerprintIDsForRequest(
+				account,
+				clientHeaders,
+				body,
+				getAPIKeyIDFromContext(c),
+				codexFingerprintDeploymentSeed(s.cfg),
+			)
+			if next, changed := applyCodexFingerprintToBodyBytes(body, fingerprintIDs); changed {
+				body = next
+			}
+		}
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -301,12 +320,8 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 		}
 	}
 	if account.IsOpenAIOAuth() {
-		var clientHeaders http.Header
-		if c != nil && c.Request != nil {
-			clientHeaders = c.Request.Header
-		}
-		ids := resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c), codexFingerprintDeploymentSeed(s.cfg))
-		applyCodexFingerprintHeaders(req.Header, ids)
+		applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
+		applyCodexFingerprintCountTokensHeaders(req.Header, fingerprintIDs)
 		identity := resolveCodexOutboundIdentity(s.codexIdentityOverrideUA(account))
 		req.Header.Set("user-agent", identity.userAgent)
 		req.Header.Set("originator", identity.originator)

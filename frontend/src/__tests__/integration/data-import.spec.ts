@@ -135,14 +135,15 @@ describe('ImportDataModal', () => {
     await wrapper.find('form').trigger('submit')
     await flushPromises()
 
-    expect(adminAPI.accounts.importData).toHaveBeenCalledWith({
+    const importPayload = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]
+    expect(importPayload).toMatchObject({
       data: expect.objectContaining({
         accounts: [makeAccount('a')]
       }),
       skip_default_group_bind: true,
-      codex_429_guard_enabled: false,
       confirm_overages_risk: false
     })
+    expect(importPayload).not.toHaveProperty('codex_429_guard_enabled')
   })
 
   it('merges multiple selected JSON files before importing', async () => {
@@ -176,19 +177,20 @@ describe('ImportDataModal', () => {
     await wrapper.find('form').trigger('submit')
     await flushPromises()
 
-    expect(adminAPI.accounts.importData).toHaveBeenCalledWith({
+    const importPayload = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]
+    expect(importPayload).toMatchObject({
       data: expect.objectContaining({
         proxies: [{ proxy_key: 'p' }],
         accounts: [makeAccount('a'), makeAccount('b')]
       }),
       skip_default_group_bind: true,
-      codex_429_guard_enabled: false,
       confirm_overages_risk: false
     })
+    expect(importPayload).not.toHaveProperty('codex_429_guard_enabled')
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.dataImportSuccess')
   })
 
-  it('奸商模式默认关闭时把 false 传给导入接口', async () => {
+  it('preserves the backup 429 setting unless an explicit import override is selected', async () => {
     const { adminAPI } = await import('@/api/admin')
     vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
       proxy_created: 0,
@@ -206,9 +208,51 @@ describe('ImportDataModal', () => {
     await wrapper.find('form').trigger('submit')
     await flushPromises()
 
+    const importPayload = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]
+    expect(importPayload).not.toHaveProperty('codex_429_guard_enabled')
+  })
+
+  it('sends an explicit 429 override after the import switch is changed', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
+      proxy_created: 0,
+      proxy_reused: 0,
+      proxy_failed: 0,
+      account_created: 1,
+      account_failed: 0
+    })
+    const wrapper = mountModal()
+    const input = wrapper.find('input[type="file"]')
+    setInputFiles(input.element, [
+      makeJsonFile('codex.json', JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [makeAccount('codex')] }))
+    ])
+    await input.trigger('change')
+    await wrapper.get('[data-test="codex-429-guard-toggle"]').trigger('click')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
     expect(adminAPI.accounts.importData).toHaveBeenCalledWith(expect.objectContaining({
-      codex_429_guard_enabled: false
+      codex_429_guard_enabled: true
     }))
+  })
+
+  it('rejects invalid Codex 429 guard data before creating a partial import', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    const wrapper = mountModal()
+    const input = wrapper.find('input[type="file"]')
+    const invalidAccount = {
+      ...makeAccount('invalid-guard'),
+      extra: { openai_codex_429_guard_enabled: 'true' }
+    }
+    setInputFiles(input.element, [
+      makeJsonFile('invalid-guard.json', JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [invalidAccount] }))
+    ])
+    await input.trigger('change')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    expect(showError).toHaveBeenCalledWith('admin.accounts.dataImportInvalidFile')
+    expect(adminAPI.accounts.importData).not.toHaveBeenCalled()
   })
 
   it('部分成功时关闭弹窗仍通知父组件刷新', async () => {

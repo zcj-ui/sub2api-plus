@@ -2963,7 +2963,7 @@ func TestNormalizeOpenAICompactRequestBodyPreservesCurrentCodexPayloadFields(t *
 	require.Equal(t, "resp_123", gjson.GetBytes(normalized, "previous_response_id").String())
 	require.False(t, gjson.GetBytes(normalized, "store").Exists())
 	require.False(t, gjson.GetBytes(normalized, "stream").Exists())
-	require.False(t, gjson.GetBytes(normalized, "prompt_cache_key").Exists())
+	require.Equal(t, "cache_123", gjson.GetBytes(normalized, "prompt_cache_key").String())
 }
 
 func TestOpenAIBuildUpstreamRequestOpenAIPassthroughPreservesCompactPath(t *testing.T) {
@@ -3079,6 +3079,8 @@ func TestOpenAIBuildUpstreamRequestPreservesCodexIdentityHeaders(t *testing.T) {
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.144.1")
 	c.Request.Header.Set("X-Codex-Window-ID", "window-http")
 	c.Request.Header.Set("X-Codex-Installation-ID", "installation-http")
+	c.Request.Header.Set("X-Codex-Parent-Thread-ID", "parent-http")
+	c.Request.Header.Set("X-OpenAI-Subagent", "collab_spawn")
 	c.Request.Header.Set("X-Test", "blocked")
 
 	body := []byte(`{"model":"gpt-5","input":"hello"}`)
@@ -3093,6 +3095,8 @@ func TestOpenAIBuildUpstreamRequestPreservesCodexIdentityHeaders(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "window-http", req.Header.Get("X-Codex-Window-ID"))
 	require.Equal(t, "installation-http", req.Header.Get("X-Codex-Installation-ID"))
+	require.Equal(t, "parent-http", req.Header.Get("X-Codex-Parent-Thread-ID"))
+	require.Equal(t, "collab_spawn", req.Header.Get("X-OpenAI-Subagent"))
 	require.Empty(t, req.Header.Get("X-Test"))
 	require.True(t, openai.EvaluateEngineFingerprint(req.Header, body, openai.DefaultEngineFingerprintSignals))
 }

@@ -296,7 +296,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 		},
 		// 收敛是显式 opt-in（#5610），这里显式开启以验证探测身份与真实流量同构。
 		Extra: map[string]any{
-			codexFingerprintModeExtraKey: "session",
+			codexFingerprintModeExtraKey: "device",
 			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
 		},
 	})
@@ -317,16 +317,14 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 
 	require.NoError(t, svc.TestAccountConnection(c, account.ID, "gpt-5.4", "", AccountTestModeCompact))
 
-	// Explicit session convergence keeps one stable conversation identity for
-	// the account's stable compact-probe session, without collapsing all turns
-	// on the account into the full-convergence identity.
-	converged := resolveCodexConversationSessionID(&account, compactProbeSessionID(account.ID))
-	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
-	// 显式 session 收敛模式：出站身份 = 账号级收敛值
-	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
-	require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
-	require.Equal(t, resolveConvergedInstallationID(&account), upstream.lastReq.Header.Get("x-codex-installation-id"),
-		"真实 Codex 每个请求必带 installation-id，探测不得缺失")
+	// Compact keeps the probe's real UUIDv7 root session; device convergence
+	// changes only the persisted installation identity.
+	require.NotEmpty(t, upstream.lastReq.Header.Get("session-id"))
+	require.Equal(t, upstream.lastReq.Header.Get("session-id"), upstream.lastReq.Header.Get("session_id"))
+	require.Empty(t, upstream.lastReq.Header.Get("x-codex-installation-id"),
+		"native remote compaction v2 uses body client_metadata, not the compact-only direct header")
+	require.Equal(t, resolveConvergedInstallationID(&account),
+		gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
 	require.NotContains(t, upstream.lastReq.Header.Get("session-id"), "probe_compact",
 		"探测标识不得是可被上游一眼识别的字面量")
 	<-updateCalls
@@ -338,6 +336,10 @@ func TestCompactProbeSessionID_IsUUIDShaped(t *testing.T) {
 		_, err := uuid.Parse(got)
 		require.NoError(t, err, "探测会话标识必须是 UUID 形态: %s", got)
 	}
-	require.Equal(t, compactProbeSessionID(7), compactProbeSessionID(7), "同账号应稳定复用同一会话")
-	require.NotEqual(t, compactProbeSessionID(7), compactProbeSessionID(8))
+	first := compactProbeSessionID(7)
+	second := compactProbeSessionID(7)
+	parsed, err := uuid.Parse(first)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Version(7), parsed.Version())
+	require.NotEqual(t, first, second, "每次探测应创建独立的 UUIDv7 根回合")
 }

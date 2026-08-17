@@ -491,6 +491,13 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		enrichCredentialsFromIDToken(&item)
+		// The guard is meaningful only for a normal OpenAI OAuth account. Exported
+		// bundles from older/custom builds can carry arbitrary extra keys; do not
+		// let that stale setting make an unrelated account fail creation or alter
+		// a Claude/API-key import.
+		if item.Platform != service.PlatformOpenAI || item.Type != service.AccountTypeOAuth {
+			delete(item.Extra, service.OpenAICodex429GuardEnabledExtraKey)
+		}
 		if req.Codex429GuardEnabled != nil && item.Platform == service.PlatformOpenAI && item.Type == service.AccountTypeOAuth {
 			if item.Extra == nil {
 				item.Extra = make(map[string]any)
@@ -499,21 +506,22 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		accountInput := &service.CreateAccountInput{
-			Name:                 item.Name,
-			Notes:                item.Notes,
-			Platform:             item.Platform,
-			Type:                 item.Type,
-			Credentials:          item.Credentials,
-			Extra:                item.Extra,
-			ProxyID:              proxyID,
-			Concurrency:          item.Concurrency,
-			Priority:             item.Priority,
-			RateMultiplier:       item.RateMultiplier,
-			GroupIDs:             nil,
-			ExpiresAt:            item.ExpiresAt,
-			AutoPauseOnExpired:   item.AutoPauseOnExpired,
-			SkipDefaultGroupBind: skipDefaultGroupBind,
-			ConfirmOveragesRisk:  req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
+			Name:                         item.Name,
+			Notes:                        item.Notes,
+			Platform:                     item.Platform,
+			Type:                         item.Type,
+			Credentials:                  item.Credentials,
+			Extra:                        item.Extra,
+			ProxyID:                      proxyID,
+			Concurrency:                  item.Concurrency,
+			Priority:                     item.Priority,
+			RateMultiplier:               item.RateMultiplier,
+			GroupIDs:                     nil,
+			ExpiresAt:                    item.ExpiresAt,
+			AutoPauseOnExpired:           item.AutoPauseOnExpired,
+			PreserveCodexFingerprintSeed: true,
+			SkipDefaultGroupBind:         skipDefaultGroupBind,
+			ConfirmOveragesRisk:          req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
 		}
 
 		created, err := h.adminService.CreateAccount(ctx, accountInput)
@@ -809,6 +817,9 @@ func validateDataAccount(item DataAccount) error {
 		if enabled && item.Platform != service.PlatformAntigravity {
 			return errors.New("allow_overages is only supported for Antigravity accounts")
 		}
+	}
+	if err := service.ValidateCodexFingerprintExtra(item.Platform, item.Type, item.Extra); err != nil {
+		return err
 	}
 	if item.RateMultiplier != nil && *item.RateMultiplier < 0 {
 		return errors.New("rate_multiplier must be >= 0")

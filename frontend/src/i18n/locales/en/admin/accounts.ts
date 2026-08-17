@@ -643,11 +643,11 @@ export default {
         codexCLIOnlyAppServerDesc:
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
-        codexFingerprintModeDesc: 'Off by default and passes client identifiers through unchanged. Explicit modes can stabilize the account device and converge session identifiers; some accounts reported quota shrinkage or risk controls after enabling convergence, so enable it only after measurement.',
+        codexFingerprintModeDesc: 'Off by default and passes client identifiers through unchanged. “Device only” stabilizes the device fingerprint for OpenAI/Codex OAuth accounts while session and thread IDs retain the official Codex CLI per-session lifecycle. Legacy session/full values are accepted only for compatibility and are migrated to “Device only” when read.',
         codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
-        codexFingerprintSession: 'One device + session per conversation',
-        codexFingerprintFull: 'Full convergence (one account session)',
+        codexFingerprintSession: 'Legacy: session convergence (migrated)',
+        codexFingerprintFull: 'Legacy: full convergence (migrated)',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',

@@ -92,16 +92,23 @@ func extractProtocolSegments(protocol string, document any) []promptSegment {
 		return extractGeminiRoot(root)
 	case "openai_responses", "responses", "responses_websocket":
 		if frameType := stringValue(root["type"]); frameType != "" || protocol == "responses_websocket" {
-			if frameType != "response.create" {
+			switch frameType {
+			case "response.create":
+				if input, exists := root["input"]; exists && input != nil {
+					return append(extractInstructions(root["instructions"]), extractResponses(input)...)
+				}
+				if response, ok := root["response"].(map[string]any); ok {
+					return append(extractInstructions(response["instructions"]), extractResponses(response["input"])...)
+				}
+				return extractInstructions(root["instructions"])
+			case "conversation.item.create":
+				// Responses WebSocket clients may stage a user/tool item before a
+				// later response.create with no inline input. The item is client
+				// controlled and must be audited before the relay forwards it.
+				return extractResponses(root["item"])
+			default:
 				return nil
 			}
-			if input, exists := root["input"]; exists && input != nil {
-				return append(extractInstructions(root["instructions"]), extractResponses(input)...)
-			}
-			if response, ok := root["response"].(map[string]any); ok {
-				return append(extractInstructions(response["instructions"]), extractResponses(response["input"])...)
-			}
-			return extractInstructions(root["instructions"])
 		}
 		return append(extractInstructions(root["instructions"]), extractResponses(root["input"])...)
 	case "openai_images", "grok_media", "media", "images":
@@ -155,6 +162,18 @@ func extractMessages(value any, wantedRoles ...string) []promptSegment {
 		for _, text := range texts {
 			result = append(result, promptSegment{text: text, user: role == "user", role: role})
 		}
+		if calls, ok := message["tool_calls"].([]any); ok {
+			for _, call := range calls {
+				for _, text := range toolInteractionTexts(call) {
+					result = append(result, promptSegment{text: text, role: "tool"})
+				}
+			}
+		}
+		if call, ok := message["function_call"].(map[string]any); ok {
+			for _, text := range toolInteractionTexts(call) {
+				result = append(result, promptSegment{text: text, role: "tool"})
+			}
+		}
 	}
 	return result
 }
@@ -198,6 +217,12 @@ func extractResponses(value any) []promptSegment {
 			case string:
 				result = append(result, promptSegment{text: entry, user: true, role: "user"})
 			case map[string]any:
+				if texts := toolInteractionTexts(entry); len(texts) > 0 {
+					for _, text := range texts {
+						result = append(result, promptSegment{text: text, role: "tool"})
+					}
+					continue
+				}
 				role := strings.ToLower(stringValue(entry["role"]))
 				if role != "" && !isClientInstructionRole(role) {
 					continue
@@ -216,6 +241,9 @@ func extractResponses(value any) []promptSegment {
 		role := strings.ToLower(stringValue(typed["role"]))
 		if role != "" && !isClientInstructionRole(role) {
 			return nil
+		}
+		if texts := toolInteractionTexts(typed); len(texts) > 0 {
+			return promptSegmentsForRole(texts, "tool")
 		}
 		return promptSegmentsForRole(contentTexts(typed["content"]), role)
 	default:
@@ -257,6 +285,9 @@ func extractGemini(value any) []promptSegment {
 			if object, ok := part.(map[string]any); ok {
 				if text := stringValue(object["text"]); text != "" {
 					result = append(result, promptSegment{text: text, user: role == "" || role == "user", role: role})
+				}
+				for _, text := range toolInteractionTexts(object) {
+					result = append(result, promptSegment{text: text, role: "tool"})
 				}
 			}
 		}
@@ -419,10 +450,13 @@ func contentTexts(value any) []string {
 				continue
 			}
 			typeName := strings.ToLower(stringValue(object["type"]))
-			if typeName != "" && typeName != "text" && typeName != "input_text" && typeName != "output_text" {
+			if typeName == "" || typeName == "text" || typeName == "input_text" || typeName == "output_text" {
+				if text := stringValue(object["text"]); text != "" {
+					result = append(result, text)
+				}
 				continue
 			}
-			if text := stringValue(object["text"]); text != "" {
+			for _, text := range toolInteractionTexts(object) {
 				result = append(result, text)
 			}
 		}
@@ -431,8 +465,72 @@ func contentTexts(value any) []string {
 		if text := stringValue(typed["text"]); text != "" {
 			return []string{text}
 		}
+		return toolInteractionTexts(typed)
 	}
 	return nil
+}
+
+// toolInteractionTexts extracts client-controlled tool arguments/results
+// without treating arbitrary JSON fields as prompt text. Structured values are
+// serialized deterministically so nested instructions remain auditable.
+func toolInteractionTexts(value any) []string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	typeName := strings.ToLower(stringValue(object["type"]))
+	normalizedType := strings.NewReplacer("_", "", "-", "").Replace(typeName)
+	if normalizedType == "" || normalizedType == "function" {
+		if function, ok := object["function"].(map[string]any); ok {
+			object = function
+			typeName = "function_call"
+			normalizedType = "functioncall"
+		} else if function, ok := object["functionCall"].(map[string]any); ok {
+			object = function
+			typeName = "function_call"
+			normalizedType = "functioncall"
+		} else if response, ok := object["functionResponse"].(map[string]any); ok {
+			object = response
+			typeName = "function_response"
+			normalizedType = "functionresponse"
+		}
+	}
+	fields := make(map[string]any)
+	switch normalizedType {
+	case "tooluse":
+		copyToolField(fields, object, "name")
+		copyToolField(fields, object, "input")
+	case "toolresult":
+		copyToolField(fields, object, "tool_use_id")
+		copyToolField(fields, object, "content")
+		copyToolField(fields, object, "output")
+	case "functioncall", "customtoolcall":
+		copyToolField(fields, object, "name")
+		copyToolField(fields, object, "arguments")
+		copyToolField(fields, object, "args")
+	case "functioncalloutput", "customtoolcalloutput":
+		copyToolField(fields, object, "call_id")
+		copyToolField(fields, object, "output")
+	case "functionresponse":
+		copyToolField(fields, object, "name")
+		copyToolField(fields, object, "response")
+	default:
+		return nil
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return nil
+	}
+	return []string{typeName + ": " + string(encoded)}
+}
+
+func copyToolField(dst, src map[string]any, key string) {
+	if value, ok := src[key]; ok && value != nil {
+		dst[key] = value
+	}
 }
 
 func normalizeSegmentsLatestUserFirst(values []promptSegment) []string {
@@ -481,6 +579,17 @@ func blockingSegmentsLatestUserAndPreviousOutput(values []promptSegment) []strin
 	// priority segment so every part of the latest input is scanned before the
 	// prior output begins.
 	selected := []promptSegment{{text: strings.Join(currentUserText, "\n\n"), user: true, role: "user"}}
+	// Tool calls/results emitted after the latest user message belong to the
+	// same turn even when an assistant/tool exchange separates them. Keep those
+	// segments in the blocking scan instead of letting tool-only content bypass it.
+	for index := latestUserEnd; index < len(normalized); index++ {
+		if isUserSegment(normalized[index]) {
+			break
+		}
+		if isToolInteractionSegment(normalized[index]) {
+			selected = append(selected, normalized[index])
+		}
+	}
 	for index := latestUserStart - 1; index >= 0; index-- {
 		if !isAssistantOutputSegment(normalized[index]) {
 			continue
@@ -526,6 +635,15 @@ func isUserSegment(segment promptSegment) bool {
 
 func isAssistantOutputSegment(segment promptSegment) bool {
 	return segment.role == "assistant" || segment.role == "model"
+}
+
+func isToolInteractionSegment(segment promptSegment) bool {
+	switch strings.ToLower(strings.TrimSpace(segment.role)) {
+	case "tool", "tool_use", "tool_result", "function_call", "function_call_output":
+		return true
+	default:
+		return false
+	}
 }
 
 func promptSegmentTexts(values []promptSegment) []string {

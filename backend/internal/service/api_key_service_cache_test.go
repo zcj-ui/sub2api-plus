@@ -318,6 +318,48 @@ func TestAPIKeyService_SnapshotRoundTrip_PreservesReasoningEffortPolicy(t *testi
 	require.Equal(t, apiKey.Group.ReasoningEffortMappings, roundTrip.Group.ReasoningEffortMappings)
 }
 
+func TestAPIKeyService_SnapshotRoundTrip_PreservesOpenAIBillingPolicy(t *testing.T) {
+	svc := NewAPIKeyService(nil, nil, nil, nil, nil, nil, &config.Config{})
+	groupID := int64(12)
+	inputPrice := 0.000001
+	outputPrice := 0.000002
+	apiKey := &APIKey{
+		ID:      2,
+		UserID:  3,
+		GroupID: &groupID,
+		Key:     "k-openai-billing-policy",
+		Status:  StatusActive,
+		User:    &User{ID: 3, Status: StatusActive, Role: RoleUser, Balance: 10, Concurrency: 2},
+		Group: &Group{
+			ID:                        groupID,
+			Name:                      "openai",
+			Platform:                  PlatformOpenAI,
+			Status:                    StatusActive,
+			SubscriptionType:          SubscriptionTypeStandard,
+			RateMultiplier:            1,
+			LongContextPricingEnabled: true,
+			ModelPricing: []ChannelModelPricing{{
+				Platform:    PlatformOpenAI,
+				Models:      []string{"gpt-5.4"},
+				BillingMode: BillingModeToken,
+				InputPrice:  &inputPrice,
+				OutputPrice: &outputPrice,
+			}},
+		},
+	}
+
+	snapshot := svc.snapshotFromAPIKey(context.Background(), apiKey)
+	roundTrip := svc.snapshotToAPIKey(apiKey.Key, snapshot)
+
+	require.NotNil(t, roundTrip)
+	require.NotNil(t, roundTrip.Group)
+	require.True(t, roundTrip.Group.LongContextPricingEnabled)
+	require.Len(t, roundTrip.Group.ModelPricing, 1)
+	require.Equal(t, []string{"gpt-5.4"}, roundTrip.Group.ModelPricing[0].Models)
+	require.Equal(t, apiKey.Group.ModelPricing[0].InputPrice, roundTrip.Group.ModelPricing[0].InputPrice)
+	require.Equal(t, apiKey.Group.ModelPricing[0].OutputPrice, roundTrip.Group.ModelPricing[0].OutputPrice)
+}
+
 func TestAPIKeyService_GetByKey_IgnoresLegacyAuthCacheSnapshotWithoutMessagesDispatchConfig(t *testing.T) {
 	cache := &authCacheStub{}
 	var repoCalls int32

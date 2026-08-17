@@ -204,3 +204,72 @@ func TestReconcileCRSUpstreamBillingProbeExtra(t *testing.T) {
 		})
 	}
 }
+
+func TestScrubCRSOpenAIOAuthOnlyExtra(t *testing.T) {
+	keys := []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	}
+	for _, target := range []struct {
+		name     string
+		platform string
+		kind     string
+		keep     bool
+	}{
+		{name: "openai oauth", platform: PlatformOpenAI, kind: AccountTypeOAuth, keep: true},
+		{name: "openai api key", platform: PlatformOpenAI, kind: AccountTypeAPIKey},
+		{name: "openai setup token", platform: PlatformOpenAI, kind: AccountTypeSetupToken},
+		{name: "anthropic oauth", platform: PlatformAnthropic, kind: AccountTypeOAuth},
+	} {
+		t.Run(target.name, func(t *testing.T) {
+			extra := map[string]any{
+				codexFingerprintModeExtraKey:       "device",
+				codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+				"openai_device_id":                 "device",
+				"openai_session_id":                "session",
+				OpenAICodex429GuardEnabledExtraKey: true,
+				"keep":                             "value",
+			}
+			scrubCRSOpenAIOAuthOnlyExtra(target.platform, target.kind, extra)
+			for _, key := range keys {
+				if target.keep {
+					require.Contains(t, extra, key)
+				} else {
+					require.NotContains(t, extra, key)
+				}
+			}
+			require.Equal(t, "value", extra["keep"])
+		})
+	}
+}
+
+func TestNormalizeCRSOpenAICodexFingerprintExtraScrubsShadowIdentity(t *testing.T) {
+	parentID := int64(7)
+	shadow := &Account{
+		Platform:        PlatformOpenAI,
+		Type:            AccountTypeOAuth,
+		ParentAccountID: &parentID,
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey:       "device",
+			codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+			"openai_device_id":                 "legacy-device",
+			"openai_session_id":                "legacy-session",
+			OpenAICodex429GuardEnabledExtraKey: true,
+		},
+	}
+	extra := mergeMap(shadow.Extra, map[string]any{"keep": "value"})
+	got := normalizeCRSOpenAICodexFingerprintExtra(shadow, extra)
+	for _, key := range []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	} {
+		require.NotContains(t, got, key)
+	}
+	require.Equal(t, "value", got["keep"])
+}

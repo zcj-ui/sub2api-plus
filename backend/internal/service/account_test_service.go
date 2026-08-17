@@ -2058,20 +2058,29 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 		testModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	probeSessionID := compactProbeSessionID(credentialAccount.ID)
-	payloadBytes, _ := json.Marshal(createOpenAICompactProbePayload(testModelID, isOAuth))
+	probePayload := createOpenAICompactProbePayload(testModelID, isOAuth)
+	// Codex defaults the compact cache domain to its session identity. Keep the
+	// probe on that same root instead of deriving a second account-local key.
+	probePayload["prompt_cache_key"] = probeSessionID
 	var fingerprintIDs *codexFingerprintIDs
-	var metadataErr error
 	if isOAuth {
-		fingerprintIDs = resolveCodexFingerprintIDs(credentialAccount, probeSessionID, codexFingerprintSession, codexFingerprintDeploymentSeed(s.cfg))
+		probeBodyForIDs, _ := json.Marshal(probePayload)
+		fingerprintIDs = resolveCodexFingerprintIDsForRequest(
+			credentialAccount,
+			nil,
+			probeBodyForIDs,
+			0,
+			codexFingerprintDeploymentSeed(s.cfg),
+		)
 		if fingerprintIDs != nil {
-			var changed bool
-			payloadBytes, changed, metadataErr = applyCodexFingerprintClientMetadataRaw(payloadBytes, fingerprintIDs)
-			if metadataErr != nil {
-				return s.sendErrorAndEnd(c, "Failed to build Codex compact probe metadata")
-			}
-			_ = changed
+			// Native remote compaction v2 is a regular Responses request. Give
+			// enabled OAuth probes the same client_metadata carrier as a real
+			// Codex request, then project the shared installation snapshot into it.
+			probePayload["client_metadata"] = map[string]any{"session_id": probeSessionID}
+			_ = applyCodexFingerprintClientMetadata(probePayload, fingerprintIDs)
 		}
 	}
+	payloadBytes, _ := json.Marshal(probePayload)
 	if !agentIdentityTaskRecoveryWasTried(ctx) {
 		s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
 	}

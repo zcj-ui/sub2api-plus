@@ -400,6 +400,8 @@ func TestOpenAIGatewayService_BuildOpenAIWSHeadersPreservesCodexIdentity(t *test
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.144.1")
 	c.Request.Header.Set("X-Codex-Window-ID", "window-ws")
 	c.Request.Header.Set("X-Codex-Installation-ID", "installation-ws")
+	c.Request.Header.Set("X-Codex-Parent-Thread-ID", "parent-ws")
+	c.Request.Header.Set("X-OpenAI-Subagent", "compact")
 	c.Request.Header.Set("X-Test", "blocked")
 
 	svc := &OpenAIGatewayService{}
@@ -421,6 +423,8 @@ func TestOpenAIGatewayService_BuildOpenAIWSHeadersPreservesCodexIdentity(t *test
 	require.NoError(t, err)
 	require.Equal(t, "window-ws", headers.Get("X-Codex-Window-ID"))
 	require.Equal(t, "installation-ws", headers.Get("X-Codex-Installation-ID"))
+	require.Equal(t, "parent-ws", headers.Get("X-Codex-Parent-Thread-ID"))
+	require.Equal(t, "compact", headers.Get("X-OpenAI-Subagent"))
 	require.Empty(t, headers.Get("X-Test"))
 }
 
@@ -931,12 +935,12 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthStoreFalseByDefault(t *testing.T
 	require.Equal(t, "native-wsv2", gjson.Get(requestJSON, "input.0.namespace").String(), "OAuth WSv2 应保留原生 namespace")
 	require.Equal(t, openAIWSBetaV2Value, captureDialer.lastHeaders.Get("OpenAI-Beta"))
 	require.Equal(t, "remote_compaction_v2", captureDialer.lastHeaders.Get("x-codex-beta-features"))
-	conversationSeed := resolveCodexConversationSeed(c.Request.Header, body, 0)
-	wantSession := resolveCodexConversationSessionID(account, conversationSeed)
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("conversation_id"))
-	require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
-	require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
+	require.Equal(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
+	require.Equal(t, "conv-oauth-1", captureDialer.lastHeaders.Get("conversation_id"))
+	// Normal Responses-WebSocket identity carries device convergence through
+	// client_metadata; the direct installation header is reserved for compact.
+	require.Empty(t, captureDialer.lastHeaders.Get("x-codex-installation-id"))
+	require.Empty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_OAuthOriginatorCompatibility(t *testing.T) {
@@ -1160,10 +1164,8 @@ func TestOpenAIGatewayService_Forward_WSv2_HeaderSessionFallbackFromPromptCacheK
 	require.NotNil(t, result)
 	require.Equal(t, "resp_prompt_cache_key", result.RequestID)
 
-	conversationSeed := resolveCodexConversationSeed(c.Request.Header, body, 0)
-	wantSession := resolveCodexConversationSessionID(account, conversationSeed)
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, wantSession, captureDialer.lastHeaders.Get("conversation_id"))
+	require.Equal(t, "pcache_123", captureDialer.lastHeaders.Get("session_id"))
+	require.Equal(t, "pcache_123", captureDialer.lastHeaders.Get("conversation_id"))
 	require.NotNil(t, captureConn.lastWrite)
 	require.True(t, gjson.Get(requestToJSONString(captureConn.lastWrite), "stream").Exists())
 }

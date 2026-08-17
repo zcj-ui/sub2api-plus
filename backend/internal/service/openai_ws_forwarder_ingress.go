@@ -92,6 +92,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 				return fmt.Errorf("websocket ingress requires ws_v2 transport, got=%s", wsDecision.Transport)
 			}
+			// Keep passthrough as the fast path for ordinary frames, but do not
+			// let its early return bypass the oversized-frame HTTP bridge.
+			if s.shouldBridgeOpenAIWSHTTP(
+				account,
+				len(firstClientMessage),
+				gjson.GetBytes(firstClientMessage, "previous_response_id").String(),
+			) {
+				forceHTTPBridge = true
+				break
+			}
 			// 注意：透传 relay 只回调 hooks.AfterTurn，没有 turn 起始回调，
 			// 因此下面这条路径永远不会触发 hooks.BeforeTurn——分组利润控制的
 			// turn 级复核与 turn 级 pricingAt 冻结都不覆盖透传 ingress，
@@ -404,6 +414,30 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		normalized = policyApplied
+		if account.IsOpenAIOAuth() {
+			var clientHeaders http.Header
+			if c != nil && c.Request != nil {
+				clientHeaders = c.Request.Header
+			}
+			var codexFPIDs *codexFingerprintIDs
+			if !codexFingerprintProjectionMalformed(clientHeaders, normalized) {
+				codexFPIDs = resolveCodexFingerprintIDsForRequest(
+					account,
+					clientHeaders,
+					normalized,
+					getAPIKeyIDFromContext(c),
+					codexFingerprintDeploymentSeed(s.cfg),
+				)
+				if next, changed := applyCodexFingerprintToBodyBytes(normalized, codexFPIDs); changed {
+					normalized = next
+				}
+			}
+			// Replace the snapshot on every frame, including nil, to prevent a
+			// failover/off-mode account from inheriting the previous frame's IDs.
+			stageCodexFingerprintIDs(c, codexFPIDs)
+		} else {
+			stageCodexFingerprintIDs(c, nil)
+		}
 		ingressSessionOriginalModel = originalModel
 
 		return openAIWSClientPayload{

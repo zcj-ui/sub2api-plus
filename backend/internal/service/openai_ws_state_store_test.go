@@ -334,6 +334,8 @@ func TestEnsureBindingCapacityPreservingProtectsPermanentGuards(t *testing.T) {
 
 type openAIWSStateStoreTimeoutProbeCache struct {
 	setHasDeadline    bool
+	setCanceled       bool
+	setValue          any
 	getHasDeadline    bool
 	deleteHasDeadline bool
 	setDeadlineDelta  time.Duration
@@ -350,12 +352,16 @@ func (c *openAIWSStateStoreTimeoutProbeCache) GetSessionAccountID(ctx context.Co
 }
 
 func (c *openAIWSStateStoreTimeoutProbeCache) SetSessionAccountID(ctx context.Context, _ int64, _ string, _ int64, _ time.Duration) error {
+	c.setCanceled = ctx.Err() != nil
+	c.setValue = ctx.Value(openAIWSStateStoreProbeContextKey{})
 	if deadline, ok := ctx.Deadline(); ok {
 		c.setHasDeadline = true
 		c.setDeadlineDelta = time.Until(deadline)
 	}
 	return errors.New("set failed")
 }
+
+type openAIWSStateStoreProbeContextKey struct{}
 
 func (c *openAIWSStateStoreTimeoutProbeCache) RefreshSessionTTL(context.Context, int64, string, time.Duration) error {
 	return nil
@@ -422,4 +428,20 @@ func TestWithOpenAIWSStateStoreRedisTimeout_WithParentContext(t *testing.T) {
 	require.NotNil(t, ctx)
 	_, ok := ctx.Deadline()
 	require.True(t, ok, "应附加短超时")
+}
+
+func TestOpenAIWSStateStore_BindResponseAccountDetachedWriteContext(t *testing.T) {
+	probe := &openAIWSStateStoreTimeoutProbeCache{}
+	store := NewOpenAIWSStateStore(probe)
+	parent := context.WithValue(context.Background(), openAIWSStateStoreProbeContextKey{}, "trace")
+	ctx, cancel := context.WithCancel(parent)
+	cancel()
+
+	err := store.BindResponseAccount(ctx, 9, "resp_detached_write", 77, time.Minute)
+	require.Error(t, err, "probe deliberately rejects the write")
+	require.False(t, probe.setCanceled, "durable binding write must outlive request cancellation")
+	require.Equal(t, "trace", probe.setValue, "context values must remain available to the write")
+	require.True(t, probe.setHasDeadline)
+	require.Greater(t, probe.setDeadlineDelta, 2*time.Second)
+	require.LessOrEqual(t, probe.setDeadlineDelta, 3*time.Second)
 }

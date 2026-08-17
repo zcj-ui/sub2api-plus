@@ -520,6 +520,30 @@ describe('EditAccountModal', () => {
     )
   })
 
+  it('does not render or submit fingerprint and 429 guard settings for Spark shadows', async () => {
+    const account = buildOpenAISparkShadowAccount()
+    account.extra = {
+      codex_fingerprint_mode: 'device',
+      openai_codex_429_guard_enabled: true
+    }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    expect(wrapper.find('[data-testid="edit-codex-fingerprint-mode-select"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="edit-codex-429-guard-toggle"]').exists()).toBe(false)
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('codex_fingerprint_mode')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty(
+      'openai_codex_429_guard_enabled'
+    )
+  })
+
   it('defaults legacy OpenAI accounts to long-context billing disabled', async () => {
     const account = buildAccount()
     updateAccountMock.mockReset()

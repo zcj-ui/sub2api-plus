@@ -761,7 +761,19 @@ const form = reactive({
 let abortController: AbortController | null = null
 
 // ── Platform config ──
-const platformOrder: GroupPlatform[] = ['anthropic', 'openai', 'gemini', 'antigravity', 'grok']
+// Keep every concrete platform that can be attached to a channel here.  The
+// editor uses this list both to render sections and to reconstruct an API
+// response; omitting a platform silently drops its group IDs on save.
+const platformOrder: GroupPlatform[] = [
+  'anthropic',
+  'openai',
+  'gemini',
+  'antigravity',
+  'grok',
+  'kimi',
+  'zhipu',
+  'deepseek'
+]
 
 // ── Helpers ──
 function formatDate(value: string): string {

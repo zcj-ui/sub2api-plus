@@ -79,8 +79,11 @@ describe('fetchAccountSelectionMetadata', () => {
 
     const metadata = await fetchAccountSelectionMetadata(fetchPage, { status: 'active' }, [1, 1001])
 
-    expect(metadata.platforms).toEqual(['openai', 'anthropic'])
-    expect(metadata.types).toEqual(['oauth', 'apikey'])
+    expect(metadata).toEqual({
+      platforms: ['openai', 'anthropic'],
+      types: ['oauth', 'apikey'],
+      hasCredentialShadows: false
+    })
     expect(fetchPage).toHaveBeenCalledTimes(2)
   })
 
@@ -96,6 +99,21 @@ describe('fetchAccountSelectionMetadata', () => {
     const metadata = await fetchAccountSelectionMetadata(fetchPage, {})
 
     expect(metadata.platforms).toEqual(['openai', 'antigravity'])
+  })
+
+  it('marks selections containing a credential shadow', async () => {
+    const fetchPage = vi.fn().mockResolvedValue({
+      items: [
+        { id: 1, platform: 'openai', type: 'oauth' },
+        { id: 2, platform: 'openai', type: 'oauth', parent_account_id: 1 }
+      ],
+      total: 2,
+      pages: 1
+    })
+
+    const metadata = await fetchAccountSelectionMetadata(fetchPage, {})
+
+    expect(metadata.hasCredentialShadows).toBe(true)
   })
 
   it('rejects when a selected account disappeared before metadata was loaded', async () => {

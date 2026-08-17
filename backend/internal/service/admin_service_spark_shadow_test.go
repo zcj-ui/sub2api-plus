@@ -554,6 +554,89 @@ func TestUpdateAccount_RejectsTypeChangeOnShadow(t *testing.T) {
 
 // TestBulkUpdateAccounts_RejectsCredentialWriteToShadow 验证外审 G5:批量更新携带凭据时
 // 目标含影子必须被拒(与单账号 UpdateAccount 守卫对齐,堵住 bulk 绕过)。
+func TestUpdateAccount_RejectsCodexGuardWriteToShadow(t *testing.T) {
+	ctx := context.Background()
+	repo := newSparkShadowRepoStub()
+	svc := &adminServiceImpl{accountRepo: repo}
+	parent := &Account{
+		Name: "guard-parent", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Credentials: map[string]any{"chatgpt_account_id": "org-guard"},
+	}
+	require.NoError(t, repo.Create(ctx, parent))
+	shadow, err := svc.CreateShadow(ctx, parent.ID, ShadowOptions{Name: "guard-shadow"})
+	require.NoError(t, err)
+
+	_, err = svc.UpdateAccount(ctx, shadow.ID, &UpdateAccountInput{Extra: map[string]any{
+		OpenAICodex429GuardEnabledExtraKey: true,
+	}})
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, infraerrors.Code(err))
+	require.NotContains(t, repo.accounts[shadow.ID].Extra, OpenAICodex429GuardEnabledExtraKey)
+}
+
+func TestUpdateAccount_TypeChangeScrubsOAuthOnlyCodexState(t *testing.T) {
+	ctx := context.Background()
+	repo := newSparkShadowRepoStub()
+	svc := &adminServiceImpl{accountRepo: repo}
+	account := &Account{
+		Name: "type-transition", Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Status: StatusActive, Credentials: map[string]any{"chatgpt_account_id": "org-transition"},
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey:       "device",
+			codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+			"openai_device_id":                 "legacy-device",
+			"openai_session_id":                "legacy-session",
+			OpenAICodex429GuardEnabledExtraKey: true,
+			"keep":                             "value",
+		},
+	}
+	require.NoError(t, repo.Create(ctx, account))
+
+	updated, err := svc.UpdateAccount(ctx, account.ID, &UpdateAccountInput{Type: AccountTypeAPIKey})
+	require.NoError(t, err)
+	require.Equal(t, AccountTypeAPIKey, updated.Type)
+	require.NotContains(t, updated.Extra, codexFingerprintModeExtraKey)
+	require.NotContains(t, updated.Extra, codexFingerprintSeedExtraKey)
+	require.NotContains(t, updated.Extra, "openai_device_id")
+	require.NotContains(t, updated.Extra, "openai_session_id")
+	require.NotContains(t, updated.Extra, OpenAICodex429GuardEnabledExtraKey)
+	require.Equal(t, "value", updated.Extra["keep"])
+}
+
+func TestUpdateAccount_ShadowScrubsLegacyCodexIdentityState(t *testing.T) {
+	ctx := context.Background()
+	repo := newSparkShadowRepoStub()
+	svc := &adminServiceImpl{accountRepo: repo}
+	parentID := int64(1)
+	shadow := &Account{
+		Name:            "legacy-shadow",
+		Platform:        PlatformOpenAI,
+		Type:            AccountTypeOAuth,
+		Status:          StatusActive,
+		ParentAccountID: &parentID,
+		QuotaDimension:  QuotaDimensionSpark,
+		Credentials:     map[string]any{"model_mapping": map[string]any{"spark": "spark"}},
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey:       "device",
+			codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+			"openai_device_id":                 "legacy-device",
+			"openai_session_id":                "legacy-session",
+			OpenAICodex429GuardEnabledExtraKey: true,
+			"keep":                             "value",
+		},
+	}
+	require.NoError(t, repo.Create(ctx, shadow))
+
+	updated, err := svc.UpdateAccount(ctx, shadow.ID, &UpdateAccountInput{Name: "legacy-shadow-edited"})
+	require.NoError(t, err)
+	require.NotContains(t, updated.Extra, codexFingerprintModeExtraKey)
+	require.NotContains(t, updated.Extra, codexFingerprintSeedExtraKey)
+	require.NotContains(t, updated.Extra, "openai_device_id")
+	require.NotContains(t, updated.Extra, "openai_session_id")
+	require.NotContains(t, updated.Extra, OpenAICodex429GuardEnabledExtraKey)
+	require.Equal(t, "value", updated.Extra["keep"])
+}
+
 func TestBulkUpdateAccounts_RejectsCredentialWriteToShadow(t *testing.T) {
 	ctx := context.Background()
 	repo := newSparkShadowRepoStub()

@@ -420,12 +420,32 @@ type OpenAIWSIngressHooks struct {
 	MaxReasoningEffort string
 	// ReasoningEffortMappings rewrites explicit effort values for this WS session.
 	ReasoningEffortMappings []ReasoningEffortMapping
-	BeforeTurn              func(turn int) error
-	BeforeRequest           func(turn int, payload []byte, originalModel string) error
+	// InitialPassthroughFrames contains client prelude frames read before the
+	// first response.create (for example conversation.item.create). The handler
+	// buffers these so the service can audit and forward them in order without
+	// starting a relay turn before a response exists.
+	InitialPassthroughFrames []OpenAIWSPassthroughInitialFrame
+	// InitialResponseMessageType preserves the client frame encoding for the
+	// first response.create when the direct relay writes it upstream.
+	InitialResponseMessageType coderws.MessageType
+	BeforeTurn                 func(turn int) error
+	// BeforePassthroughTurn runs only for an admitted follow-up turn in the
+	// direct upstream WebSocket relay. The normal BeforeTurn hook owns the
+	// pooled ingress lifecycle; passthrough needs this separate callback to
+	// reacquire per-turn resources after the prior terminal event released them.
+	BeforePassthroughTurn func(turn int) error
+	BeforeRequest         func(turn int, payload []byte, originalModel string) error
 	// MapRequestModel resolves the current turn's client model to the model
 	// that must be written into the upstream response.create frame.
 	MapRequestModel func(turn int, originalModel string) (string, error)
 	AfterTurn       func(turn int, result *OpenAIForwardResult, turnErr error)
+}
+
+// OpenAIWSPassthroughInitialFrame is a client frame buffered before the first
+// response.create in a Responses WebSocket session.
+type OpenAIWSPassthroughInitialFrame struct {
+	MessageType coderws.MessageType
+	Payload     []byte
 }
 
 // OpenAIWSResumeState carries a fully rebuilt, not-yet-client-visible turn

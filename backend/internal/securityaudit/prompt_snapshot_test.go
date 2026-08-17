@@ -37,6 +37,63 @@ func TestExtractPromptSnapshotProtocols(t *testing.T) {
 	}
 }
 
+func TestPromptSnapshotAuditsToolInteractionPayloads(t *testing.T) {
+	tests := []struct {
+		name, protocol, body string
+		want                 []string
+	}{
+		{
+			name:     "anthropic tool use and result",
+			protocol: "anthropic_messages",
+			body:     `{"messages":[{"role":"user","content":"run it"},{"role":"assistant","content":[{"type":"tool_use","name":"lookup","input":{"instruction":"TOOL_USE_CANARY"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"TOOL_RESULT_CANARY"}]}]}`,
+			want:     []string{"TOOL_USE_CANARY", "TOOL_RESULT_CANARY"},
+		},
+		{
+			name:     "responses function call output only",
+			protocol: "openai_responses",
+			body:     `{"input":[{"type":"function_call_output","call_id":"call_1","output":"FUNCTION_OUTPUT_CANARY"}]}`,
+			want:     []string{"FUNCTION_OUTPUT_CANARY"},
+		},
+		{
+			name:     "responses function call arguments",
+			protocol: "openai_responses",
+			body:     `{"input":[{"type":"function_call","name":"lookup","arguments":"FUNCTION_ARGUMENT_CANARY"}]}`,
+			want:     []string{"FUNCTION_ARGUMENT_CANARY"},
+		},
+		{
+			name:     "chat tool calls arguments",
+			protocol: "openai_chat_completions",
+			body:     `{"messages":[{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"CHAT_TOOL_CANARY"}}]}]}`,
+			want:     []string{"CHAT_TOOL_CANARY"},
+		},
+		{
+			name:     "gemini function response",
+			protocol: "gemini",
+			body:     `{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"lookup","response":{"text":"GEMINI_RESPONSE_CANARY"}}}]}]}`,
+			want:     []string{"GEMINI_RESPONSE_CANARY"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot, err := ExtractPromptSnapshot(Request{Protocol: tt.protocol, Body: []byte(tt.body)})
+			require.NoError(t, err)
+			for _, want := range tt.want {
+				require.Contains(t, snapshot.ScanText, want)
+			}
+		})
+	}
+}
+
+func TestBlockingPromptSnapshotKeepsToolResultsAfterLatestUser(t *testing.T) {
+	body := `{"input":[{"role":"user","content":[{"type":"input_text","text":"latest user"}]},{"type":"function_call","name":"lookup","arguments":"CALL_AFTER_USER"},{"type":"function_call_output","call_id":"call_1","output":"RESULT_AFTER_USER"}]}`
+	snapshot, err := ExtractBlockingPromptSnapshot(Request{Protocol: "openai_responses", Body: []byte(body)}, true)
+	require.NoError(t, err)
+	require.Contains(t, snapshot.ScanText, "latest user")
+	require.Contains(t, snapshot.ScanText, "CALL_AFTER_USER")
+	require.Contains(t, snapshot.ScanText, "RESULT_AFTER_USER")
+}
+
 func TestSnapshotRedactsCanariesAndPreservesHashOfScanText(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"PROMPT_CANARY_ABC123 email@example.com +86 138 0013 8000 Bearer AUTH_CANARY_XYZ sk-secretvalue123 password=supersecret123"}]}`
 	snapshot, err := ExtractPromptSnapshot(Request{Protocol: "openai_chat_completions", Body: []byte(body)})
@@ -210,7 +267,7 @@ func TestPromptSnapshotMediaOnlyExtractsDeterministicTextPrompts(t *testing.T) {
 	require.NotContains(t, snapshot.ScanText, strings.Repeat("A", 100))
 }
 
-func TestResponsesWebSocketOnlyAuditsResponseCreateAndPreservesStage(t *testing.T) {
+func TestResponsesWebSocketAuditsResponseCreateAndConversationItems(t *testing.T) {
 	for _, stage := range []string{"first_turn", "subsequent_turn"} {
 		snapshot, err := ExtractPromptSnapshot(Request{
 			Protocol: "openai_responses", Stage: stage,
@@ -220,9 +277,16 @@ func TestResponsesWebSocketOnlyAuditsResponseCreateAndPreservesStage(t *testing.
 		require.Equal(t, "ws turn", snapshot.ScanText)
 		require.Equal(t, stage, snapshot.Stage)
 	}
-	_, err := ExtractPromptSnapshot(Request{
+	itemSnapshot, err := ExtractPromptSnapshot(Request{
 		Protocol: "openai_responses", Stage: "subsequent_turn",
-		Body: []byte(`{"type":"conversation.item.create","response":{"input":"must not scan this frame"}}`),
+		Body: []byte(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"staged websocket content"}]}}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, "staged websocket content", itemSnapshot.ScanText)
+
+	_, err = ExtractPromptSnapshot(Request{
+		Protocol: "openai_responses", Stage: "subsequent_turn",
+		Body: []byte(`{"type":"conversation.item.create","item":{"type":"message","role":"assistant","content":[]}}`),
 	})
 	require.True(t, errors.Is(err, ErrNoPromptText))
 }

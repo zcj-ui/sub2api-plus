@@ -70,6 +70,8 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 	body := []byte(`{"model":"gpt-5.3-codex","prompt_cache_key":"conversation-1","input":[{"type":"input_text","text":"hello"}]}`)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	c.Request.Header.Set("session-id", "client-session-1")
+	c.Request.Header.Set("x-codex-parent-thread-id", "parent-passthrough")
+	c.Request.Header.Set("x-openai-subagent", "review")
 
 	account := &Account{
 		ID:       901,
@@ -77,7 +79,7 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 		Type:     AccountTypeOAuth,
 		Extra: map[string]any{
 			"openai_device_id":           "device-901",
-			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+			codexFingerprintModeExtraKey: string(codexFingerprintDevice),
 			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
 		},
 	}
@@ -87,11 +89,11 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 	svc := &OpenAIGatewayService{}
 	req, err := svc.buildUpstreamRequestOpenAIPassthrough(context.Background(), c, account, body, "token")
 	require.NoError(t, err)
-	require.Equal(t, "device-901", req.Header.Get("x-codex-installation-id"))
-	require.Equal(t, ids.sessionID, req.Header.Get("session_id"))
-	require.Equal(t, ids.sessionID, req.Header.Get("conversation_id"))
-	require.Equal(t, ids.threadID, req.Header.Get("thread-id"))
-	require.NotEmpty(t, req.Header.Get("x-client-request-id"))
+	require.Empty(t, req.Header.Get("x-codex-installation-id"), "regular passthrough must not emit the direct installation header")
+	require.Equal(t, "client-session-1", req.Header.Get("session_id"))
+	require.Equal(t, "parent-passthrough", req.Header.Get("x-codex-parent-thread-id"))
+	require.Equal(t, "review", req.Header.Get("x-openai-subagent"))
+	require.Empty(t, req.Header.Get("x-client-request-id"))
 }
 
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {

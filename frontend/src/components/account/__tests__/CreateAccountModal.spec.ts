@@ -167,6 +167,16 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBe(false)
   })
 
+  it('does not attach OpenAI runtime settings to an Anthropic API key account', async () => {
+    await submitApiKeyAccount('anthropic')
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    const extra = createAccountMock.mock.calls[0]?.[0]?.extra ?? {}
+    expect(extra).not.toHaveProperty('openai_apikey_responses_websockets_v2_mode')
+    expect(extra).not.toHaveProperty('openai_apikey_responses_websockets_v2_enabled')
+    expect(extra).not.toHaveProperty('openai_long_context_billing_enabled')
+  })
+
   // namespace 摊平是仅 OAuth 的兼容开关：API Key 走 chat completions 回退桥时由桥自行摊平
   it('shows the Codex namespace flatten toggle only for OpenAI OAuth accounts', async () => {
     const wrapper = mountModal()

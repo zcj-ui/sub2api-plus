@@ -89,6 +89,11 @@ type cacheWriteTask struct {
 	balance          float64
 	amount           float64
 	subscriptionData *subscriptionCacheData
+
+	// Subscription writes are chained per key so a stale cache snapshot cannot
+	// overtake a usage update handled by another worker.
+	subscriptionPrev chan struct{}
+	subscriptionDone chan struct{}
 }
 
 // apiKeyRateLimitLoader defines the interface for loading rate limit data from DB.
@@ -99,6 +104,104 @@ type apiKeyRateLimitLoader interface {
 type subscriptionCacheInvalidationPubSub interface {
 	PublishSubscriptionCacheInvalidation(ctx context.Context, cacheKey string) error
 	SubscribeSubscriptionCacheInvalidation(ctx context.Context, handler func(cacheKey string)) error
+}
+
+// subscriptionUsageTurnLeaseCache is optional so lightweight test caches and
+// non-Redis deployments remain usable. The production Redis implementation
+// provides the distributed form; BillingCacheService uses a process-local
+// fallback only when that optional capability is absent.
+type subscriptionUsageTurnLeaseCache interface {
+	AcquireSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string, ttl time.Duration) (bool, error)
+	RefreshSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string, ttl time.Duration) (bool, error)
+	ReleaseSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string) error
+}
+
+const (
+	subscriptionUsageTurnLeaseTTL             = 90 * time.Second
+	subscriptionUsageTurnLeaseRefreshInterval = 20 * time.Second
+	subscriptionUsageTurnLeaseOperationTO     = 2 * time.Second
+)
+
+// SubscriptionUsageTurnLease protects one in-flight subscription WebSocket
+// turn from the preflight eligibility check until post-usage billing settles.
+// It is a lease rather than a permanent lock so a crashed process eventually
+// releases the subscription for another backend instance.
+type SubscriptionUsageTurnLease struct {
+	cache   subscriptionUsageTurnLeaseCache
+	service *BillingCacheService
+	userID  int64
+	groupID int64
+	owner   string
+
+	local bool
+
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	refreshDone chan struct{}
+	lost        atomic.Bool
+}
+
+func (l *SubscriptionUsageTurnLease) Lost() bool {
+	return l != nil && l.lost.Load()
+}
+
+func (l *SubscriptionUsageTurnLease) Release() {
+	if l == nil {
+		return
+	}
+	l.stopOnce.Do(func() {
+		if l.stopCh != nil {
+			close(l.stopCh)
+		}
+		if l.refreshDone != nil {
+			<-l.refreshDone
+		}
+		if l.local {
+			if l.service != nil {
+				l.service.releaseLocalSubscriptionUsageTurnLease(l.userID, l.groupID, l.owner)
+			}
+			return
+		}
+		if l.cache == nil {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.Background(), subscriptionUsageTurnLeaseOperationTO)
+		defer cancel()
+		if err := l.cache.ReleaseSubscriptionUsageTurnLease(releaseCtx, l.userID, l.groupID, l.owner); err != nil {
+			logger.LegacyPrintf("service.billing_cache", "Warning: release subscription turn lease failed for user %d group %d: %v", l.userID, l.groupID, err)
+		}
+	})
+}
+
+func (l *SubscriptionUsageTurnLease) refreshLoop() {
+	defer close(l.refreshDone)
+	ticker := time.NewTicker(subscriptionUsageTurnLeaseRefreshInterval)
+	defer ticker.Stop()
+	lastConfirmedAt := time.Now()
+	for {
+		select {
+		case <-l.stopCh:
+			return
+		case <-ticker.C:
+			refreshCtx, cancel := context.WithTimeout(context.Background(), subscriptionUsageTurnLeaseOperationTO)
+			owned, err := l.cache.RefreshSubscriptionUsageTurnLease(refreshCtx, l.userID, l.groupID, l.owner, subscriptionUsageTurnLeaseTTL)
+			cancel()
+			if err == nil && owned {
+				lastConfirmedAt = time.Now()
+				continue
+			}
+			if err == nil {
+				l.lost.Store(true)
+				return
+			}
+			if time.Since(lastConfirmedAt) >= subscriptionUsageTurnLeaseTTL {
+				l.lost.Store(true)
+				logger.LegacyPrintf("service.billing_cache", "Warning: subscription turn lease refresh timed out for user %d group %d: %v", l.userID, l.groupID, err)
+				return
+			}
+			logger.LegacyPrintf("service.billing_cache", "Warning: subscription turn lease refresh failed for user %d group %d: %v", l.userID, l.groupID, err)
+		}
+	}
 }
 
 // BillingCacheService 计费缓存服务
@@ -114,13 +217,17 @@ type BillingCacheService struct {
 	circuitBreaker        *billingCircuitBreaker
 	userPlatformQuotaRepo UserPlatformQuotaRepository
 
-	cacheWriteChan     chan cacheWriteTask
-	cacheWriteWg       sync.WaitGroup
-	cacheWriteStopOnce sync.Once
-	cacheWriteMu       sync.RWMutex
-	stopped            atomic.Bool
-	balanceLoadSF      singleflight.Group
-	quotaLoadSF        singleflight.Group
+	cacheWriteChan         chan cacheWriteTask
+	cacheWriteWg           sync.WaitGroup
+	cacheWriteStopOnce     sync.Once
+	cacheWriteMu           sync.RWMutex
+	subscriptionWriteMu    sync.Mutex
+	subscriptionWriteTails map[string]chan struct{}
+	subscriptionTurnMu     sync.Mutex
+	subscriptionTurnOwners map[string]string
+	stopped                atomic.Bool
+	balanceLoadSF          singleflight.Group
+	quotaLoadSF            singleflight.Group
 	// 丢弃日志节流计数器（减少高负载下日志噪音）
 	cacheWriteDropFullCount     uint64
 	cacheWriteDropFullLastLog   int64
@@ -140,14 +247,16 @@ func NewBillingCacheService(
 	userPlatformQuotaRepo UserPlatformQuotaRepository,
 ) *BillingCacheService {
 	svc := &BillingCacheService{
-		cache:                 cache,
-		userRepo:              userRepo,
-		subRepo:               subRepo,
-		apiKeyRateLimitLoader: apiKeyRepo,
-		userRPMCache:          userRPMCache,
-		userGroupRateRepo:     userGroupRateRepo,
-		cfg:                   cfg,
-		userPlatformQuotaRepo: userPlatformQuotaRepo,
+		cache:                  cache,
+		userRepo:               userRepo,
+		subRepo:                subRepo,
+		apiKeyRateLimitLoader:  apiKeyRepo,
+		userRPMCache:           userRPMCache,
+		userGroupRateRepo:      userGroupRateRepo,
+		cfg:                    cfg,
+		userPlatformQuotaRepo:  userPlatformQuotaRepo,
+		subscriptionWriteTails: make(map[string]chan struct{}),
+		subscriptionTurnOwners: make(map[string]string),
 	}
 	svc.circuitBreaker = newBillingCircuitBreaker(cfg.Billing.CircuitBreaker)
 	svc.startCacheWriteWorkers()
@@ -194,20 +303,34 @@ func (s *BillingCacheService) enqueueCacheWrite(task cacheWriteTask) (enqueued b
 		s.logCacheWriteDrop(task, "closed")
 		return false
 	}
+	if isSubscriptionCacheWrite(task.kind) {
+		s.registerSubscriptionCacheWrite(&task)
+	}
 
 	s.cacheWriteMu.RLock()
-	defer s.cacheWriteMu.RUnlock()
-
-	if s.cacheWriteChan == nil {
+	if s.stopped.Load() || s.cacheWriteChan == nil {
+		s.cacheWriteMu.RUnlock()
+		if task.subscriptionDone != nil {
+			s.executeOrderedCacheWriteTask(task)
+			return true
+		}
 		s.logCacheWriteDrop(task, "closed")
 		return false
 	}
 
 	select {
 	case s.cacheWriteChan <- task:
+		s.cacheWriteMu.RUnlock()
 		return true
 	default:
 		// 队列满时不阻塞主流程，交由调用方决定是否同步回退。
+		s.cacheWriteMu.RUnlock()
+		// Subscription usage is quota-sensitive. Preserve ordering even when
+		// the shared queue is full by completing this task synchronously.
+		if task.subscriptionDone != nil {
+			s.executeOrderedCacheWriteTask(task)
+			return true
+		}
 		s.logCacheWriteDrop(task, "full")
 		return false
 	}
@@ -216,33 +339,83 @@ func (s *BillingCacheService) enqueueCacheWrite(task cacheWriteTask) (enqueued b
 func (s *BillingCacheService) cacheWriteWorker(ch <-chan cacheWriteTask) {
 	defer s.cacheWriteWg.Done()
 	for task := range ch {
-		ctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
-		switch task.kind {
-		case cacheWriteSetBalance:
-			s.setBalanceCache(ctx, task.userID, task.balance)
-		case cacheWriteSetSubscription:
-			s.setSubscriptionCache(ctx, task.userID, task.groupID, task.subscriptionData)
-		case cacheWriteUpdateSubscriptionUsage:
-			if s.cache != nil {
-				if err := s.cache.UpdateSubscriptionUsage(ctx, task.userID, task.groupID, task.amount); err != nil {
-					logger.LegacyPrintf("service.billing_cache", "Warning: update subscription cache failed for user %d group %d: %v", task.userID, task.groupID, err)
-				}
-			}
-		case cacheWriteDeductBalance:
-			if s.cache != nil {
-				if err := s.cache.DeductUserBalance(ctx, task.userID, task.amount); err != nil {
-					logger.LegacyPrintf("service.billing_cache", "Warning: deduct balance cache failed for user %d: %v", task.userID, err)
-				}
-			}
-		case cacheWriteUpdateRateLimitUsage:
-			if s.cache != nil {
-				if err := s.cache.UpdateAPIKeyRateLimitUsage(ctx, task.apiKeyID, task.amount); err != nil {
-					logger.LegacyPrintf("service.billing_cache", "Warning: update rate limit usage cache failed for api key %d: %v", task.apiKeyID, err)
-				}
+		s.executeOrderedCacheWriteTask(task)
+	}
+}
+
+func isSubscriptionCacheWrite(kind cacheWriteKind) bool {
+	return kind == cacheWriteSetSubscription || kind == cacheWriteUpdateSubscriptionUsage
+}
+
+func subscriptionCacheWriteKey(userID, groupID int64) string {
+	return strconv.FormatInt(userID, 10) + ":" + strconv.FormatInt(groupID, 10)
+}
+
+// registerSubscriptionCacheWrite links writes for one subscription into a
+// FIFO chain. Registration happens before queueing, so a synchronous fallback
+// cannot overtake a task that was already accepted by a worker.
+func (s *BillingCacheService) registerSubscriptionCacheWrite(task *cacheWriteTask) {
+	key := subscriptionCacheWriteKey(task.userID, task.groupID)
+	s.subscriptionWriteMu.Lock()
+	defer s.subscriptionWriteMu.Unlock()
+	if s.subscriptionWriteTails == nil {
+		s.subscriptionWriteTails = make(map[string]chan struct{})
+	}
+	task.subscriptionPrev = s.subscriptionWriteTails[key]
+	task.subscriptionDone = make(chan struct{})
+	s.subscriptionWriteTails[key] = task.subscriptionDone
+}
+
+func (s *BillingCacheService) completeSubscriptionCacheWrite(task cacheWriteTask) {
+	if task.subscriptionDone == nil {
+		return
+	}
+	close(task.subscriptionDone)
+	key := subscriptionCacheWriteKey(task.userID, task.groupID)
+	s.subscriptionWriteMu.Lock()
+	if s.subscriptionWriteTails[key] == task.subscriptionDone {
+		delete(s.subscriptionWriteTails, key)
+	}
+	s.subscriptionWriteMu.Unlock()
+}
+
+// executeCacheWriteTask is used by the ordered synchronous fallback when the
+// shared worker queue is full or is being shut down.
+func (s *BillingCacheService) executeCacheWriteTask(task cacheWriteTask) {
+	ctx, cancel := context.WithTimeout(context.Background(), cacheWriteTimeout)
+	defer cancel()
+	switch task.kind {
+	case cacheWriteSetBalance:
+		s.setBalanceCache(ctx, task.userID, task.balance)
+	case cacheWriteSetSubscription:
+		s.setSubscriptionCache(ctx, task.userID, task.groupID, task.subscriptionData)
+	case cacheWriteUpdateSubscriptionUsage:
+		if s.cache != nil {
+			if err := s.cache.UpdateSubscriptionUsage(ctx, task.userID, task.groupID, task.amount); err != nil {
+				logger.LegacyPrintf("service.billing_cache", "Warning: update subscription cache failed for user %d group %d: %v", task.userID, task.groupID, err)
 			}
 		}
-		cancel()
+	case cacheWriteDeductBalance:
+		if s.cache != nil {
+			if err := s.cache.DeductUserBalance(ctx, task.userID, task.amount); err != nil {
+				logger.LegacyPrintf("service.billing_cache", "Warning: deduct balance cache failed for user %d: %v", task.userID, err)
+			}
+		}
+	case cacheWriteUpdateRateLimitUsage:
+		if s.cache != nil {
+			if err := s.cache.UpdateAPIKeyRateLimitUsage(ctx, task.apiKeyID, task.amount); err != nil {
+				logger.LegacyPrintf("service.billing_cache", "Warning: update rate limit usage cache failed for api key %d: %v", task.apiKeyID, err)
+			}
+		}
 	}
+}
+
+func (s *BillingCacheService) executeOrderedCacheWriteTask(task cacheWriteTask) {
+	if task.subscriptionPrev != nil {
+		<-task.subscriptionPrev
+	}
+	s.executeCacheWriteTask(task)
+	s.completeSubscriptionCacheWrite(task)
 }
 
 // cacheWriteKindName 用于日志中的任务类型标识，便于排查丢弃原因。
@@ -495,6 +668,98 @@ func (s *BillingCacheService) UpdateSubscriptionUsage(ctx context.Context, userI
 		return nil
 	}
 	return s.cache.UpdateSubscriptionUsage(ctx, userID, groupID, costUSD)
+}
+
+// WaitForSubscriptionCacheWrites waits until every subscription-cache write
+// registered before the call has settled. A WebSocket turn uses this after its
+// durable billing update, before releasing its admission lease, so the next
+// same-subscription turn cannot observe an older cache snapshot.
+func (s *BillingCacheService) WaitForSubscriptionCacheWrites(ctx context.Context, userID, groupID int64) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := subscriptionCacheWriteKey(userID, groupID)
+	for {
+		s.subscriptionWriteMu.Lock()
+		tail := s.subscriptionWriteTails[key]
+		s.subscriptionWriteMu.Unlock()
+		if tail == nil {
+			return nil
+		}
+		select {
+		case <-tail:
+			// A writer may have registered while we were waiting. Re-read the
+			// tail so callers do not race a follow-up usage update.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// AcquireSubscriptionUsageTurnLease obtains a single in-flight turn lease for
+// a user subscription. It is intentionally non-blocking across connections:
+// another socket receives a retryable admission rejection instead of keeping
+// an unbounded WebSocket goroutine parked behind a slow upstream response.
+func (s *BillingCacheService) AcquireSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64) (*SubscriptionUsageTurnLease, bool, error) {
+	if s == nil || userID <= 0 || groupID <= 0 {
+		return nil, true, nil
+	}
+	owner := generateRequestID()
+	if cache, ok := s.cache.(subscriptionUsageTurnLeaseCache); ok {
+		baseCtx := context.Background()
+		if ctx != nil {
+			baseCtx = context.WithoutCancel(ctx)
+		}
+		acquireCtx, cancel := context.WithTimeout(baseCtx, subscriptionUsageTurnLeaseOperationTO)
+		acquired, err := cache.AcquireSubscriptionUsageTurnLease(acquireCtx, userID, groupID, owner, subscriptionUsageTurnLeaseTTL)
+		cancel()
+		if err != nil || !acquired {
+			return nil, acquired, err
+		}
+		lease := &SubscriptionUsageTurnLease{
+			cache:       cache,
+			userID:      userID,
+			groupID:     groupID,
+			owner:       owner,
+			stopCh:      make(chan struct{}),
+			refreshDone: make(chan struct{}),
+		}
+		go lease.refreshLoop()
+		return lease, true, nil
+	}
+
+	key := subscriptionCacheWriteKey(userID, groupID)
+	s.subscriptionTurnMu.Lock()
+	defer s.subscriptionTurnMu.Unlock()
+	if s.subscriptionTurnOwners == nil {
+		s.subscriptionTurnOwners = make(map[string]string)
+	}
+	if _, held := s.subscriptionTurnOwners[key]; held {
+		return nil, false, nil
+	}
+	s.subscriptionTurnOwners[key] = owner
+	return &SubscriptionUsageTurnLease{
+		service: s,
+		userID:  userID,
+		groupID: groupID,
+		owner:   owner,
+		local:   true,
+	}, true, nil
+}
+
+func (s *BillingCacheService) releaseLocalSubscriptionUsageTurnLease(userID, groupID int64, owner string) {
+	if s == nil {
+		return
+	}
+	key := subscriptionCacheWriteKey(userID, groupID)
+	s.subscriptionTurnMu.Lock()
+	defer s.subscriptionTurnMu.Unlock()
+	if s.subscriptionTurnOwners[key] == owner {
+		delete(s.subscriptionTurnOwners, key)
+	}
 }
 
 // QueueUpdateSubscriptionUsage 异步更新订阅用量缓存

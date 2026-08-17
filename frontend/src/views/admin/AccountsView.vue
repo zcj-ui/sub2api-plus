@@ -585,6 +585,7 @@ type AccountBulkEditTarget =
       accountIds: number[]
       selectedPlatforms: AccountPlatform[]
       selectedTypes: AccountType[]
+      hasCredentialShadows: boolean
     }
   | {
       mode: 'filtered'
@@ -601,6 +602,7 @@ type AccountBulkEditTarget =
       previewCount: number
       selectedPlatforms: AccountPlatform[]
       selectedTypes: AccountType[]
+      hasCredentialShadows: boolean
     }
 const showCreate = ref(false)
 const showEdit = ref(false)
@@ -2185,7 +2187,8 @@ const loadSelectionMetadata = async (selectedAccountIds?: number[]) => {
   )
   return {
     selectedPlatforms: metadata.platforms as AccountPlatform[],
-    selectedTypes: metadata.types as AccountType[]
+    selectedTypes: metadata.types as AccountType[],
+    hasCredentialShadows: metadata.hasCredentialShadows
   }
 }
 
@@ -2194,12 +2197,13 @@ const openBulkEditSelected = async () => {
   openingBulkEdit.value = true
   try {
     const accountIds = [...selIds.value]
-    const { selectedPlatforms, selectedTypes } = await loadSelectionMetadata(accountIds)
+    const { selectedPlatforms, selectedTypes, hasCredentialShadows } = await loadSelectionMetadata(accountIds)
     bulkEditTarget.value = {
       mode: 'selected',
       accountIds,
       selectedPlatforms,
-      selectedTypes
+      selectedTypes,
+      hasCredentialShadows
     }
     showBulkEdit.value = true
   } catch (error) {
@@ -2214,13 +2218,14 @@ const openBulkEditFiltered = async () => {
   openingBulkEdit.value = true
   try {
     const filters = buildBulkEditFilterSnapshot()
-    const { selectedPlatforms, selectedTypes } = await loadSelectionMetadata()
+    const { selectedPlatforms, selectedTypes, hasCredentialShadows } = await loadSelectionMetadata()
     bulkEditTarget.value = {
       mode: 'filtered',
       filters,
       previewCount: pagination.total,
       selectedPlatforms,
-      selectedTypes
+      selectedTypes,
+      hasCredentialShadows
     }
     showBulkEdit.value = true
   } catch (error) {
@@ -2640,12 +2645,19 @@ onMounted(async () => {
   load()
   void loadGlobalHealthProbeFailures()
   loadUpstreamBillingProbeGlobalState()
-  try {
-    const [p, g] = await Promise.all([adminAPI.proxies.getAll(), adminAPI.groups.getAll()])
-    proxies.value = p
-    groups.value = g
-  } catch (error) {
-    console.error('Failed to load proxies/groups:', error)
+  const [proxiesResult, groupsResult] = await Promise.allSettled([
+    adminAPI.proxies.getAll(),
+    adminAPI.groups.getAll()
+  ])
+  if (proxiesResult.status === 'fulfilled') {
+    proxies.value = proxiesResult.value
+  } else {
+    console.error('Failed to load proxies:', proxiesResult.reason)
+  }
+  if (groupsResult.status === 'fulfilled') {
+    groups.value = groupsResult.value
+  } else {
+    console.error('Failed to load groups:', groupsResult.reason)
   }
   window.addEventListener('scroll', handleScroll, true)
   window.addEventListener('resize', handleViewportResize)

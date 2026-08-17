@@ -59,6 +59,39 @@ func TestUpstreamModelMismatchThreeStateAndCaseInsensitiveComparison(t *testing.
 	require.True(t, *mismatched)
 }
 
+func TestUpstreamModelMismatchNormalizesMatchingGrokRuntimeAliases(t *testing.T) {
+	for _, tt := range []struct {
+		sent, response string
+	}{
+		{sent: "grok-4.5", response: "grok-4.5-build"},
+		{sent: "grok-4.5-latest", response: "grok-4.5-build"},
+		{sent: "grok-4.6", response: "grok-4.6-build"},
+		{sent: "grok-4.6-latest", response: "grok-4.6-build"},
+	} {
+		t.Run(tt.sent+"/"+tt.response, func(t *testing.T) {
+			mismatch := upstreamModelMismatch(tt.sent, tt.response)
+			require.NotNil(t, mismatch)
+			require.False(t, *mismatch)
+		})
+	}
+}
+
+func TestUpstreamModelMismatchDoesNotCrossGrokVersionsOrUnknownBuilds(t *testing.T) {
+	for _, tt := range []struct {
+		sent, response string
+	}{
+		{sent: "grok-4.5", response: "grok-4.6-build"},
+		{sent: "grok-4.6", response: "grok-4.6-custom-build"},
+		{sent: "gpt-5.5", response: "grok-4.5-build"},
+	} {
+		t.Run(tt.sent+"/"+tt.response, func(t *testing.T) {
+			mismatch := upstreamModelMismatch(tt.sent, tt.response)
+			require.NotNil(t, mismatch)
+			require.True(t, *mismatch)
+		})
+	}
+}
+
 func TestObserveOpenAISSEBodyIgnoresMalformedPayload(t *testing.T) {
 	observer := &upstreamResponseModelObserver{}
 	observeOpenAISSEBody(observer, "data: not-json\n\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\"}}\n\n")

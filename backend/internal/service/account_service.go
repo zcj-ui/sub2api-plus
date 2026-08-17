@@ -166,6 +166,9 @@ type AccountBulkUpdate struct {
 	Credentials    map[string]any
 	Extra          map[string]any
 	ProbeEnabled   *bool
+	// EnsureCodexFingerprintSeed asks the repository to generate one distinct
+	// seed per eligible OpenAI OAuth row inside the same bulk transaction.
+	EnsureCodexFingerprintSeed bool
 }
 
 // CreateAccountRequest 创建账号请求
@@ -219,6 +222,9 @@ func NewAccountService(accountRepo AccountRepository, groupRepo GroupRepository)
 
 // Create 创建账号
 func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (*Account, error) {
+	if err := ValidateCodexFingerprintExtra(req.Platform, req.Type, req.Extra); err != nil {
+		return nil, err
+	}
 	// 验证分组是否存在（如果指定了分组）
 	if len(req.GroupIDs) > 0 {
 		if err := s.validateGroupIDsExist(ctx, req.GroupIDs); err != nil {
@@ -240,6 +246,7 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 		Status:      StatusActive,
 		ExpiresAt:   req.ExpiresAt,
 	}
+	account.Extra = normalizeCodexFingerprintModeForStorage(account.Extra)
 	account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
 	if req.AutoPauseOnExpired != nil {
 		account.AutoPauseOnExpired = *req.AutoPauseOnExpired
@@ -330,6 +337,9 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 	}
 
 	if req.Extra != nil {
+		if err := ValidateCodexFingerprintExtra(account.Platform, account.Type, *req.Extra); err != nil {
+			return nil, err
+		}
 		extra := make(map[string]any, len(*req.Extra))
 		for key, value := range *req.Extra {
 			extra[key] = value
@@ -337,7 +347,23 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		delete(extra, OllamaCloudUsageSessionExtraKey)
 		delete(extra, OllamaCloudUsageAutoRefreshExtraKey)
 		delete(extra, OllamaCloudUsageSnapshotExtraKey)
+		// The Codex seed is system-owned. Preserve the existing seed for a
+		// normal edit, and never accept a caller-supplied replacement here.
+		delete(extra, codexFingerprintSeedExtraKey)
+		extra = normalizeCodexFingerprintModeForStorage(extra)
+		if !account.IsCredentialShadow() {
+			if seed := account.getCodexFingerprintSeed(); seed != "" {
+				extra[codexFingerprintSeedExtraKey] = seed
+			}
+			extra = ensureCodexFingerprintSeed(account.Platform, account.Type, extra)
+		}
 		account.Extra = extra
+	}
+	// Keep legacy rows converged even when the update did not include Extra.
+	// This also prevents a full account edit from silently dropping the seed.
+	account.Extra = normalizeCodexFingerprintModeForStorage(account.Extra)
+	if !account.IsCredentialShadow() {
+		account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
 	}
 
 	if req.ProxyID != nil {

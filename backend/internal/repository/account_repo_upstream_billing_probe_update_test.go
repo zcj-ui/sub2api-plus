@@ -285,6 +285,33 @@ func TestUpdateExtraNilProbeRemovesKeyInsteadOfWritingJSONNull(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestUpdateExtraCodexFingerprintModeDeleteEnqueuesSchedulerOutbox(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	t.Cleanup(func() { _ = client.Close() })
+
+	// A nil mode is represented as a JSONB key deletion. It still changes
+	// routing identity and must publish an outbox event for other instances.
+	mock.ExpectBegin()
+	mock.ExpectExec(`(?s)UPDATE accounts SET extra = .* - 'codex_fingerprint_mode'`).
+		WithArgs(`{}`, int64(27)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).
+		WithArgs(service.SchedulerOutboxEventAccountChanged, int64(27), nil, nil, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+	repo := newAccountRepositoryWithSQL(client, db, nil)
+
+	err = repo.UpdateExtra(context.Background(), 27, map[string]any{
+		"codex_fingerprint_mode": nil,
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestBulkUpdateNilProbeRemovesKeyInsteadOfWritingJSONNull(t *testing.T) {
 	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
 	repo := newAccountRepositoryWithSQL(nil, exec, nil)
@@ -296,6 +323,28 @@ func TestBulkUpdateNilProbeRemovesKeyInsteadOfWritingJSONNull(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, exec.execQueries)
 	require.Contains(t, normalizeSQLWhitespace(exec.execQueries[0]), "- 'upstream_billing_probe'")
+}
+
+func TestBulkUpdateCodexFingerprintSeedNormalizesModeInSQL(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	_, err := repo.BulkUpdate(context.Background(), []int64{27}, service.AccountBulkUpdate{
+		Extra: map[string]any{
+			"codex_fingerprint_mode": " DEVICE ",
+		},
+		EnsureCodexFingerprintSeed: true,
+	})
+
+	require.NoError(t, err)
+	require.NotEmpty(t, exec.execQueries)
+	query := normalizeSQLWhitespace(exec.execQueries[0])
+	require.Contains(t, query, "LOWER(BTRIM(COALESCE(")
+	require.Contains(t, query, "IN ('device', 'session', 'full')")
+	require.Contains(t, query, "gen_random_uuid()")
+	payload, ok := exec.execArgs[0][0].([]byte)
+	require.True(t, ok)
+	require.Equal(t, `{"codex_fingerprint_mode":" DEVICE "}`, string(payload))
 }
 
 func TestBulkUpdateDisablingProbeRemovesSnapshot(t *testing.T) {

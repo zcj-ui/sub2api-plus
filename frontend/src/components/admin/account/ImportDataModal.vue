@@ -62,7 +62,11 @@
             {{ t('admin.accounts.codex429GuardHint') }}
           </div>
         </div>
-        <Toggle v-model="codex429GuardEnabled" data-test="codex-429-guard-toggle" />
+        <Toggle
+          :model-value="codex429GuardEnabled"
+          data-test="codex-429-guard-toggle"
+          @update:model-value="(value) => { codex429GuardEnabled = value; codex429GuardOverride = true }"
+        />
       </div>
 
       <div
@@ -141,6 +145,10 @@ const dragActive = computed(() => dragDepth.value > 0)
 const hasCreatedData = ref(false)
 const result = ref<AdminDataImportResult | null>(null)
 const codex429GuardEnabled = ref(false)
+// Omit the override by default so a data import preserves the guard value
+// already present in an exported account. Clicking the toggle opts into an
+// explicit true/false override.
+const codex429GuardOverride = ref(false)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFilesLabel = computed(() => {
@@ -161,6 +169,7 @@ watch(
       hasCreatedData.value = false
       result.value = null
       codex429GuardEnabled.value = false
+      codex429GuardOverride.value = false
       if (fileInput.value) {
         fileInput.value.value = ''
       }
@@ -278,7 +287,23 @@ const isValidDataPayload = (payload: unknown): payload is AdminDataPayload => {
     if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return false
     const allowOverages = (extra as Record<string, unknown>).allow_overages
     if (allowOverages !== undefined && typeof allowOverages !== 'boolean') return false
-    return allowOverages !== true || account.platform === 'antigravity'
+    if (allowOverages === true && account.platform !== 'antigravity') return false
+    const fingerprintMode = (extra as Record<string, unknown>).codex_fingerprint_mode
+    if (fingerprintMode !== undefined && fingerprintMode !== null) {
+      if (typeof fingerprintMode !== 'string' || !['off', 'device', 'session', 'full'].includes(fingerprintMode.trim().toLowerCase())) return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    const fingerprintSeed = (extra as Record<string, unknown>).codex_fingerprint_seed
+    if (fingerprintSeed !== undefined && fingerprintSeed !== null) {
+      if (typeof fingerprintSeed !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(fingerprintSeed.trim())) return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    const codex429Guard = (extra as Record<string, unknown>).openai_codex_429_guard_enabled
+    if (codex429Guard !== undefined) {
+      if (typeof codex429Guard !== 'boolean') return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    return true
   })
 }
 
@@ -341,12 +366,20 @@ const handleImport = async () => {
       return
     }
 
-    const res = await adminAPI.accounts.importData({
+    const importPayload: {
+      data: AdminDataPayload
+      skip_default_group_bind: boolean
+      codex_429_guard_enabled?: boolean
+      confirm_overages_risk: boolean
+    } = {
       data: dataPayload,
       skip_default_group_bind: true,
-      codex_429_guard_enabled: codex429GuardEnabled.value,
       confirm_overages_risk: importsOverages
-    })
+    }
+    if (codex429GuardOverride.value) {
+      importPayload.codex_429_guard_enabled = codex429GuardEnabled.value
+    }
+    const res = await adminAPI.accounts.importData(importPayload)
 
     result.value = res
 

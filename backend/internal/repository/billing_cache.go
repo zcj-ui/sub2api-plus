@@ -17,6 +17,7 @@ import (
 const (
 	billingBalanceKeyPrefix   = "billing:balance:"
 	billingSubKeyPrefix       = "billing:sub:"
+	billingSubTurnLeasePrefix = "billing:sub_turn_lease:"
 	billingRateLimitKeyPrefix = "apikey:rate:"
 	subCacheInvalidateChannel = "subscription:cache:invalidate"
 	billingCacheTTL           = 5 * time.Minute
@@ -47,6 +48,13 @@ func billingBalanceKey(userID int64) string {
 // billingSubKey generates the Redis key for subscription cache.
 func billingSubKey(userID, groupID int64) string {
 	return fmt.Sprintf("%s%d:%d", billingSubKeyPrefix, userID, groupID)
+}
+
+// billingSubTurnLeaseKey is deliberately separate from the subscription
+// snapshot. A lease only serializes an in-flight WebSocket turn; it must not
+// change the cache data used by normal eligibility checks.
+func billingSubTurnLeaseKey(userID, groupID int64) string {
+	return fmt.Sprintf("%s%d:%d", billingSubTurnLeasePrefix, userID, groupID)
 }
 
 const (
@@ -95,6 +103,39 @@ var (
 		redis.call('HINCRBYFLOAT', KEYS[1], 'monthly_usage', cost)
 		redis.call('EXPIRE', KEYS[1], ARGV[2])
 		return 1
+	`)
+
+	// subscriptionTurnLeaseAcquireScript atomically claims one short-lived
+	// subscription turn lease. Reacquiring with the same owner refreshes the
+	// TTL, which makes retries idempotent without allowing another socket to
+	// steal an active turn.
+	subscriptionTurnLeaseAcquireScript = redis.NewScript(`
+		local current = redis.call('GET', KEYS[1])
+		if current == ARGV[1] then
+			redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+			return 1
+		end
+		if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then
+			return 1
+		end
+		return 0
+	`)
+
+	// Refresh and release compare the owner token so a delayed cleanup from an
+	// expired turn cannot affect a newer lease holder.
+	subscriptionTurnLeaseRefreshScript = redis.NewScript(`
+		if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+			return 0
+		end
+		redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+		return 1
+	`)
+
+	subscriptionTurnLeaseReleaseScript = redis.NewScript(`
+		if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+			return 0
+		end
+		return redis.call('DEL', KEYS[1])
 	`)
 
 	// updateRateLimitUsageScript atomically increments all three rate limit usage counters
@@ -250,6 +291,54 @@ func (c *billingCache) UpdateSubscriptionUsage(ctx context.Context, userID, grou
 		return err
 	}
 	return nil
+}
+
+// AcquireSubscriptionUsageTurnLease serializes one in-flight subscription
+// WebSocket turn across backend instances. The lease is intentionally scoped to
+// user+group rather than an API key because multiple keys can spend the same
+// subscription quota.
+func (c *billingCache) AcquireSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("subscription turn lease TTL must be positive")
+	}
+	result, err := subscriptionTurnLeaseAcquireScript.Run(
+		ctx,
+		c.rdb,
+		[]string{billingSubTurnLeaseKey(userID, groupID)},
+		owner,
+		int(ttl.Seconds()),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
+func (c *billingCache) RefreshSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, fmt.Errorf("subscription turn lease TTL must be positive")
+	}
+	result, err := subscriptionTurnLeaseRefreshScript.Run(
+		ctx,
+		c.rdb,
+		[]string{billingSubTurnLeaseKey(userID, groupID)},
+		owner,
+		int(ttl.Seconds()),
+	).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
+func (c *billingCache) ReleaseSubscriptionUsageTurnLease(ctx context.Context, userID, groupID int64, owner string) error {
+	_, err := subscriptionTurnLeaseReleaseScript.Run(
+		ctx,
+		c.rdb,
+		[]string{billingSubTurnLeaseKey(userID, groupID)},
+		owner,
+	).Result()
+	return err
 }
 
 func (c *billingCache) InvalidateSubscriptionCache(ctx context.Context, userID, groupID int64) error {

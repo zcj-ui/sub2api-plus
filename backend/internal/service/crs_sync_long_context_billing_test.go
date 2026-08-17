@@ -20,9 +20,10 @@ type crsLongContextAccountRepo struct {
 }
 
 type crsOpenAILongContextSource struct {
-	collection  string
-	credentials map[string]any
-	extra       map[string]any
+	collection   string
+	credentials  map[string]any
+	extra        map[string]any
+	existingType string
 }
 
 func newCRSLongContextAccountRepo(existing ...*Account) *crsLongContextAccountRepo {
@@ -69,6 +70,7 @@ func TestCRSSyncOpenAILongContextBilling(t *testing.T) {
 		credentials   map[string]any
 		sourceExtra   map[string]any
 		existingExtra map[string]any
+		existingType  string
 		wantAction    string
 		wantEnabled   bool
 	}{
@@ -102,17 +104,21 @@ func TestCRSSyncOpenAILongContextBilling(t *testing.T) {
 			var existing *Account
 			if tt.existingExtra != nil {
 				existingExtra := mergeMap(tt.existingExtra, map[string]any{"crs_account_id": crsID})
-				accountType := AccountTypeOAuth
-				if tt.collection == "openaiResponsesAccounts" {
-					accountType = AccountTypeAPIKey
+				accountType := tt.existingType
+				if accountType == "" {
+					accountType = AccountTypeOAuth
+					if tt.collection == "openaiResponsesAccounts" {
+						accountType = AccountTypeAPIKey
+					}
 				}
 				existing = &Account{ID: 41, Platform: PlatformOpenAI, Type: accountType, Extra: existingExtra}
 			}
 			repo := newCRSLongContextAccountRepo(existing)
 			result := runCRSOpenAILongContextSync(t, repo, crsOpenAILongContextSource{
-				collection:  tt.collection,
-				credentials: tt.credentials,
-				extra:       tt.sourceExtra,
+				collection:   tt.collection,
+				credentials:  tt.credentials,
+				extra:        tt.sourceExtra,
+				existingType: tt.existingType,
 			})
 
 			require.Len(t, result.Items, 1)
@@ -126,6 +132,45 @@ func TestCRSSyncOpenAILongContextBilling(t *testing.T) {
 			require.Equal(t, tt.wantEnabled, stored)
 		})
 	}
+}
+
+func TestCRSSyncOpenAIResponsesTypeTransitionScrubsCodexIdentity(t *testing.T) {
+	const crsID = "crs-openai-1"
+	existingExtra := map[string]any{
+		"crs_account_id":                   crsID,
+		codexFingerprintModeExtraKey:       "device",
+		codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+		"openai_device_id":                 "legacy-device",
+		"openai_session_id":                "legacy-session",
+		OpenAICodex429GuardEnabledExtraKey: true,
+		"keep":                             "value",
+	}
+	repo := newCRSLongContextAccountRepo(&Account{
+		ID:          41,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Credentials: map[string]any{"access_token": "old-token"},
+		Extra:       existingExtra,
+	})
+	result := runCRSOpenAILongContextSync(t, repo, crsOpenAILongContextSource{
+		collection:   "openaiResponsesAccounts",
+		credentials:  map[string]any{"api_key": "sk-test"},
+		existingType: AccountTypeOAuth,
+	})
+	require.Len(t, result.Items, 1)
+	require.Equal(t, "updated", result.Items[0].Action)
+	updated := repo.accounts[crsID]
+	require.Equal(t, AccountTypeAPIKey, updated.Type)
+	for _, key := range []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	} {
+		require.NotContains(t, updated.Extra, key)
+	}
+	require.Equal(t, "value", updated.Extra["keep"])
 }
 
 func runCRSOpenAILongContextSync(t *testing.T, repo AccountRepository, source crsOpenAILongContextSource) *SyncFromCRSResult {

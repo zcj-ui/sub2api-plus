@@ -5,6 +5,7 @@ interface AccountIDRow {
 interface AccountMetadataRow extends AccountIDRow {
   platform: string
   type: string
+  parent_account_id?: number | null
 }
 
 interface AccountListPage {
@@ -65,7 +66,7 @@ export async function fetchAccountSelectionMetadata(
   fetchPage: AccountMetadataPageFetcher,
   filters: Record<string, unknown>,
   selectedAccountIds?: number[]
-): Promise<{ platforms: string[]; types: string[] }> {
+): Promise<{ platforms: string[]; types: string[]; hasCredentialShadows: boolean }> {
   const requestFilters = {
     ...filters,
     lite: '1',
@@ -80,6 +81,7 @@ export async function fetchAccountSelectionMetadata(
   const seen = new Set<number>()
   const platforms = new Set<string>()
   const types = new Set<string>()
+  let hasCredentialShadows = false
 
   const collect = (items: AccountMetadataRow[]) => {
     for (const account of items) {
@@ -87,6 +89,7 @@ export async function fetchAccountSelectionMetadata(
       seen.add(account.id)
       platforms.add(account.platform)
       types.add(account.type)
+      hasCredentialShadows ||= account.parent_account_id != null
     }
   }
 
@@ -101,5 +104,5 @@ export async function fetchAccountSelectionMetadata(
   if (seen.size !== expected) {
     throw new Error('账号选择元数据不完整')
   }
-  return { platforms: [...platforms], types: [...types] }
+  return { platforms: [...platforms], types: [...types], hasCredentialShadows }
 }

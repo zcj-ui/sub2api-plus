@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -50,15 +52,6 @@ func createOpenAICompactProbePayload(model string, isOAuth bool) map[string]any 
 	}
 	if isOAuth {
 		payload["store"] = false
-		metadata, _ := json.Marshal(map[string]any{
-			"request_kind": "compaction",
-			"compaction": map[string]any{
-				"trigger": "manual", "reason": "user_requested",
-				"implementation": "responses_compaction_v2",
-				"phase":          "standalone_turn", "strategy": "memento",
-			},
-		})
-		payload["client_metadata"] = map[string]any{"x-codex-turn-metadata": string(metadata)}
 	}
 	return payload
 }
@@ -407,9 +400,14 @@ func mergeExtraUpdates(base map[string]any, more map[string]any) map[string]any 
 }
 
 func compactProbeSessionID(accountID int64) string {
-	seed := "anonymous"
-	if accountID > 0 {
-		seed = strconv.FormatInt(accountID, 10)
+	// A probe is an independent root turn. Use the same UUIDv7 shape as the
+	// official Codex client instead of deriving identity from the local account
+	// sequence (which collides across deployments). The argument is retained for
+	// source compatibility with older tests/callers.
+	_ = accountID
+	id, err := uuid.NewV7()
+	if err != nil {
+		return uuid.New().String()
 	}
-	return deriveStableUUIDv4("sub2api:codex-compact-probe:v1:" + seed)
+	return id.String()
 }

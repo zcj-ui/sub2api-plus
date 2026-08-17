@@ -35,6 +35,16 @@ func TestRunEntry_DelegatesRelay(t *testing.T) {
 	require.Equal(t, "resp_entry", result.RequestID)
 }
 
+func TestIsClientResponseCreateFrame_AcceptsTextAndBinaryJSON(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte(`{"type":"response.create","model":"gpt-5.6"}`)
+	require.True(t, isClientResponseCreateFrame(coderws.MessageText, payload))
+	require.True(t, isClientResponseCreateFrame(coderws.MessageBinary, payload))
+	require.False(t, isClientResponseCreateFrame(coderws.MessageText, []byte(`{"type":"session.update"}`)))
+	require.False(t, isClientResponseCreateFrame(coderws.MessageType(0), payload))
+}
+
 func TestRunClientToUpstream_ErrorPaths(t *testing.T) {
 	t.Parallel()
 
