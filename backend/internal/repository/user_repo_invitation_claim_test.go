@@ -49,7 +49,7 @@ func TestCreateWithEmailAliasGuardJoinsOuterTransaction(t *testing.T) {
 	suffix := time.Now().UnixNano()
 
 	t.Run("rollback", func(t *testing.T) {
-		codeID := seedCode(fmt.Sprintf("TX-INV-ROLLBACK-%d", suffix))
+		codeID := seedCode(fmt.Sprintf("R-%d", suffix))
 		tx, err := client.Tx(ctx)
 		require.NoError(t, err)
 		txCtx := dbent.NewTxContext(ctx, tx)
@@ -73,7 +73,7 @@ func TestCreateWithEmailAliasGuardJoinsOuterTransaction(t *testing.T) {
 	})
 
 	t.Run("commit", func(t *testing.T) {
-		codeID := seedCode(fmt.Sprintf("TX-INV-COMMIT-%d", suffix))
+		codeID := seedCode(fmt.Sprintf("C-%d", suffix))
 		tx, err := client.Tx(ctx)
 		require.NoError(t, err)
 		txCtx := dbent.NewTxContext(ctx, tx)
