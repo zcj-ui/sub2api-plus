@@ -1,9 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -84,6 +86,45 @@ type OpenAICodexCredits struct {
 	Unlimited           bool   `json:"unlimited"`
 	OverageLimitReached bool   `json:"overage_limit_reached"`
 	Balance             string `json:"balance"`
+}
+
+// UnmarshalJSON accepts both forms currently returned by /wham/usage for
+// credits.balance. Keeping Balance as a string preserves decimal precision for
+// the UI's Credit / 25 reference conversion and avoids a float round trip.
+func (c *OpenAICodexCredits) UnmarshalJSON(data []byte) error {
+	if c == nil {
+		return fmt.Errorf("unmarshal OpenAI Codex credits into nil receiver")
+	}
+
+	type creditsPayload struct {
+		HasCredits          bool            `json:"has_credits"`
+		Unlimited           bool            `json:"unlimited"`
+		OverageLimitReached bool            `json:"overage_limit_reached"`
+		Balance             json.RawMessage `json:"balance"`
+	}
+	var payload creditsPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+
+	c.HasCredits = payload.HasCredits
+	c.Unlimited = payload.Unlimited
+	c.OverageLimitReached = payload.OverageLimitReached
+	c.Balance = ""
+	rawBalance := bytes.TrimSpace(payload.Balance)
+	if len(rawBalance) == 0 || bytes.Equal(rawBalance, []byte("null")) {
+		return nil
+	}
+	if rawBalance[0] == '"' {
+		return json.Unmarshal(rawBalance, &c.Balance)
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(rawBalance, &number); err != nil {
+		return fmt.Errorf("decode credits.balance: %w", err)
+	}
+	c.Balance = number.String()
+	return nil
 }
 
 // OpenAICodexCreditSnapshot is persisted in account.extra after a successful

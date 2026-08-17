@@ -14,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 // --- mock: 只记录临时不可调度写入，其余方法不应被调用 ---
@@ -94,11 +95,85 @@ func TestOpenAIStreamErrorFrameDoesNotStartClientOutput(t *testing.T) {
 		{`{"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}`, "response.failed", false},
 		{`{"type":"response.created","response":{"id":"resp_1"}}`, "response.created", false},
 		{`{"type":"response.in_progress","response":{"id":"resp_1"}}`, "response.in_progress", false},
+		{`{"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`, "response.output_item.added", false},
+		{`{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"ciphertext"}}`, "response.output_item.added", true},
+		{`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`, "response.reasoning_summary_part.added", false},
+		{`{"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":"thinking"}}`, "response.reasoning_summary_part.added", true},
+		{`{"type":"response.content_part.added","part":{"type":"output_text","text":""}}`, "response.content_part.added", false},
 		{`{"type":"response.output_text.delta","delta":"hi"}`, "response.output_text.delta", true},
 		{`[DONE]`, "", true},
 	}
 	for _, tc := range cases {
 		require.Equal(t, tc.want, openAIStreamDataStartsClientOutput(tc.data, tc.eventType), "data=%s type=%s", tc.data, tc.eventType)
+	}
+}
+
+func TestOpenAIStreamFailureStatusRecognizesExplicit429TransportText(t *testing.T) {
+	require.Equal(t, http.StatusTooManyRequests, openAIStreamFailureStatus(
+		[]byte(`{"type":"error","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests"}}`),
+		"exceeded retry limit, last status: 429 Too Many Requests",
+	))
+}
+
+func TestOpenAIStreamFailoverErrorMarksMessageOnlyCapacityAsRequestScoped(t *testing.T) {
+	account := &Account{ID: 77, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	err := (&OpenAIGatewayService{}).newOpenAIStreamFailoverError(
+		nil,
+		account,
+		false,
+		"rid-capacity-message-only",
+		nil,
+		"Selected model is at capacity. Please try a different model.",
+	)
+	require.True(t, err.RetryableOnSameAccount)
+	require.True(t, err.RequestScopedTransient)
+}
+
+func TestOpenAIStreamMetadataPreambleAndMessageOnlyOverloadFailOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	largeMetadata := strings.Repeat("x", 16*1024)
+	stream := strings.Join([]string{
+		"event: response.created",
+		`data: {"type":"response.created","response":{"id":"resp_1","metadata":{"padding":"` + largeMetadata + `"}}}`,
+		"",
+		"event: response.output_item.added",
+		`data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`,
+		"",
+		"event: response.reasoning_summary_part.added",
+		`data: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}`,
+		"",
+		"event: error",
+		`data: {"type":"error","error":{"type":"service_unavailable_error","message":"Our servers are currently overloaded. Please try again later."}}`,
+		"",
+	}, "\n")
+
+	for _, passthrough := range []bool{false, true} {
+		name := "native"
+		if passthrough {
+			name = "passthrough"
+		}
+		t.Run(name, func(t *testing.T) {
+			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Header: http.Header{"X-Request-Id": []string{"rid-message-only-overload"}}}
+			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Name: "acc"}
+
+			var err error
+			if passthrough {
+				_, err = svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+			} else {
+				_, err = svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+			}
+			require.Error(t, err)
+			var failoverErr *UpstreamFailoverError
+			require.ErrorAs(t, err, &failoverErr)
+			require.True(t, failoverErr.RetryableOnSameAccount)
+			require.True(t, failoverErr.RequestScopedTransient)
+			require.False(t, c.Writer.Written())
+			require.Empty(t, rec.Body.String())
+		})
 	}
 }
 
@@ -245,6 +320,18 @@ func TestSanitizeOpenAICapacityShedErrorCodeForClient(t *testing.T) {
 
 // 出站身份的版本声明只能有一个来源：UA 的版本段、version 头、探针版本三处必须同源，
 // 各自硬编码会漂移成互相矛盾的身份，而自相矛盾或陈旧的身份会被上游优先降载。
+func TestSanitizeOpenAICapacityShedErrorCodeMissingCode(t *testing.T) {
+	ordinary := []byte(`{"type":"response.failed","response":{"error":{"message":"boom"}}}`)
+	out, changed := sanitizeOpenAICapacityShedErrorCodeForClient(ordinary)
+	require.False(t, changed)
+	require.JSONEq(t, string(ordinary), string(out))
+
+	capacity := []byte(`{"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded. Please try again later."}}}`)
+	out, changed = sanitizeOpenAICapacityShedErrorCodeForClient(capacity)
+	require.True(t, changed)
+	require.Equal(t, "server_error", gjson.GetBytes(out, "response.error.code").String())
+}
+
 func TestCodexOutboundVersionHasSingleSource(t *testing.T) {
 	require.True(t,
 		strings.HasPrefix(codexCLIUserAgent, openai.CodexDefaultOriginator+"/"+codexCLIVersion+" "),

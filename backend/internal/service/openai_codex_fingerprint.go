@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -70,7 +71,109 @@ const (
 
 const (
 	codexFingerprintModeExtraKey = "codex_fingerprint_mode"
+	// codexFingerprintSeedExtraKey is generated once for newly-created OAuth
+	// accounts. It is deliberately kept in account extra so imports/backups keep
+	// the same account identity without exposing a deployment secret.
+	codexFingerprintSeedExtraKey = "codex_fingerprint_seed"
 )
+
+// codexFingerprintDeploymentSeed is retained for source compatibility with
+// callers that still pass the deployment secret. Persisted account seeds are
+// deliberately independent of it: restoring an account database must preserve
+// the same Codex identity, while random per-account seeds already prevent
+// collisions between independent deployments.
+func codexFingerprintDeploymentSeed(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.JWT.Secret)
+}
+
+func codexFingerprintSeed(account *Account) string {
+	if account == nil {
+		return ""
+	}
+	if seed := account.getCodexFingerprintSeed(); seed != "" {
+		return "extra:" + seed
+	}
+	return ""
+}
+
+func codexFingerprintDerivationSeed(account *Account, purpose, deploymentSeed string, extra ...string) string {
+	identity := codexFingerprintSeed(account)
+	if identity == "" {
+		return ""
+	}
+	if len(extra) > 0 {
+		identity += "\x00" + strings.Join(extra, "\x00")
+	}
+	label := "sub2api:codex-fingerprint:v2:" + purpose + "\x00" + identity
+	// Keep the variadic deploymentSeed parameter for old call sites, but do not
+	// mix it into persisted identities (see codexFingerprintDeploymentSeed).
+	_ = deploymentSeed
+	return label
+}
+
+func (a *Account) getCodexFingerprintSeed() string {
+	if a == nil || !a.IsOpenAIOAuth() {
+		return ""
+	}
+	seed := strings.TrimSpace(a.GetExtraString(codexFingerprintSeedExtraKey))
+	if _, err := uuid.Parse(seed); err != nil {
+		return ""
+	}
+	return seed
+}
+
+func codexFingerprintModeEnabledExtra(extra map[string]any) bool {
+	if extra == nil {
+		return false
+	}
+	mode, _ := extra[codexFingerprintModeExtraKey].(string)
+	switch codexFingerprintMode(strings.ToLower(strings.TrimSpace(mode))) {
+	case codexFingerprintDevice, codexFingerprintSession, codexFingerprintFull:
+		return true
+	default:
+		return false
+	}
+}
+
+// ensureCodexFingerprintSeed adds an opaque random seed only when convergence
+// is explicitly enabled. Existing extra values are preserved and callers
+// receive their original map when no change is needed.
+func ensureCodexFingerprintSeed(platform, accountType string, extra map[string]any) map[string]any {
+	if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
+		return extra
+	}
+	if !codexFingerprintModeEnabledExtra(extra) {
+		return extra
+	}
+	if seed := strings.TrimSpace(extraStringValue(extra, codexFingerprintSeedExtraKey)); seed != "" {
+		if _, err := uuid.Parse(seed); err == nil {
+			return extra
+		}
+	}
+	out := make(map[string]any, len(extra)+1)
+	for key, value := range extra {
+		out[key] = value
+	}
+	out[codexFingerprintSeedExtraKey] = uuid.NewString()
+	return out
+}
+
+func extraStringValue(extra map[string]any, key string) string {
+	if extra == nil {
+		return ""
+	}
+	switch value := extra[key].(type) {
+	case string:
+		return value
+	case fmt.Stringer:
+		return value.String()
+	default:
+		return ""
+	}
+}
 
 // GetCodexFingerprintMode 从账号 extra JSON 读取指纹收敛模式。
 //
@@ -112,29 +215,36 @@ func deriveStableUUIDv4(seed string) string {
 }
 
 // resolveConvergedInstallationID 返回账号级恒定的 installation_id。
-// 优先使用管理员配置的真实 device_id，无则从 accountID 确定性派生。
-func resolveConvergedInstallationID(account *Account) string {
+// 优先使用管理员配置的真实 device_id，无则使用持久化的随机种子。
+func resolveConvergedInstallationID(account *Account, deploymentSeed ...string) string {
 	if account == nil {
 		return ""
 	}
 	if deviceID := account.GetOpenAIDeviceID(); deviceID != "" {
 		return deviceID
 	}
-	return deriveStableUUIDv4(fmt.Sprintf("sub2api:codex-install-id:v1:%d", account.ID))
+	// installation_id is itself the persisted identity. Hashing it again
+	// changes the client-visible value and diverges from the official Codex
+	// seed persistence contract.
+	return account.getCodexFingerprintSeed()
 }
 
 // resolveConvergedSessionID returns the account-wide session used only by full
 // convergence mode.
-func resolveConvergedSessionID(account *Account) string {
+func resolveConvergedSessionID(account *Account, deploymentSeed ...string) string {
 	if account == nil {
 		return ""
 	}
-	return deriveStableUUIDv4(fmt.Sprintf("sub2api:codex-session-id:v1:%d", account.ID))
+	seed := codexFingerprintDerivationSeed(account, "session", firstCodexFingerprintSeed(deploymentSeed))
+	if seed == "" {
+		return ""
+	}
+	return deriveStableUUIDv4(seed)
 }
 
 // resolveCodexConversationSessionID derives a stable upstream session for one
 // client conversation while keeping different conversations isolated.
-func resolveCodexConversationSessionID(account *Account, clientSessionSeed string) string {
+func resolveCodexConversationSessionID(account *Account, clientSessionSeed string, deploymentSeed ...string) string {
 	if account == nil {
 		return ""
 	}
@@ -142,17 +252,32 @@ func resolveCodexConversationSessionID(account *Account, clientSessionSeed strin
 	if clientSessionSeed == "" {
 		clientSessionSeed = "default"
 	}
-	return deriveStableUUIDv4(fmt.Sprintf("sub2api:codex-conversation-session:v1:%d:%s", account.ID, clientSessionSeed))
+	seed := codexFingerprintDerivationSeed(account, "conversation-session", firstCodexFingerprintSeed(deploymentSeed), clientSessionSeed)
+	if seed == "" {
+		return ""
+	}
+	return deriveStableUUIDv4(seed)
 }
 
 // resolveConvergedThreadID 按客户端原始 session-id 确定性派生 thread_id。
 // 每个真实 Codex 会话（不同客户端启动实例）获得一个独立线程，
 // 模拟正常用户 spawn 子代理或开多窗口的模式。
-func resolveConvergedThreadID(account *Account, clientSessionID string) string {
+func resolveConvergedThreadID(account *Account, clientSessionID string, deploymentSeed ...string) string {
 	if account == nil || clientSessionID == "" {
 		return ""
 	}
-	return deriveStableUUIDv4(fmt.Sprintf("sub2api:codex-thread-id:v1:%d:%s", account.ID, clientSessionID))
+	seed := codexFingerprintDerivationSeed(account, "thread", firstCodexFingerprintSeed(deploymentSeed), clientSessionID)
+	if seed == "" {
+		return ""
+	}
+	return deriveStableUUIDv4(seed)
+}
+
+func firstCodexFingerprintSeed(seeds []string) string {
+	if len(seeds) == 0 {
+		return ""
+	}
+	return seeds[0]
 }
 
 // codexFingerprintIDs 收敛后的完整 ID 集合。
@@ -172,14 +297,14 @@ type codexFingerprintIDs struct {
 // 的 thread_id 派生——每个真实 Codex 会话得到一个独立线程。
 // 返回 nil 表示 off 模式，不需要改写。
 // 注意：包含随机生成的 turn_id，调用方必须只调用一次并共享结果给头改写和体改写。
-func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode codexFingerprintMode) *codexFingerprintIDs {
+func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode codexFingerprintMode, deploymentSeed ...string) *codexFingerprintIDs {
 	if mode == codexFingerprintOff {
 		return nil
 	}
 
 	ids := &codexFingerprintIDs{mode: mode}
 
-	ids.installationID = resolveConvergedInstallationID(account)
+	ids.installationID = resolveConvergedInstallationID(account, firstCodexFingerprintSeed(deploymentSeed))
 	if ids.installationID == "" {
 		return nil
 	}
@@ -189,8 +314,9 @@ func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode c
 		return ids
 
 	case codexFingerprintSession:
-		ids.sessionID = resolveCodexConversationSessionID(account, clientSessionID)
-		ids.threadID = resolveConvergedThreadID(account, clientSessionID)
+		seed := firstCodexFingerprintSeed(deploymentSeed)
+		ids.sessionID = resolveCodexConversationSessionID(account, clientSessionID, seed)
+		ids.threadID = resolveConvergedThreadID(account, clientSessionID, seed)
 		if ids.threadID == "" {
 			ids.threadID = ids.sessionID
 		}
@@ -199,7 +325,7 @@ func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode c
 		return ids
 
 	case codexFingerprintFull:
-		ids.sessionID = resolveConvergedSessionID(account)
+		ids.sessionID = resolveConvergedSessionID(account, firstCodexFingerprintSeed(deploymentSeed))
 		ids.threadID = ids.sessionID
 		ids.turnID = uuid.Must(uuid.NewV7()).String()
 		ids.windowID = ids.threadID + ":0"
@@ -259,7 +385,7 @@ func resolveCodexConversationSeed(clientHeaders http.Header, body []byte, apiKey
 // resolveCodexFingerprintIDsFromRequest 从客户端原始请求头中提取 session-id，
 // 结合账号配置一次性解析收敛 ID 集合。调用方应将返回的 ids 同时传给
 // applyCodexFingerprintHeaders 和 applyCodexFingerprintClientMetadata。
-func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.Header) *codexFingerprintIDs {
+func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.Header, deploymentSeed ...string) *codexFingerprintIDs {
 	if account == nil {
 		return nil
 	}
@@ -271,10 +397,10 @@ func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.
 	if clientHeaders != nil {
 		clientSessionID = extractClientSessionID(clientHeaders)
 	}
-	return resolveCodexFingerprintIDs(account, clientSessionID, mode)
+	return resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
 }
 
-func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.Header, body []byte, apiKeyID int64) *codexFingerprintIDs {
+func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.Header, body []byte, apiKeyID int64, deploymentSeed ...string) *codexFingerprintIDs {
 	if account == nil {
 		return nil
 	}
@@ -283,7 +409,7 @@ func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.H
 		return nil
 	}
 	clientSessionID := resolveCodexConversationSeed(clientHeaders, body, apiKeyID)
-	return resolveCodexFingerprintIDs(account, clientSessionID, mode)
+	return resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
 }
 
 // applyCodexFingerprintHeaders 按预计算的收敛 ID 改写出站 HTTP 头中的设备指纹。
@@ -388,10 +514,28 @@ func applyCodexFingerprintClientMetadata(reqBody map[string]any, ids *codexFinge
 		existing = make(map[string]any)
 	}
 
-	if !applyCodexFingerprintToClientMetadataMap(existing, ids) {
+	modified := applyCodexFingerprintToClientMetadataMap(existing, ids)
+	reqBody["client_metadata"] = existing
+	if rewriteCodexPromptCacheKey(reqBody, ids) {
+		modified = true
+	}
+	return modified
+}
+
+// rewriteCodexPromptCacheKey keeps the Responses body cache key aligned with
+// the converged session header. Codex emits these as one conversation identity;
+// leaving the client key untouched would split cache affinity after convergence.
+func rewriteCodexPromptCacheKey(reqBody map[string]any, ids *codexFingerprintIDs) bool {
+	if reqBody == nil || ids == nil ||
+		(ids.mode != codexFingerprintSession && ids.mode != codexFingerprintFull) ||
+		strings.TrimSpace(ids.sessionID) == "" {
 		return false
 	}
-	reqBody["client_metadata"] = existing
+	current, ok := reqBody["prompt_cache_key"].(string)
+	if !ok || strings.TrimSpace(current) == "" || current == ids.sessionID {
+		return false
+	}
+	reqBody["prompt_cache_key"] = ids.sessionID
 	return true
 }
 
@@ -468,6 +612,15 @@ func applyCodexFingerprintClientMetadataRaw(body []byte, ids *codexFingerprintID
 	next, err := sjson.SetRawBytes(body, "client_metadata", raw)
 	if err != nil {
 		return body, false, fmt.Errorf("splice converged client_metadata: %w", err)
+	}
+	if ids.mode == codexFingerprintSession || ids.mode == codexFingerprintFull {
+		if current := strings.TrimSpace(gjson.GetBytes(next, "prompt_cache_key").String()); current != "" && current != ids.sessionID {
+			updated, setErr := sjson.SetBytes(next, "prompt_cache_key", ids.sessionID)
+			if setErr != nil {
+				return body, false, fmt.Errorf("splice converged prompt_cache_key: %w", setErr)
+			}
+			next = updated
+		}
 	}
 	return next, true, nil
 }

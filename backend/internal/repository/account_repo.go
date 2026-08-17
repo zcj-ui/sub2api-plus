@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -67,6 +68,70 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"codex_usage_updated_at":     {},
 	"grok_billing_snapshot":      {},
 	"session_window_utilization": {},
+}
+
+type compactProbeExtraUpdateGroup struct {
+	observedAt int64
+	updates    map[string]any
+}
+
+func compactProbeSnapshotExtraKey(key string) bool {
+	switch key {
+	case service.OpenAICompactProbeObservedAtUnixNanoExtraKey,
+		"openai_compact_supported",
+		"openai_compact_probe_version",
+		"openai_compact_checked_at",
+		"openai_compact_last_status",
+		"openai_compact_last_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactProbeObservedAt(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, typed > 0
+	case int:
+		return int64(typed), typed > 0
+	case float64:
+		return int64(typed), typed > 0 && typed == float64(int64(typed))
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func partitionCompactProbeExtraUpdates(updates map[string]any) (map[string]any, *compactProbeExtraUpdateGroup) {
+	common := make(map[string]any, len(updates))
+	observedAt, ok := compactProbeObservedAt(updates[service.OpenAICompactProbeObservedAtUnixNanoExtraKey])
+	if !ok {
+		for key, value := range updates {
+			common[key] = value
+		}
+		return common, nil
+	}
+	group := &compactProbeExtraUpdateGroup{observedAt: observedAt, updates: make(map[string]any)}
+	for key, value := range updates {
+		if compactProbeSnapshotExtraKey(key) {
+			group.updates[key] = value
+		} else {
+			common[key] = value
+		}
+	}
+	return common, group
+}
+
+func compactProbeExtraDeleteKeys(updates map[string]any) []string {
+	keys := make([]string, 0, 1)
+	if value, exists := updates["openai_compact_supported"]; exists && value == nil {
+		keys = append(keys, "openai_compact_supported")
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 const postgresParameterBatchSize = 50000
@@ -2524,8 +2589,11 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		return nil
 	}
 
-	// 使用 JSONB 合并操作实现原子更新，避免读-改-写的并发丢失更新问题
-	payload, err := json.Marshal(updates)
+	// Compact capability observations may complete out of order. Keep the
+	// snapshot fields together and apply them only when their observation time
+	// is newer than the stored snapshot. Unrelated fields remain independent.
+	commonUpdates, compactProbeGroup := partitionCompactProbeExtraUpdates(updates)
+	payload, err := json.Marshal(commonUpdates)
 	if err != nil {
 		return err
 	}
@@ -2552,10 +2620,34 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if clearProbeSnapshot {
 		extraExpression = "(" + extraExpression + ") - 'upstream_billing_probe'"
 	}
+	args := []any{string(payload), id}
+	if deleteKeys := compactProbeExtraDeleteKeys(commonUpdates); len(deleteKeys) > 0 {
+		extraExpression = "(" + extraExpression + ") - $3::text[]"
+		args = append(args, pq.Array(deleteKeys))
+	}
+	if compactProbeGroup != nil {
+		previousExpression := extraExpression
+		observedAtParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, compactProbeGroup.observedAt)
+		groupPayload, marshalErr := json.Marshal(compactProbeGroup.updates)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		payloadParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, string(groupPayload))
+		candidateExpression := "(" + previousExpression + " || " + payloadParam + "::jsonb)"
+		if deleteKeys := compactProbeExtraDeleteKeys(compactProbeGroup.updates); len(deleteKeys) > 0 {
+			deleteParam := "$" + strconv.Itoa(len(args)+1)
+			args = append(args, pq.Array(deleteKeys))
+			candidateExpression = "(" + candidateExpression + ") - " + deleteParam + "::text[]"
+		}
+		storedObservedAt := "COALESCE(CASE WHEN jsonb_typeof(COALESCE(extra, '{}'::jsonb)->'" + service.OpenAICompactProbeObservedAtUnixNanoExtraKey + "') = 'number' THEN (extra->>'" + service.OpenAICompactProbeObservedAtUnixNanoExtraKey + "')::numeric END, 0)"
+		extraExpression = "CASE WHEN " + storedObservedAt + " <= " + observedAtParam + "::numeric THEN " + candidateExpression + " ELSE " + previousExpression + " END"
+	}
 	result, err := client.ExecContext(
 		ctx,
 		"UPDATE accounts SET extra = "+extraExpression+", updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL",
-		string(payload), id,
+		args...,
 	)
 
 	if err != nil {

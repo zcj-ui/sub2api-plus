@@ -257,6 +257,24 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		if errors.As(err, &dialErr) && dialErr != nil && dialErr.StatusCode == http.StatusTooManyRequests {
 			s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
 		}
+		// A confirmed 429 guard deliberately keeps a healthy old socket alive.
+		// Once that exact pinned socket cannot be acquired, however, it is no
+		// longer a valid continuation and retrying the same account only burns the
+		// request-local WS retry budget. Remove its stale bindings and let the
+		// handler immediately select another account.
+		if forcePreferredConn && isOpenAIWS429GuardSwitchableAcquireError(err) {
+			s.clearOpenAIWSContinuationBindings(ctx, groupID, sessionHash, account.ID, previousResponseID, preferredConnID)
+			return nil, newOpenAIUpstreamFailoverError(
+				http.StatusBadGateway,
+				http.Header{},
+				nil,
+				"Codex 429 guard connection became unavailable: "+sanitizeUpstreamErrorMessage(err.Error()),
+				false,
+			)
+		}
+		// A preferred guard socket can be temporarily occupied or queued. Those
+		// conditions are not proof that the old connection failed; retain the
+		// binding so the next request still targets the same healthy socket.
 		return nil, wrapOpenAIWSFallback(classifyOpenAIWSAcquireError(err), err)
 	}
 	// cleanExit 标记正常终端事件退出，此时上游不会再发送帧，连接可安全归还复用。

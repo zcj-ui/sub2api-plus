@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -14,6 +15,12 @@ import (
 )
 
 func newTestOAuthAccount(id int64, extra map[string]any) *Account {
+	if extra == nil {
+		extra = make(map[string]any)
+	}
+	if strings.TrimSpace(extraStringValue(extra, codexFingerprintSeedExtraKey)) == "" {
+		extra[codexFingerprintSeedExtraKey] = "11111111-1111-4111-8111-111111111111"
+	}
 	return &Account{
 		ID:       id,
 		Platform: PlatformOpenAI,
@@ -78,18 +85,83 @@ func TestResolveConvergedInstallationID_UsesDeviceID(t *testing.T) {
 	assert.Equal(t, "real-device-id", resolveConvergedInstallationID(account))
 }
 
-func TestResolveConvergedInstallationID_DerivesFromAccountID(t *testing.T) {
-	account := newTestOAuthAccount(42, nil)
+func TestResolveConvergedInstallationID_UsesPersistedSeed(t *testing.T) {
+	account := newTestOAuthAccount(42, map[string]any{
+		codexFingerprintModeExtraKey: "device",
+		codexFingerprintSeedExtraKey: "22222222-2222-4222-8222-222222222222",
+	})
 	result := resolveConvergedInstallationID(account)
+	assert.Equal(t, "22222222-2222-4222-8222-222222222222", result)
 	_, err := uuid.Parse(result)
 	require.NoError(t, err, "派生值应为合法 UUID")
 	assert.Equal(t, result, resolveConvergedInstallationID(account), "确定性")
 }
 
-func TestResolveConvergedInstallationID_DifferentAccounts(t *testing.T) {
-	a := resolveConvergedInstallationID(newTestOAuthAccount(1, nil))
-	b := resolveConvergedInstallationID(newTestOAuthAccount(2, nil))
+func TestResolveConvergedInstallationID_DifferentSeedsWithSameLocalID(t *testing.T) {
+	a := resolveConvergedInstallationID(newTestOAuthAccount(1, map[string]any{
+		codexFingerprintModeExtraKey: "device",
+		codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
+	}))
+	b := resolveConvergedInstallationID(newTestOAuthAccount(1, map[string]any{
+		codexFingerprintModeExtraKey: "device",
+		codexFingerprintSeedExtraKey: "22222222-2222-4222-8222-222222222222",
+	}))
 	assert.NotEqual(t, a, b)
+}
+
+func TestResolveConvergedInstallationID_DoesNotFallbackToLocalID(t *testing.T) {
+	account := &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Extra: map[string]any{codexFingerprintModeExtraKey: "device"}}
+	assert.Empty(t, resolveConvergedInstallationID(account))
+}
+
+func TestResolveCodexFingerprintIDs_DeploymentNamespaceSeparatesInstances(t *testing.T) {
+	accountA := newTestOAuthAccount(1, map[string]any{
+		"chatgpt_account_id":         "chatgpt-a",
+		codexFingerprintModeExtraKey: "full",
+	})
+	accountB := newTestOAuthAccount(1, map[string]any{
+		"chatgpt_account_id":         "chatgpt-a",
+		codexFingerprintModeExtraKey: "full",
+	})
+	one := resolveCodexFingerprintIDs(accountA, "client", codexFingerprintFull, "deployment-a")
+	two := resolveCodexFingerprintIDs(accountB, "client", codexFingerprintFull, "deployment-b")
+	require.NotNil(t, one)
+	require.NotNil(t, two)
+	assert.Equal(t, one.installationID, two.installationID)
+	assert.Equal(t, one.sessionID, two.sessionID)
+	assert.Equal(t, one.sessionID, resolveCodexFingerprintIDs(accountA, "client", codexFingerprintFull, "deployment-a").sessionID)
+}
+
+func TestEnsureCodexFingerprintSeed_GeneratesOnlyForOpenAIOAuth(t *testing.T) {
+	extra := map[string]any{codexFingerprintModeExtraKey: "session", "keep": "value"}
+	seeded := ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeOAuth, extra)
+	require.NotEmpty(t, seeded[codexFingerprintSeedExtraKey])
+	assert.Equal(t, "value", seeded["keep"])
+	assert.Empty(t, extra[codexFingerprintSeedExtraKey], "caller map is not mutated")
+	assert.Equal(t, seeded, ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeOAuth, seeded))
+	assert.Nil(t, ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeAPIKey, nil))
+}
+
+func TestEnsureCodexFingerprintSeed_ReplacesInvalidSeed(t *testing.T) {
+	extra := map[string]any{
+		codexFingerprintModeExtraKey: "session",
+		codexFingerprintSeedExtraKey: "not-a-uuid",
+	}
+	seeded := ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeOAuth, extra)
+	seed, ok := seeded[codexFingerprintSeedExtraKey].(string)
+	require.True(t, ok)
+	require.NotEqual(t, "not-a-uuid", seed)
+	_, err := uuid.Parse(seed)
+	require.NoError(t, err)
+	require.Equal(t, "not-a-uuid", extra[codexFingerprintSeedExtraKey])
+}
+
+func TestEnsureCodexFingerprintSeed_LeavesOptOutAccountUnchanged(t *testing.T) {
+	extra := map[string]any{"keep": "value"}
+	got := ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeOAuth, extra)
+	assert.Equal(t, extra, got)
+	assert.Empty(t, got[codexFingerprintSeedExtraKey])
 }
 
 // --- resolveConvergedThreadID ---
@@ -583,7 +655,7 @@ func TestApplyCodexFingerprintClientMetadataRaw_PreservesUnrelatedFields(t *test
 	var decoded map[string]any
 	require.NoError(t, json.Unmarshal(out, &decoded))
 	assert.Equal(t, "gpt-5.6-sol", decoded["model"])
-	assert.Equal(t, "pck-1", decoded["prompt_cache_key"])
+	assert.Equal(t, ids.sessionID, decoded["prompt_cache_key"], "session/full convergence must keep body cache key aligned with session_id")
 	assert.Equal(t, true, decoded["stream"])
 	cm, _ := decoded["client_metadata"].(map[string]any)
 	require.NotNil(t, cm)

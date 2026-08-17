@@ -271,6 +271,122 @@ func TestOpenAIGatewayService_ForwardWSv2Confirmed429StatusOnlyKeepsLease(t *tes
 	require.Len(t, captureConn.writes, 2)
 }
 
+func TestOpenAIGatewayService_ForwardWSv2GuardAcquireQueueFullKeepsBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_queue_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          5041,
+		Name:        "openai-codex-429-queue-full",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	openAITestAccountWithProxy(account)
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	invoke := func(body map[string]any) (*OpenAIForwardResult, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		recoveryTried := false
+		return svc.forwardOpenAIWSV2(
+			context.Background(),
+			c,
+			account,
+			body,
+			"access-token",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			true,
+			false,
+			"gpt-5.1",
+			"gpt-5.1",
+			time.Now(),
+			1,
+			"",
+			&recoveryTried,
+		)
+	}
+
+	seed, err := invoke(map[string]any{
+		"model":  "gpt-5.1",
+		"stream": false,
+		"input":  []any{map[string]any{"type": "input_text", "text": "seed"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, seed)
+	store := svc.getOpenAIWSStateStore()
+	connID, ok := store.GetResponseConn(seed.RequestID)
+	require.True(t, ok)
+	require.NotEmpty(t, connID)
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	snapshot := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, snapshot.Active)
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, connID, snapshot.Generation))
+	require.True(t, svc.pinOpenAI429GuardConnection(account, connID))
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	guardConn := ap.conns[connID]
+	ap.mu.Unlock()
+	require.NotNil(t, guardConn)
+	require.True(t, guardConn.tryAcquire(), "hold the guarded socket so Acquire returns queue-full")
+	guardConn.waiters.Store(1)
+	defer func() {
+		guardConn.waiters.Store(0)
+		guardConn.release()
+	}()
+
+	result, err := invoke(map[string]any{
+		"model":                "gpt-5.1",
+		"stream":               false,
+		"previous_response_id": seed.RequestID,
+		"input":                []any{map[string]any{"type": "input_text", "text": "next"}},
+	})
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.NotErrorAs(t, err, &failoverErr, "a busy guard socket is not a connection failure")
+
+	boundAccountID, getErr := store.GetResponseAccount(context.Background(), 0, seed.RequestID)
+	require.NoError(t, getErr)
+	require.Equal(t, account.ID, boundAccountID)
+	boundConnID, stillBound := store.GetResponseConn(seed.RequestID)
+	require.True(t, stillBound)
+	require.Equal(t, connID, boundConnID)
+	require.True(t, pool.IsGuardConnPinned(account.ID, connID), "queue-full must not release a healthy guard pin")
+}
+
 func TestOpenAIGatewayService_Forward_WSv2Handshake429PersistsRateLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

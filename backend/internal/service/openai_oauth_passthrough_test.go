@@ -78,6 +78,7 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 		Extra: map[string]any{
 			"openai_device_id":           "device-901",
 			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
 		},
 	}
 	ids := resolveCodexFingerprintIDsForRequest(account, c.Request.Header, body, 0)
@@ -702,9 +703,10 @@ func TestOpenAIGatewayService_OAuthPassthrough_NamespaceNonStreamingResponse(t *
 		"collaboration__spawn_agent": {Namespace: "collaboration", Name: "spawn_agent"},
 	}
 	setOpenAIResponsesNamespaceNames(c, names)
+	account := &Account{ID: 124, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 
 	result, err := (&OpenAIGatewayService{cfg: &config.Config{}}).handleNonStreamingResponsePassthrough(
-		context.Background(), resp, c, "gpt-5.5", "",
+		context.Background(), resp, c, account, "gpt-5.5", "",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, result)

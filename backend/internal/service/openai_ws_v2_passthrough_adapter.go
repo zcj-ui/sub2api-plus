@@ -767,7 +767,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
-		codexFPIDs = resolveCodexFingerprintIDsForRequest(account, clientHeaders, firstClientMessage, getAPIKeyIDFromContext(c))
+		codexFPIDs = resolveCodexFingerprintIDsForRequest(account, clientHeaders, firstClientMessage, getAPIKeyIDFromContext(c), codexFingerprintDeploymentSeed(s.cfg))
 		if nextMessage, changed := applyCodexFingerprintToBodyBytes(firstClientMessage, codexFPIDs); changed {
 			firstClientMessage = nextMessage
 		}

@@ -256,11 +256,11 @@ func TestEnsureOpenAIRemoteCompactionV2BetaFeature(t *testing.T) {
 		require.Equal(t, "remote_compaction_v2", h.Get("x-codex-beta-features"))
 	})
 
-	t.Run("present_unchanged", func(t *testing.T) {
+	t.Run("present_is_canonicalized_without_duplication", func(t *testing.T) {
 		h := http.Header{}
 		h.Set("x-codex-beta-features", "responses_websockets_v2, remote_compaction_v2")
 		ensureOpenAIRemoteCompactionV2BetaFeature(h)
-		require.Equal(t, "responses_websockets_v2, remote_compaction_v2", h.Get("x-codex-beta-features"))
+		require.Equal(t, "responses_websockets_v2,remote_compaction_v2", h.Get("x-codex-beta-features"))
 	})
 
 	t.Run("other_tokens_merged", func(t *testing.T) {

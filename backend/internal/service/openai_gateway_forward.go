@@ -437,7 +437,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				clientHeaders = c.Request.Header
 			}
 			identityBody, _ := marshalOpenAIUpstreamJSON(decoded)
-			fpIDs := resolveCodexFingerprintIDsForRequest(account, clientHeaders, identityBody, apiKeyID)
+			fpIDs := resolveCodexFingerprintIDsForRequest(account, clientHeaders, identityBody, apiKeyID, codexFingerprintDeploymentSeed(s.cfg))
 			if fpIDs != nil {
 				if applyCodexFingerprintClientMetadata(decoded, fpIDs) {
 					markDecodedModified()
@@ -828,6 +828,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
+	oauth401RetryTried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := newOpenAIResponsesRejectedFieldRetryState(body)
 	for {
@@ -899,6 +900,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 			upstreamCode := extractUpstreamErrorCode(respBody)
+			if !oauth401RetryTried && resp.StatusCode == http.StatusUnauthorized && account.IsOpenAIOAuth() && s.openAITokenProvider != nil {
+				oauth401RetryTried = true
+				refreshedToken, refreshErr := s.openAITokenProvider.ForceRefresh(ctx, account)
+				if refreshErr == nil && strings.TrimSpace(refreshedToken) != "" {
+					token = refreshedToken
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying request once after OAuth 401 token refresh (account: %s)", account.Name)
+					continue
+				}
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] OAuth 401 refresh failed (account: %s): %v", account.Name, refreshErr)
+			}
 			if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, respBody) {
 				agentTaskRecoveryTried = true
 				expectedTaskID := account.GetCredential("task_id")

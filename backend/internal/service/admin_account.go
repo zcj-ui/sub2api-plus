@@ -17,6 +17,7 @@ import (
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"github.com/google/uuid"
 )
 
 // Account management implementations
@@ -98,6 +99,45 @@ func (s *adminServiceImpl) invalidateOpenAIWSConnectionsForCredentialFamily(ctx 
 	}
 }
 
+// openAIExtraRequiresWSInvalidation identifies account-level settings that are
+// captured at WebSocket handshake or affect the request representation sent on
+// a reused socket. Leaving a live pool entry in place after one of these fields
+// changes can mix an old Codex identity, compact mode, or routing policy into a
+// later request.
+func openAIExtraRequiresWSInvalidation(extra map[string]any) bool {
+	if len(extra) == 0 {
+		return false
+	}
+	for _, key := range []string{
+		OpenAICodex429GuardEnabledExtraKey,
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		"openai_compact_mode",
+		openAICompactProbeSupportedExtraKey,
+		openAICompactProbeVersionExtraKey,
+		openAICompactProbeCheckedAtExtraKey,
+		"openai_passthrough",
+		"openai_oauth_passthrough",
+		"openai_oauth_responses_websockets_v2_enabled",
+		"openai_apikey_responses_websockets_v2_enabled",
+		"openai_oauth_responses_websockets_v2_mode",
+		"openai_apikey_responses_websockets_v2_mode",
+		"responses_websockets_v2_enabled",
+		"openai_ws_enabled",
+		"openai_ws_force_http",
+		"openai_ws_allow_store_recovery",
+		"openai_responses_flatten_namespaces",
+		"openai_responses_mode",
+	} {
+		if _, exists := extra[key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
 // listShadowsForOpenAIWSInvalidation is deliberately best effort. Some narrow
 // repository test doubles (and older integrations) embed an optional
 // AccountRepository implementation; invoking a promoted method on a nil
@@ -162,6 +202,8 @@ func cloneAccountJSONMap(value map[string]any) (map[string]any, error) {
 var duplicateAccountDiscardedExtraKeys = map[string]struct{}{
 	// A retry identity belongs to the operation that created one copy, not to later copies.
 	duplicateAccountOperationIDExtraKey: {},
+	// A duplicate must never inherit the source account's Codex device identity.
+	codexFingerprintSeedExtraKey: {},
 	// External sync identity belongs to one local account only.
 	"crs_account_id": {},
 	"crs_kind":       {},
@@ -175,43 +217,45 @@ var duplicateAccountDiscardedExtraKeys = map[string]struct{}{
 	"quota_daily_reset_at":  {},
 	"quota_weekly_reset_at": {},
 	// Provider observations, capability probes, and transient scheduling state.
-	"model_rate_limits":                      {},
-	"session_window_utilization":             {},
-	"passive_usage_7d_utilization":           {},
-	"passive_usage_7d_reset":                 {},
-	"passive_usage_7d_oi_utilization":        {},
-	"passive_usage_7d_oi_reset":              {},
-	"passive_usage_sampled_at":               {},
-	"grok_usage_snapshot":                    {},
-	"grok_billing_snapshot":                  {},
-	"openai_responses_supported":             {},
-	"openai_compact_supported":               {},
-	"openai_compact_checked_at":              {},
-	"openai_compact_last_status":             {},
-	"openai_compact_last_error":              {},
-	"antigravity_credits_overages":           {},
-	"antigravity_force_token_refresh":        {},
-	"antigravity_force_token_refresh_at":     {},
-	"antigravity_force_token_refresh_reason": {},
-	"drive_storage_limit":                    {},
-	"drive_storage_usage":                    {},
-	"drive_tier_updated_at":                  {},
-	"codex_primary_used_percent":             {},
-	"codex_primary_reset_after_seconds":      {},
-	"codex_primary_window_minutes":           {},
-	"codex_secondary_used_percent":           {},
-	"codex_secondary_reset_after_seconds":    {},
-	"codex_secondary_window_minutes":         {},
-	"codex_primary_over_secondary_percent":   {},
-	"codex_usage_updated_at":                 {},
-	"codex_5h_used_percent":                  {},
-	"codex_5h_reset_after_seconds":           {},
-	"codex_5h_window_minutes":                {},
-	"codex_5h_reset_at":                      {},
-	"codex_7d_used_percent":                  {},
-	"codex_7d_reset_after_seconds":           {},
-	"codex_7d_window_minutes":                {},
-	"codex_7d_reset_at":                      {},
+	"model_rate_limits":                          {},
+	"session_window_utilization":                 {},
+	"passive_usage_7d_utilization":               {},
+	"passive_usage_7d_reset":                     {},
+	"passive_usage_7d_oi_utilization":            {},
+	"passive_usage_7d_oi_reset":                  {},
+	"passive_usage_sampled_at":                   {},
+	"grok_usage_snapshot":                        {},
+	"grok_billing_snapshot":                      {},
+	"openai_responses_supported":                 {},
+	"openai_compact_supported":                   {},
+	openAICompactProbeVersionExtraKey:            {},
+	"openai_compact_checked_at":                  {},
+	"openai_compact_last_status":                 {},
+	"openai_compact_last_error":                  {},
+	OpenAICompactProbeObservedAtUnixNanoExtraKey: {},
+	"antigravity_credits_overages":               {},
+	"antigravity_force_token_refresh":            {},
+	"antigravity_force_token_refresh_at":         {},
+	"antigravity_force_token_refresh_reason":     {},
+	"drive_storage_limit":                        {},
+	"drive_storage_usage":                        {},
+	"drive_tier_updated_at":                      {},
+	"codex_primary_used_percent":                 {},
+	"codex_primary_reset_after_seconds":          {},
+	"codex_primary_window_minutes":               {},
+	"codex_secondary_used_percent":               {},
+	"codex_secondary_reset_after_seconds":        {},
+	"codex_secondary_window_minutes":             {},
+	"codex_primary_over_secondary_percent":       {},
+	"codex_usage_updated_at":                     {},
+	"codex_5h_used_percent":                      {},
+	"codex_5h_reset_after_seconds":               {},
+	"codex_5h_window_minutes":                    {},
+	"codex_5h_reset_at":                          {},
+	"codex_7d_used_percent":                      {},
+	"codex_7d_reset_after_seconds":               {},
+	"codex_7d_window_minutes":                    {},
+	"codex_7d_reset_at":                          {},
 }
 
 func duplicateAccountExtra(value map[string]any) (map[string]any, error) {
@@ -495,6 +539,7 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	delete(accountExtra, OllamaCloudUsageSessionExtraKey)
 	delete(accountExtra, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(accountExtra, OllamaCloudUsageSnapshotExtraKey)
+	accountExtra = ensureCodexFingerprintSeed(input.Platform, input.Type, accountExtra)
 	account := &Account{
 		Name:        input.Name,
 		Notes:       normalizeAccountNotes(input.Notes),
@@ -643,6 +688,8 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
+	extraWSSettingChanged := openAIExtraRequiresWSInvalidation(input.Extra)
+	accountTypeChanged := input.Type != "" && input.Type != account.Type
 	previousProxyID := int64(0)
 	if account.ProxyID != nil {
 		previousProxyID = *account.ProxyID
@@ -840,6 +887,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 	}
 	// 只在指针非 nil 时更新 Concurrency（支持设置为 0）
+	// Persist a stable seed for legacy OAuth rows the first time they are edited.
+	// This keeps convergence independent of the local auto-increment account ID.
+	account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
 	if input.Concurrency != nil {
 		account.Concurrency = normalizeAccountConcurrency(account.Platform, account.Type, *input.Concurrency)
 	}
@@ -961,8 +1011,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
-	_, guardSettingChanged := input.Extra[OpenAICodex429GuardEnabledExtraKey]
-	if input.ProxyID != nil || len(input.Credentials) > 0 || guardSettingChanged {
+	if input.ProxyID != nil || len(input.Credentials) > 0 || extraWSSettingChanged || accountTypeChanged {
 		nextProxyID := int64(0)
 		if updated.ProxyID != nil {
 			nextProxyID = *updated.ProxyID
@@ -971,7 +1020,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, updated)
 		} else if len(input.Credentials) > 0 {
 			s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, updated)
-		} else if guardSettingChanged {
+		} else if extraWSSettingChanged || accountTypeChanged {
 			s.invalidateOpenAIWSConnections(id)
 		}
 	}
@@ -987,18 +1036,22 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	delete(updates, OllamaCloudUsageSessionExtraKey)
 	delete(updates, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(updates, OllamaCloudUsageSnapshotExtraKey)
+	wsSettingChanged := openAIExtraRequiresWSInvalidation(updates)
 	var accountForInvalidation *Account
-	guardSettingChanged := false
-	if _, exists := updates[OpenAICodex429GuardEnabledExtraKey]; exists {
+	if wsSettingChanged {
 		account, err := s.accountRepo.GetByID(ctx, id)
 		if err != nil {
 			return err
 		}
-		if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, updates); err != nil {
-			return err
+		if _, exists := updates[OpenAICodex429GuardEnabledExtraKey]; exists {
+			if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, updates); err != nil {
+				return err
+			}
+		}
+		if codexFingerprintModeEnabledExtra(updates) && account.IsOpenAIOAuth() && account.getCodexFingerprintSeed() == "" {
+			updates[codexFingerprintSeedExtraKey] = uuid.NewString()
 		}
 		accountForInvalidation = account
-		guardSettingChanged = true
 	}
 	if _, exists := updates[openAILongContextBillingEnabledKey]; exists {
 		account, err := s.accountRepo.GetByID(ctx, id)
@@ -1015,7 +1068,7 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	if err := s.accountRepo.UpdateExtra(ctx, id, updates); err != nil {
 		return err
 	}
-	if guardSettingChanged && accountForInvalidation != nil {
+	if wsSettingChanged && accountForInvalidation != nil {
 		s.invalidateOpenAIWSConnections(accountForInvalidation.ID)
 	}
 	return nil
@@ -1031,6 +1084,9 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	delete(input.Extra, OllamaCloudUsageSessionExtraKey)
 	delete(input.Extra, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(input.Extra, OllamaCloudUsageSnapshotExtraKey)
+	// The seed is system-managed and must never be copied into every selected
+	// account. A convergence enablement below creates one unique seed per row.
+	delete(input.Extra, codexFingerprintSeedExtraKey)
 
 	if len(input.AccountIDs) == 0 && input.Filters != nil {
 		accountIDs, err := s.resolveBulkUpdateTargetIDs(ctx, input.Filters)
@@ -1057,7 +1113,8 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	needMixedChannelCheck := input.GroupIDs != nil && !input.SkipMixedChannelCheck
 	_, hasLongContextBillingUpdate := input.Extra[openAILongContextBillingEnabledKey]
-	_, hasCodex429GuardUpdate := input.Extra[OpenAICodex429GuardEnabledExtraKey]
+	extraWSSettingChanged := openAIExtraRequiresWSInvalidation(input.Extra)
+	hasCodexFingerprintModeUpdate := codexFingerprintModeEnabledExtra(input.Extra)
 	overagesEnabled, hasOveragesUpdate := input.Extra["allow_overages"].(bool)
 	if _, present := input.Extra["allow_overages"]; present && !hasOveragesUpdate {
 		return nil, infraerrors.BadRequest("INVALID_ALLOW_OVERAGES", "allow_overages must be a boolean")
@@ -1068,12 +1125,18 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	// 预取所有目标账号，供凭据守卫/代理守卫/混合渠道检查共用，避免多次 DB 查询。
 	var cachedTargets []*Account
-	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || hasCodex429GuardUpdate || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil {
+	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || extraWSSettingChanged || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil {
 		loaded, err := s.accountRepo.GetByIDs(ctx, input.AccountIDs)
 		if err != nil {
 			return nil, err
 		}
 		cachedTargets = loaded
+	}
+	targetsByID := make(map[int64]*Account, len(cachedTargets))
+	for _, account := range cachedTargets {
+		if account != nil {
+			targetsByID[account.ID] = account
+		}
 	}
 	if hasOveragesUpdate {
 		for _, account := range cachedTargets {
@@ -1086,12 +1149,6 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 		}
 	}
 	if input.ProbeEnabled != nil {
-		targetsByID := make(map[int64]*Account, len(cachedTargets))
-		for _, account := range cachedTargets {
-			if account != nil {
-				targetsByID[account.ID] = account
-			}
-		}
 		for _, accountID := range input.AccountIDs {
 			account, ok := targetsByID[accountID]
 			if !ok {
@@ -1113,13 +1170,34 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 			break
 		}
 	}
-	if hasCodex429GuardUpdate {
+	if _, hasCodex429GuardUpdate := input.Extra[OpenAICodex429GuardEnabledExtraKey]; hasCodex429GuardUpdate {
 		for _, account := range cachedTargets {
 			if account == nil {
 				return nil, ErrAccountNotFound
 			}
 			if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, input.Extra); err != nil {
 				return nil, err
+			}
+		}
+	}
+	if hasCodexFingerprintModeUpdate {
+		for _, accountID := range input.AccountIDs {
+			account, ok := targetsByID[accountID]
+			if !ok || account == nil {
+				return nil, ErrAccountNotFound
+			}
+			if !account.IsOpenAIOAuth() {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_FINGERPRINT_ACCOUNT_INVALID",
+					"codex_fingerprint_mode only applies to OpenAI OAuth accounts",
+				)
+			}
+			if account.getCodexFingerprintSeed() == "" {
+				if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{
+					codexFingerprintSeedExtraKey: uuid.NewString(),
+				}); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -1275,7 +1353,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 				s.invalidateOpenAIWSConnections(accountID)
 			}
 		}
-	} else if hasCodex429GuardUpdate {
+	} else if extraWSSettingChanged {
 		for _, accountID := range input.AccountIDs {
 			s.invalidateOpenAIWSConnections(accountID)
 		}

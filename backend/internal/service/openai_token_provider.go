@@ -116,6 +116,20 @@ func (p *OpenAITokenProvider) SetAccountRuntimeBlocker(blocker AccountRuntimeBlo
 	p.runtimeBlocker = blocker
 }
 
+// invalidateOpenAIWSConnections drops pooled sockets after an OAuth token
+// rotation. A WebSocket retains its Authorization header from the handshake,
+// so retaining it after a successful refresh can keep sending a revoked token.
+func (p *OpenAITokenProvider) invalidateOpenAIWSConnections(accountID int64) {
+	if p == nil || accountID <= 0 || p.runtimeBlocker == nil {
+		return
+	}
+	if invalidator, ok := p.runtimeBlocker.(interface {
+		InvalidateOpenAIWSConnections(int64)
+	}); ok {
+		invalidator.InvalidateOpenAIWSConnections(accountID)
+	}
+}
+
 func (p *OpenAITokenProvider) SnapshotRuntimeMetrics() OpenAITokenRuntimeMetrics {
 	if p == nil {
 		return OpenAITokenRuntimeMetrics{}
@@ -197,6 +211,7 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 		} else if result.Refreshed {
 			p.metrics.refreshSuccess.Add(1)
 			account = result.Account
+			p.invalidateOpenAIWSConnections(account.ID)
 			expiresAt = account.GetCredentialAsTime("expires_at")
 		} else {
 			account = result.Account
@@ -268,6 +283,57 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	return accessToken, nil
+}
+
+// ForceRefresh refreshes an OpenAI OAuth credential after an upstream 401.
+// The normal provider path deliberately skips refresh while a token is still
+// within its lifetime; a 401 is the explicit signal that bypasses that cache.
+func (p *OpenAITokenProvider) ForceRefresh(ctx context.Context, account *Account) (string, error) {
+	p.ensureMetrics()
+	if p == nil || account == nil || !account.IsOpenAIOAuth() {
+		return "", errors.New("not an openai oauth account")
+	}
+	if account.IsOpenAIPersonalAccessToken() || strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+		return "", errors.New("openai oauth account has no refresh token")
+	}
+	if p.refreshAPI == nil || p.executor == nil {
+		return "", errors.New("openai oauth refresh is not configured")
+	}
+	p.metrics.refreshRequests.Add(1)
+	p.metrics.touchNow()
+	result, err := p.refreshAPI.RefreshIfNeeded(withOAuthRefreshForce(ctx), account, p.executor, 0)
+	if err != nil {
+		p.metrics.refreshFailure.Add(1)
+		return "", err
+	}
+	if result != nil && result.LockHeld {
+		// Another worker owns the refresh lock. Read the durable row rather than
+		// trusting a potentially stale token-cache entry.
+		if p.accountRepo == nil {
+			return "", errors.New("openai oauth refresh lock is held")
+		}
+		fresh, readErr := p.accountRepo.GetByID(ctx, account.ID)
+		if readErr != nil || fresh == nil || strings.TrimSpace(fresh.GetOpenAIAccessToken()) == "" {
+			if readErr == nil {
+				readErr = errors.New("refreshed account is unavailable")
+			}
+			return "", readErr
+		}
+		if p.tokenCache != nil {
+			_ = p.tokenCache.DeleteAccessToken(context.WithoutCancel(ctx), OpenAITokenCacheKey(account))
+		}
+		p.invalidateOpenAIWSConnections(fresh.ID)
+		return fresh.GetOpenAIAccessToken(), nil
+	}
+	if result == nil || result.Account == nil || strings.TrimSpace(result.Account.GetOpenAIAccessToken()) == "" {
+		return "", errors.New("openai oauth refresh returned no access token")
+	}
+	p.metrics.refreshSuccess.Add(1)
+	if p.tokenCache != nil {
+		_ = p.tokenCache.DeleteAccessToken(context.WithoutCancel(ctx), OpenAITokenCacheKey(account))
+	}
+	p.invalidateOpenAIWSConnections(result.Account.ID)
+	return result.Account.GetOpenAIAccessToken(), nil
 }
 
 // disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号

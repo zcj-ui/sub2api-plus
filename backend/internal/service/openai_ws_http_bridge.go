@@ -285,6 +285,9 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	upstreamTerminalEvent := ""
 	sawDone := false
 	wroteDownstream := false
+	pendingClientMessages := make([][]byte, 0, 4)
+	pendingClientMessageBytes := int64(0)
+	capacityFailoverSuppressedLogged := false
 	clientDisconnected := false
 	rateLimitSignalHandled := false
 	mappedModel := ""
@@ -367,6 +370,23 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if trimmedData == "[DONE]" {
 			sawDone = true
+			// A [DONE] marker without a Responses terminal event is incomplete.
+			// Keep OpenAI preambles staged so the caller can safely fail over.
+			// Legacy provider paths retain their historical partial-stream flush.
+			if account.Platform != PlatformOpenAI {
+				for _, message := range pendingClientMessages {
+					if err := writeClientMessage(message); err != nil {
+						if isOpenAIWSClientDisconnectError(err) {
+							clientDisconnected = true
+							break
+						}
+						return nil, wrapOpenAIWSIngressTurnError("write_client", fmt.Errorf("write client websocket event: %w", err), wroteDownstream)
+					}
+					wroteDownstream = true
+				}
+				pendingClientMessages = nil
+				pendingClientMessageBytes = 0
+			}
 			continue
 		}
 
@@ -409,33 +429,49 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		replayCollector.AddEvent(eventType, upstreamMessage)
 
 		var upstreamEventErr error
-		if eventType == "error" {
-			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
-			errMessage := strings.TrimSpace(errMsgRaw)
+		if eventType == "error" || eventType == "response.failed" {
+			errMessage := extractOpenAISSEErrorMessage(upstreamMessage)
 			if errMessage == "" {
 				errMessage = "upstream error event"
 			}
-			statusCode := openAIWSPayloadUpstreamStatus(upstreamMessage)
-			if statusCode == 0 {
-				statusCode = openAIWSErrorHTTPStatusFromRawWithMessage(errCodeRaw, errTypeRaw, errMsgRaw)
-			}
+			statusCode := openAIStreamFailureStatus(upstreamMessage, errMessage)
+			shouldFailover := openAIStreamFailedEventShouldFailover(upstreamMessage, errMessage)
 			isRateLimit := false
-			if account.Platform == PlatformOpenAI {
-				isRateLimit = recordRateLimitSignal(statusCode, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
+			var errCodeRaw, errTypeRaw string
+			if eventType == "error" {
+				errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
+				// Prefer an explicit status carried by the relay. When it is
+				// absent, retain the message so transport text such as
+				// "last status: 429 Too Many Requests" still participates in
+				// the explicit 429 confirmation path.
+				if explicitStatus := openAIWSPayloadUpstreamStatus(upstreamMessage); explicitStatus != 0 {
+					statusCode = explicitStatus
+				} else {
+					statusCode = openAIWSErrorHTTPStatusFromRawWithMessage(errCodeRaw, errTypeRaw, errMessage)
+				}
+				isRateLimit = account.Platform == PlatformOpenAI && recordRateLimitSignal(statusCode, errCodeRaw, errTypeRaw, errMessage, upstreamMessage)
+				shouldFailover = s.shouldFailoverOpenAIUpstreamResponse(statusCode, errMessage, upstreamMessage)
+			} else if account.Platform == PlatformOpenAI {
+				errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
+				isRateLimit = recordRateLimitSignal(
+					statusCode,
+					errCodeRaw,
+					errTypeRaw,
+					errMessage,
+					upstreamMessage,
+				)
 			}
-			shouldFailover := s.shouldFailoverOpenAIUpstreamResponse(statusCode, errMessage, upstreamMessage)
-			if account.Platform == PlatformGrok {
-				// SSE error events do not carry an HTTP status. The local status
-				// mapper therefore defaults unknown xAI codes (for example
-				// new_sensitive) to 502; classify the body as a request-scoped
-				// 403 before applying status-based failover or account state.
+			requestScopedCapacity := isOpenAIUpstreamCapacityShedEvent(upstreamMessage)
+			if account.Platform == PlatformGrok && eventType == "error" {
+				// SSE error events do not carry an HTTP status. Keep Grok's
+				// provider-specific policy handling unchanged.
 				if isGrokContentPolicyRejection(http.StatusForbidden, upstreamMessage) {
 					shouldFailover = false
 				} else {
 					shouldFailover = s.shouldFailoverGrokUpstreamError(statusCode, upstreamMessage)
 					s.handleGrokAccountUpstreamError(ctx, account, statusCode, resp.Header, upstreamMessage)
 				}
-			} else if shouldFailover && !isRateLimit {
+			} else if eventType == "error" && shouldFailover && !requestScopedCapacity && !isRateLimit {
 				accountStatus := statusCode
 				if transientStatus := openAIWSPayloadTransientStatus(upstreamMessage); transientStatus != 0 {
 					accountStatus = transientStatus
@@ -444,18 +480,19 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				s.handleOpenAIAccountUpstreamError(ctx, account, accountStatus, resp.Header, upstreamMessage, canonicalModel)
 			}
 			if turn == 1 && !wroteDownstream && shouldFailover {
-				return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
+				if account.Platform == PlatformGrok {
+					return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
+				}
+				return nil, s.newOpenAIStreamFailoverError(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, resp.Header)
 			}
-			upstreamEventErr = errors.New(errMessage)
-		}
-		if eventType == "response.failed" && account.Platform == PlatformOpenAI {
-			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
-			isRateLimit := recordRateLimitSignal(openAIWSPayloadUpstreamStatus(upstreamMessage), errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
-			if turn == 1 && !wroteDownstream && isRateLimit {
-				return nil, newOpenAIUpstreamFailoverError(http.StatusTooManyRequests, resp.Header, upstreamMessage, "rate limit exceeded", false)
+			if wroteDownstream && requestScopedCapacity && !capacityFailoverSuppressedLogged {
+				logOpenAICapacityFailoverSuppressed(ctx, account, "ws_http_bridge", resp.Header.Get("x-request-id"), eventType)
+				capacityFailoverSuppressedLogged = true
+			}
+			if eventType == "error" {
+				upstreamEventErr = errors.New(errMessage)
 			}
 		}
-
 		// 客户端写出副本改写容量降载码：Codex 对 error/response.failed 中的
 		// server_is_overloaded / slow_down 判致命并终止会话，改写后走客户端内置
 		// 重试。账号状态与终止事件判定（下方 handleOpenAIWSTerminalTransientFailure）
@@ -467,26 +504,56 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 		}
 		if !clientDisconnected {
-			if err := writeClientMessage(clientMessage); err != nil {
-				if isOpenAIWSClientDisconnectError(err) {
-					clientDisconnected = true
-					closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
-					logOpenAIWSModeInfo(
-						"ingress_ws_http_bridge_client_disconnected_drain account_id=%d turn=%d close_status=%s close_reason=%s",
-						account.ID,
-						turn,
-						closeStatus,
-						truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
-					)
-				} else {
-					return nil, wrapOpenAIWSIngressTurnError(
-						"write_client",
-						fmt.Errorf("write client websocket event: %w", err),
-						wroteDownstream,
+			stageBeforeSemanticOutput := turn == 1 && account.Platform == PlatformOpenAI && !wroteDownstream
+			startsClientOutput := openAIStreamDataStartsClientOutput(string(clientMessage), eventType)
+			if account.Platform == PlatformOpenAI {
+				startsClientOutput = openAIStreamDataStartsClientOutputForStaging(string(clientMessage), eventType)
+			} else {
+				startsClientOutput = openAIStreamDataStartsClientOutputForLegacy(string(clientMessage), eventType)
+			}
+			commitStagedMessages := !stageBeforeSemanticOutput ||
+				startsClientOutput ||
+				isOpenAIWSTerminalEvent(eventType)
+			if stageBeforeSemanticOutput && !commitStagedMessages {
+				if pendingClientMessageBytes+int64(len(clientMessage)) > openAIFirstOutputStageMaxBytes {
+					return nil, s.newOpenAIStreamFailoverError(
+						c,
+						account,
+						true,
+						resp.Header.Get("x-request-id"),
+						nil,
+						"OpenAI WS HTTP bridge first-output staging limit exceeded",
+						resp.Header,
 					)
 				}
+				pendingClientMessages = append(pendingClientMessages, append([]byte(nil), clientMessage...))
+				pendingClientMessageBytes += int64(len(clientMessage))
 			} else {
-				wroteDownstream = true
+				messages := append(pendingClientMessages, clientMessage)
+				pendingClientMessages = nil
+				pendingClientMessageBytes = 0
+				for _, message := range messages {
+					if err := writeClientMessage(message); err != nil {
+						if isOpenAIWSClientDisconnectError(err) {
+							clientDisconnected = true
+							closeStatus, closeReason := summarizeOpenAIWSReadCloseError(err)
+							logOpenAIWSModeInfo(
+								"ingress_ws_http_bridge_client_disconnected_drain account_id=%d turn=%d close_status=%s close_reason=%s",
+								account.ID,
+								turn,
+								closeStatus,
+								truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
+							)
+							break
+						}
+						return nil, wrapOpenAIWSIngressTurnError(
+							"write_client",
+							fmt.Errorf("write client websocket event: %w", err),
+							wroteDownstream,
+						)
+					}
+					wroteDownstream = true
+				}
 			}
 		}
 

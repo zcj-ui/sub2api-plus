@@ -35,7 +35,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactPrefersSupported
 			Schedulable: true,
 			Concurrency: 1,
 			Priority:    0,
-			Extra:       map[string]any{"openai_compact_supported": true}, // tier=2
+			Extra:       currentCompactProbeTestExtra(true), // tier=2
 		},
 	}
 	cfg := &config.Config{}
@@ -89,7 +89,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactRejectsExplicitl
 			Schedulable: true,
 			Concurrency: 1,
 			Priority:    0,
-			Extra:       map[string]any{"openai_compact_supported": false},
+			Extra:       currentCompactProbeTestExtra(false),
 		},
 	}
 	cfg := &config.Config{}
@@ -132,7 +132,7 @@ func TestOpenAIGatewayService_SelectAccountWithScheduler_CompactFallsBackToUnkno
 			Schedulable: true,
 			Concurrency: 1,
 			Priority:    0,
-			Extra:       map[string]any{"openai_compact_supported": false}, // tier=0
+			Extra:       currentCompactProbeTestExtra(false), // tier=0
 		},
 		{
 			ID:          71021,
@@ -231,8 +231,8 @@ func TestOpenAICompactSupportTier(t *testing.T) {
 		{name: "non openai", account: &Account{Platform: PlatformAnthropic}, want: 0},
 		{name: "grok", account: &Account{Platform: PlatformGrok}, want: 2},
 		{name: "openai unknown", account: &Account{Platform: PlatformOpenAI, Extra: map[string]any{}}, want: 1},
-		{name: "openai supported", account: &Account{Platform: PlatformOpenAI, Extra: map[string]any{"openai_compact_supported": true}}, want: 2},
-		{name: "openai unsupported", account: &Account{Platform: PlatformOpenAI, Extra: map[string]any{"openai_compact_supported": false}}, want: 0},
+		{name: "openai supported", account: &Account{Platform: PlatformOpenAI, Extra: currentCompactProbeTestExtra(true)}, want: 2},
+		{name: "openai unsupported", account: &Account{Platform: PlatformOpenAI, Extra: currentCompactProbeTestExtra(false)}, want: 0},
 		{name: "force on", account: &Account{Platform: PlatformOpenAI, Extra: map[string]any{"openai_compact_mode": OpenAICompactModeForceOn}}, want: 2},
 		{name: "force off overrides probe true", account: &Account{Platform: PlatformOpenAI, Extra: map[string]any{"openai_compact_mode": OpenAICompactModeForceOff, "openai_compact_supported": true}}, want: 0},
 	}

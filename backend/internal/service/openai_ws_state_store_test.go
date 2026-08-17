@@ -314,6 +314,24 @@ func TestEnsureBindingCapacity_DoesNotEvictWhenUpdatingExistingKey(t *testing.T)
 	require.Equal(t, 9, bindings["a"])
 }
 
+func TestEnsureBindingCapacityPreservingProtectsPermanentGuards(t *testing.T) {
+	permanent := openAIWSConnBinding{connID: "guard"}
+	expiring := openAIWSConnBinding{connID: "ordinary", expiresAt: time.Now().Add(time.Minute)}
+	bindings := map[string]openAIWSConnBinding{
+		"guard":    permanent,
+		"ordinary": expiring,
+	}
+	canEvict := func(binding openAIWSConnBinding) bool { return !binding.expiresAt.IsZero() }
+
+	require.True(t, ensureBindingCapacityPreserving(bindings, "new", 2, canEvict))
+	require.NotContains(t, bindings, "ordinary")
+	require.Contains(t, bindings, "guard")
+
+	bindings = map[string]openAIWSConnBinding{"guard": permanent}
+	require.False(t, ensureBindingCapacityPreserving(bindings, "new", 1, canEvict))
+	require.Equal(t, permanent, bindings["guard"])
+}
+
 type openAIWSStateStoreTimeoutProbeCache struct {
 	setHasDeadline    bool
 	getHasDeadline    bool

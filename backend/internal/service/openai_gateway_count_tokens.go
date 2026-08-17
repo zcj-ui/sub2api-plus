@@ -276,7 +276,7 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
-		ids := resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c))
+		ids := resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c), codexFingerprintDeploymentSeed(s.cfg))
 		applyCodexFingerprintHeaders(req.Header, ids)
 		identity := resolveCodexOutboundIdentity(s.codexIdentityOverrideUA(account))
 		req.Header.Set("user-agent", identity.userAgent)

@@ -151,7 +151,14 @@ func (s *defaultOpenAIWSStateStore) BindResponseAccount(ctx context.Context, gro
 		s.responseBindingOpMu.Unlock()
 		return nil
 	}
-	ensureBindingCapacity(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap)
+	if !ensureBindingCapacityPreserving(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap, func(binding openAIWSAccountBinding) bool {
+		return !binding.expiresAt.IsZero()
+	}) {
+		// Never evict a permanent guard binding for an ordinary continuation.
+		s.responseToAccountMu.Unlock()
+		s.responseBindingOpMu.Unlock()
+		return nil
+	}
 	s.responseToAccount[mapKey] = openAIWSAccountBinding{accountID: accountID, expiresAt: expiresAt}
 	s.responseToAccountMu.Unlock()
 	s.responseBindingOpMu.Unlock()
@@ -297,10 +304,16 @@ func (s *defaultOpenAIWSStateStore) BindResponseConn(responseID, connID string, 
 	s.responseBindingOpMu.Lock()
 	defer s.responseBindingOpMu.Unlock()
 	s.responseToConnMu.Lock()
-	ensureBindingCapacity(s.responseToConn, id, openAIWSStateStoreMaxEntriesPerMap)
 	if existing, exists := s.responseToConn[id]; exists && existing.expiresAt.IsZero() {
 		// Preserve a permanent guard connection binding. It is released only by
 		// explicit cleanup after the socket/account is invalidated.
+		s.responseToConnMu.Unlock()
+		return
+	}
+	if !ensureBindingCapacityPreserving(s.responseToConn, id, openAIWSStateStoreMaxEntriesPerMap, func(binding openAIWSConnBinding) bool {
+		return !binding.expiresAt.IsZero()
+	}) {
+		// Never evict a permanent guard socket for an ordinary response pin.
 		s.responseToConnMu.Unlock()
 		return
 	}
@@ -368,13 +381,35 @@ func (s *defaultOpenAIWSStateStore) BindGuardResponse(groupID int64, responseID 
 	s.maybeCleanup()
 	mapKey := openAIWSResponseAccountMapKey(groupID, id)
 	s.responseToAccountMu.Lock()
-	ensureBindingCapacity(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap)
-	s.responseToAccount[mapKey] = openAIWSAccountBinding{accountID: accountID}
-	s.responseToAccountMu.Unlock()
 	s.responseToConnMu.Lock()
-	ensureBindingCapacity(s.responseToConn, id, openAIWSStateStoreMaxEntriesPerMap)
+	// A permanent tuple is immutable until the exact socket is invalidated. Do
+	// not overwrite either half if another guard already owns this key.
+	if existing, exists := s.responseToAccount[mapKey]; exists && existing.expiresAt.IsZero() && existing.accountID != accountID {
+		s.responseToConnMu.Unlock()
+		s.responseToAccountMu.Unlock()
+		return
+	}
+	if existing, exists := s.responseToConn[id]; exists && existing.expiresAt.IsZero() && existing.connID != conn {
+		s.responseToConnMu.Unlock()
+		s.responseToAccountMu.Unlock()
+		return
+	}
+	canEvictAccount := func(binding openAIWSAccountBinding) bool { return !binding.expiresAt.IsZero() }
+	canEvictConn := func(binding openAIWSConnBinding) bool { return !binding.expiresAt.IsZero() }
+	// Check both maps before evicting either one so a full permanent map cannot
+	// leave the guard tuple with only one half installed.
+	if !canEnsureBindingCapacity(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap, canEvictAccount) ||
+		!canEnsureBindingCapacity(s.responseToConn, id, openAIWSStateStoreMaxEntriesPerMap, canEvictConn) {
+		s.responseToConnMu.Unlock()
+		s.responseToAccountMu.Unlock()
+		return
+	}
+	ensureBindingCapacityPreserving(s.responseToAccount, mapKey, openAIWSStateStoreMaxEntriesPerMap, canEvictAccount)
+	ensureBindingCapacityPreserving(s.responseToConn, id, openAIWSStateStoreMaxEntriesPerMap, canEvictConn)
+	s.responseToAccount[mapKey] = openAIWSAccountBinding{accountID: accountID}
 	s.responseToConn[id] = openAIWSConnBinding{connID: conn}
 	s.responseToConnMu.Unlock()
+	s.responseToAccountMu.Unlock()
 }
 
 func (s *defaultOpenAIWSStateStore) BindSessionTurnState(groupID int64, sessionHash, turnState string, ttl time.Duration) {
@@ -439,7 +474,14 @@ func (s *defaultOpenAIWSStateStore) BindSessionConn(groupID int64, sessionHash, 
 		s.sessionToConnMu.Unlock()
 		return
 	}
-	ensureBindingCapacity(s.sessionToConn, key, openAIWSStateStoreMaxEntriesPerMap)
+	if !ensureBindingCapacityPreserving(s.sessionToConn, key, openAIWSStateStoreMaxEntriesPerMap, func(binding openAIWSSessionConnBinding) bool {
+		return !binding.expiresAt.IsZero()
+	}) {
+		// Preserve permanent guard sessions when the local continuation map is
+		// saturated.
+		s.sessionToConnMu.Unlock()
+		return
+	}
 	s.sessionToConn[key] = openAIWSSessionConnBinding{
 		connID:    conn,
 		expiresAt: time.Now().Add(ttl),
@@ -460,13 +502,31 @@ func (s *defaultOpenAIWSStateStore) BindGuardSession(groupID int64, sessionHash 
 	s.sessionBindingOpMu.Lock()
 	defer s.sessionBindingOpMu.Unlock()
 	s.sessionToAccountMu.Lock()
-	ensureBindingCapacity(s.sessionToAccount, key, openAIWSStateStoreMaxEntriesPerMap)
-	s.sessionToAccount[key] = openAIWSAccountBinding{accountID: accountID}
-	s.sessionToAccountMu.Unlock()
 	s.sessionToConnMu.Lock()
-	ensureBindingCapacity(s.sessionToConn, key, openAIWSStateStoreMaxEntriesPerMap)
+	if existing, exists := s.sessionToAccount[key]; exists && existing.expiresAt.IsZero() && existing.accountID != accountID {
+		s.sessionToConnMu.Unlock()
+		s.sessionToAccountMu.Unlock()
+		return
+	}
+	if existing, exists := s.sessionToConn[key]; exists && existing.expiresAt.IsZero() && existing.connID != conn {
+		s.sessionToConnMu.Unlock()
+		s.sessionToAccountMu.Unlock()
+		return
+	}
+	canEvictAccount := func(binding openAIWSAccountBinding) bool { return !binding.expiresAt.IsZero() }
+	canEvictConn := func(binding openAIWSSessionConnBinding) bool { return !binding.expiresAt.IsZero() }
+	if !canEnsureBindingCapacity(s.sessionToAccount, key, openAIWSStateStoreMaxEntriesPerMap, canEvictAccount) ||
+		!canEnsureBindingCapacity(s.sessionToConn, key, openAIWSStateStoreMaxEntriesPerMap, canEvictConn) {
+		s.sessionToConnMu.Unlock()
+		s.sessionToAccountMu.Unlock()
+		return
+	}
+	ensureBindingCapacityPreserving(s.sessionToAccount, key, openAIWSStateStoreMaxEntriesPerMap, canEvictAccount)
+	ensureBindingCapacityPreserving(s.sessionToConn, key, openAIWSStateStoreMaxEntriesPerMap, canEvictConn)
+	s.sessionToAccount[key] = openAIWSAccountBinding{accountID: accountID}
 	s.sessionToConn[key] = openAIWSSessionConnBinding{connID: conn}
 	s.sessionToConnMu.Unlock()
+	s.sessionToAccountMu.Unlock()
 }
 
 func (s *defaultOpenAIWSStateStore) GetGuardSession(groupID int64, sessionHash string) (int64, string, bool) {
@@ -725,7 +785,7 @@ func openAIWSBindingActive(expiresAt, now time.Time) bool {
 	return expiresAt.IsZero() || now.Before(expiresAt)
 }
 
-func ensureBindingCapacity[T any](bindings map[string]T, incomingKey string, maxEntries int) {
+func ensureBindingCapacityLegacy[T any](bindings map[string]T, incomingKey string, maxEntries int) {
 	if len(bindings) < maxEntries || maxEntries <= 0 {
 		return
 	}
@@ -737,6 +797,64 @@ func ensureBindingCapacity[T any](bindings map[string]T, incomingKey string, max
 		delete(bindings, key)
 		return
 	}
+}
+
+// ensureBindingCapacity applies the optional eviction policy and reports
+// whether a slot is available. Existing callers that ignore the return value
+// retain the original bounded-map behavior.
+func ensureBindingCapacity[T any](bindings map[string]T, incomingKey string, maxEntries int, evictable ...func(T) bool) bool {
+	if len(bindings) < maxEntries || maxEntries <= 0 {
+		return true
+	}
+	if _, exists := bindings[incomingKey]; exists {
+		return true
+	}
+	canEvict := func(T) bool { return true }
+	if len(evictable) > 0 && evictable[0] != nil {
+		canEvict = evictable[0]
+	}
+	for key, value := range bindings {
+		if canEvict(value) {
+			delete(bindings, key)
+			return true
+		}
+	}
+	return false
+}
+
+// ensureBindingCapacityPreserving evicts only entries accepted by canEvict.
+// Permanent Codex guard tuples use a zero expiry and must survive ordinary
+// continuation pressure; returning false lets callers keep the map bounded
+// without installing a partial or unpinned binding.
+func ensureBindingCapacityPreserving[T any](bindings map[string]T, incomingKey string, maxEntries int, canEvict func(T) bool) bool {
+	if len(bindings) < maxEntries || maxEntries <= 0 {
+		return true
+	}
+	if _, exists := bindings[incomingKey]; exists {
+		return true
+	}
+	for key, value := range bindings {
+		if canEvict == nil || canEvict(value) {
+			delete(bindings, key)
+			return true
+		}
+	}
+	return false
+}
+
+func canEnsureBindingCapacity[T any](bindings map[string]T, incomingKey string, maxEntries int, canEvict func(T) bool) bool {
+	if len(bindings) < maxEntries || maxEntries <= 0 {
+		return true
+	}
+	if _, exists := bindings[incomingKey]; exists {
+		return true
+	}
+	for _, value := range bindings {
+		if canEvict == nil || canEvict(value) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeOpenAIWSResponseID(responseID string) string {
