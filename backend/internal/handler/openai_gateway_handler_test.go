@@ -1368,6 +1368,36 @@ func TestOpenAIResponsesWebSocket_PassthroughUsageLogPersistsUserAgentAndReasoni
 	require.True(t, got.log.OpenAIWSMode)
 }
 
+func TestOpenAIResponsesWebSocket_PassthroughRechecksSubscriptionBillingPerTurn(t *testing.T) {
+	dailyLimit := 1.0
+	billingCache := &openAIWSSubscriptionBillingCacheStub{}
+	got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
+		firstPayload:  `{"type":"response.create","model":"gpt-5.4","stream":false}`,
+		secondPayload: `{"type":"response.create","model":"gpt-5.4","stream":false}`,
+		billingCache:  billingCache,
+		group: &service.Group{
+			ID:               4201,
+			Platform:         service.PlatformOpenAI,
+			Status:           service.StatusActive,
+			SubscriptionType: service.SubscriptionTypeSubscription,
+			DailyLimitUSD:    &dailyLimit,
+		},
+		subscription: &service.UserSubscription{
+			Status:    service.SubscriptionStatusActive,
+			ExpiresAt: time.Now().Add(time.Hour),
+		},
+		expectSecondTurnBillingRejection: true,
+		afterFirstUpstreamRequest: func(*service.ChannelService) error {
+			billingCache.setDailyUsage(dailyLimit)
+			return nil
+		},
+	})
+
+	require.Len(t, got.upstreamPayloads, 1, "the rejected second turn must never reach the upstream socket")
+	require.Len(t, got.logs, 1)
+	require.Equal(t, 2, billingCache.checkCount(), "only the handshake and subsequent turn may check billing")
+}
+
 func TestOpenAIResponsesWebSocket_PassthroughUsageLogInfersReasoningFromInitialRequestModel(t *testing.T) {
 	got := runOpenAIResponsesWebSocketUsageLogCase(t, openAIResponsesWSUsageLogCase{
 		firstPayload: `{"type":"response.create","model":"gpt-5.4-xhigh","stream":false}`,
@@ -1765,14 +1795,18 @@ func newOpenAIWSHandlerTestServer(t *testing.T, h *OpenAIGatewayHandler, subject
 }
 
 type openAIResponsesWSUsageLogCase struct {
-	firstPayload              string
-	secondPayload             string
-	userAgent                 *string
-	ingressMode               string
-	channelMapping            map[string]string
-	billingModelSource        string
-	accountModelMapping       map[string]any
-	afterFirstUpstreamRequest func(channelSvc *service.ChannelService) error
+	firstPayload                     string
+	secondPayload                    string
+	userAgent                        *string
+	ingressMode                      string
+	channelMapping                   map[string]string
+	billingModelSource               string
+	accountModelMapping              map[string]any
+	billingCache                     service.BillingCache
+	group                            *service.Group
+	subscription                     *service.UserSubscription
+	expectSecondTurnBillingRejection bool
+	afterFirstUpstreamRequest        func(channelSvc *service.ChannelService) error
 }
 
 type openAIResponsesWSUsageLogResult struct {
@@ -1781,6 +1815,42 @@ type openAIResponsesWSUsageLogResult struct {
 	upstreamFirstPayload []byte
 	upstreamPayloads     [][]byte
 	clientEvents         [][]byte
+}
+
+type openAIWSSubscriptionBillingCacheStub struct {
+	service.BillingCache
+	mu         sync.Mutex
+	dailyUsage float64
+	checks     int
+}
+
+func (s *openAIWSSubscriptionBillingCacheStub) GetSubscriptionCache(context.Context, int64, int64) (*service.SubscriptionCacheData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checks++
+	return &service.SubscriptionCacheData{
+		Status:       service.SubscriptionStatusActive,
+		ExpiresAt:    time.Now().Add(time.Hour),
+		DailyUsage:   s.dailyUsage,
+		WeeklyUsage:  s.dailyUsage,
+		MonthlyUsage: s.dailyUsage,
+	}, nil
+}
+
+func (s *openAIWSSubscriptionBillingCacheStub) UpdateSubscriptionUsage(context.Context, int64, int64, float64) error {
+	return nil
+}
+
+func (s *openAIWSSubscriptionBillingCacheStub) setDailyUsage(usage float64) {
+	s.mu.Lock()
+	s.dailyUsage = usage
+	s.mu.Unlock()
+}
+
+func (s *openAIWSSubscriptionBillingCacheStub) checkCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checks
 }
 
 type openAIWSUsageHandlerAccountRepoStub struct {
@@ -2695,6 +2765,10 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	if strings.TrimSpace(tc.secondPayload) != "" {
 		turnCount = 2
 	}
+	wantCompletedTurns := turnCount
+	if tc.expectSecondTurnBillingRejection {
+		wantCompletedTurns = 1
+	}
 	upstreamPayloadCh := make(chan []byte, turnCount)
 	upstreamErrCh := make(chan error, 1)
 	var channelSvc *service.ChannelService
@@ -2715,6 +2789,10 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 			msgType, payload, readErr := conn.Read(readCtx)
 			cancelRead()
 			if readErr != nil {
+				if tc.expectSecondTurnBillingRejection && turn == 2 {
+					upstreamErrCh <- nil
+					return
+				}
 				upstreamErrCh <- readErr
 				return
 			}
@@ -2800,7 +2878,12 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		}, nil, nil, nil)
 	}
 
-	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	billingCfg := cfg
+	if tc.billingCache != nil {
+		billingCfg = &config.Config{RunMode: config.RunModeStandard}
+	}
+	billingCacheSvc := service.NewBillingCacheService(tc.billingCache, nil, nil, nil, nil, nil, billingCfg, nil)
+	t.Cleanup(billingCacheSvc.Stop)
 	gatewaySvc := service.NewOpenAIGatewayService(
 		accountRepo,
 		usageRepo,
@@ -2844,12 +2927,16 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	apiKey := &service.APIKey{
 		ID:      1801,
 		GroupID: &groupID,
+		Group:   tc.group,
 		User:    &service.User{ID: 1701, Status: service.StatusActive},
 	}
 	router := gin.New()
 	router.Use(func(c *gin.Context) {
 		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
 		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		if tc.subscription != nil {
+			c.Set(string(middleware.ContextKeySubscription), tc.subscription)
+		}
 		c.Next()
 	})
 	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
@@ -2892,12 +2979,22 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		err = clientConn.Write(writeCtx, coderws.MessageText, []byte(tc.secondPayload))
 		cancelWrite()
 		require.NoError(t, err)
-		readCompleted()
+		if tc.expectSecondTurnBillingRejection {
+			readCtx, cancelRead := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _, readErr := clientConn.Read(readCtx)
+			cancelRead()
+			var closeErr coderws.CloseError
+			require.ErrorAs(t, readErr, &closeErr)
+			require.Equal(t, coderws.StatusPolicyViolation, closeErr.Code)
+			require.Equal(t, "billing check failed", closeErr.Reason)
+		} else {
+			readCompleted()
+		}
 	}
 	_ = clientConn.Close(coderws.StatusNormalClosure, "done")
 
-	usageLogs := make([]*service.UsageLog, 0, turnCount)
-	for len(usageLogs) < turnCount {
+	usageLogs := make([]*service.UsageLog, 0, wantCompletedTurns)
+	for len(usageLogs) < wantCompletedTurns {
 		select {
 		case usageLog := <-usageRepo.created:
 			require.NotNil(t, usageLog)
@@ -2907,8 +3004,8 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		}
 	}
 
-	upstreamPayloads := make([][]byte, 0, turnCount)
-	for len(upstreamPayloads) < turnCount {
+	upstreamPayloads := make([][]byte, 0, wantCompletedTurns)
+	for len(upstreamPayloads) < wantCompletedTurns {
 		select {
 		case payload := <-upstreamPayloadCh:
 			upstreamPayloads = append(upstreamPayloads, payload)
@@ -2919,7 +3016,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 
 	select {
 	case upstreamErr := <-upstreamErrCh:
-		require.NoError(t, upstreamErr)
+		if !tc.expectSecondTurnBillingRejection {
+			require.NoError(t, upstreamErr)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待上游 WebSocket 结束超时")
 	}

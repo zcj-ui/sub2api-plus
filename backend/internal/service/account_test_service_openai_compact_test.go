@@ -229,7 +229,6 @@ func openAICompactTestAccountWithProxy(account Account) Account {
 	}
 	return account
 }
-
 func TestAccountTestService_TestAccountConnection_OpenAICompact2xxWithoutItemMarksUnsupported(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -322,6 +321,8 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 	// the account's stable compact-probe session, without collapsing all turns
 	// on the account into the full-convergence identity.
 	converged := resolveCodexConversationSessionID(&account, compactProbeSessionID(account.ID))
+	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
+	// 显式 session 收敛模式：出站身份 = 账号级收敛值
 	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
 	require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
 	require.Equal(t, resolveConvergedInstallationID(&account), upstream.lastReq.Header.Get("x-codex-installation-id"),

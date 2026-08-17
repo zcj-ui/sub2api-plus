@@ -84,6 +84,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if extractOpenAICodexTurnState(attemptResponseHeaders) == "" {
 			return
 		}
+		s.noteStagedOpenAICodexTurnStateCommitted(c, account, attemptResponseHeaders)
 		turnStateProvenanceNoted = true
 	}
 

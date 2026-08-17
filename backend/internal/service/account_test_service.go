@@ -2175,7 +2175,6 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 				mergeAccountExtra(account, codexUpdates)
 			}
 		}
-		// 探测如返回 429,主动同步限流状态,避免后续短时间内继续选中。
 		if resp.StatusCode == http.StatusTooManyRequests {
 			s.reconcileOpenAI429State(ctx, account, resp.Header, body)
 		}

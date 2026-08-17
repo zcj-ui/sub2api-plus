@@ -155,6 +155,15 @@ func TestAccountOpenAICompactSupportKnown(t *testing.T) {
 			wantKnown:     false,
 		},
 		{
+			name: "unversioned negative remains a scheduling veto",
+			account: &Account{
+				Platform: PlatformOpenAI,
+				Extra:    map[string]any{"openai_compact_supported": false},
+			},
+			wantSupported: false,
+			wantKnown:     true,
+		},
+		{
 			name: "invalid probe field remains unknown",
 			account: &Account{
 				Platform: PlatformOpenAI,

@@ -1,10 +1,22 @@
 package service
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+type configuredProxyLookupStub struct {
+	ProxyRepository
+	proxy *Proxy
+	err   error
+}
+
+func (s *configuredProxyLookupStub) GetByID(context.Context, int64) (*Proxy, error) {
+	return s.proxy, s.err
+}
 
 func TestResolveConfiguredProxyURLFailsClosedForConfiguredProxy(t *testing.T) {
 	proxyID := int64(71)
@@ -30,6 +42,23 @@ func TestResolveConfiguredProxyURLAllowsExplicitDirectAccount(t *testing.T) {
 	url, err := resolveConfiguredProxyURL(&Account{Platform: PlatformOpenAI})
 	require.NoError(t, err)
 	require.Empty(t, url)
+}
+
+func TestResolveConfiguredProxyURLWithLookupHydratesAndFailsClosed(t *testing.T) {
+	proxyID := int64(72)
+	configured := &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 8081}
+	account := &Account{Platform: PlatformKimi, ProxyID: &proxyID}
+
+	url, err := resolveConfiguredProxyURLWithLookup(context.Background(), account, &configuredProxyLookupStub{proxy: configured})
+	require.NoError(t, err)
+	require.Equal(t, "http://127.0.0.1:8081", url)
+	require.Same(t, configured, account.Proxy)
+
+	_, err = resolveConfiguredProxyURLWithLookup(context.Background(), &Account{ProxyID: &proxyID}, &configuredProxyLookupStub{err: errors.New("proxy repository unavailable")})
+	require.Error(t, err)
+
+	_, err = resolveConfiguredProxyURLWithLookup(context.Background(), &Account{ProxyID: &proxyID}, &configuredProxyLookupStub{proxy: &Proxy{ID: proxyID + 1}})
+	require.Error(t, err)
 }
 
 func TestResolveConfiguredProxyURLIgnoresStaleRelationWithoutProxyID(t *testing.T) {
