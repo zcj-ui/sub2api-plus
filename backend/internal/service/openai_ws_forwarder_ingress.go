@@ -1022,13 +1022,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			if eventType == "error" {
 				guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
-				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				canonicalModel := canonicalOpenAIAccountSchedulingModel(account, originalModel)
 				s.handleOpenAIWSErrorEventTransientFailure(ctx, account, canonicalModel, lease.HandshakeHeaders(), upstreamMessage)
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
-				guardConnectionAtEvent = guardRateLimitedConnectionActive()
+				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				if guardAccountActiveAtEvent && !guardConnectionAtEvent && !isRateLimit {
 					failedStatus, _ := openAIWS429GuardErrorEventFailureStatus(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw)
 					guardConnectionBroken = true
@@ -1140,7 +1139,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				if isRateLimit && guardRateLimitedConnectionActive() {
 					retained429ErrorTerminal = true
 					if len(pendingJSONDocuments) > 0 {
-						guardConnectionBroken = true
 						lease.MarkBroken()
 						return nil, wrapOpenAIWSIngressTurnErrorWithSemantic(
 							"upstream_error_event",
@@ -1170,13 +1168,12 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 
 			if eventType == "response.failed" {
 				guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
-				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
 				// Re-evaluate after recording: this event may be the confirming
 				// 429 that proves and pins this exact lease.
-				guardConnectionAtEvent = guardRateLimitedConnectionActive()
+				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				if !clientDisconnected && !wroteSemanticDownstream && isRateLimit && !guardRateLimitedConnectionActive() {
 					lease.MarkBroken()
 					return nil, &UpstreamFailoverError{

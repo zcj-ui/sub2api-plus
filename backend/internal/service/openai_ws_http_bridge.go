@@ -505,7 +505,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		}
 		if !clientDisconnected {
 			stageBeforeSemanticOutput := turn == 1 && account.Platform == PlatformOpenAI && !wroteDownstream
-			startsClientOutput := openAIStreamDataStartsClientOutput(string(clientMessage), eventType)
+			var startsClientOutput bool
 			if account.Platform == PlatformOpenAI {
 				startsClientOutput = openAIStreamDataStartsClientOutputForStaging(string(clientMessage), eventType)
 			} else {

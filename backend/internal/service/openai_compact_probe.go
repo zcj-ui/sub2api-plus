@@ -385,20 +385,6 @@ func buildOpenAICompactProbeExtraUpdatesLegacy(resp *http.Response, body []byte,
 	return updates
 }
 
-func mergeExtraUpdates(base map[string]any, more map[string]any) map[string]any {
-	if len(base) == 0 && len(more) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(base)+len(more))
-	for key, value := range base {
-		out[key] = value
-	}
-	for key, value := range more {
-		out[key] = value
-	}
-	return out
-}
-
 func compactProbeSessionID(accountID int64) string {
 	// A probe is an independent root turn. Use the same UUIDv7 shape as the
 	// official Codex client instead of deriving identity from the local account

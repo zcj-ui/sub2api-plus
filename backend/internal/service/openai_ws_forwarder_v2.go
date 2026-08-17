@@ -659,7 +659,6 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 
 		if eventType == "response.failed" {
 			guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
-			guardConnectionAtEvent := guardRateLimitedConnectionActive()
 			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(message)
 			upstreamStatus := openAIWSPayloadUpstreamStatus(message)
 			isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, message)
@@ -667,7 +666,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			// while recordRateLimitSignal ran. Re-read after recording so that
 			// signal is retained, while a non-429 failure on an unproven fresh
 			// socket is never allowed to return to the pool.
-			guardConnectionAtEvent = guardRateLimitedConnectionActive()
+			guardConnectionAtEvent := guardRateLimitedConnectionActive()
 			if hit, code, msg := detectOpenAICyberPolicy(message); hit {
 				MarkOpsCyberPolicy(c, CyberPolicyMark{
 					Code:           code,
@@ -720,12 +719,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 
 		if eventType == "error" {
 			guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
-			guardConnectionAtEvent := guardRateLimitedConnectionActive()
 			s.handleOpenAIWSErrorEventTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
 			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(message)
 			upstreamStatus := openAIWSPayloadUpstreamStatus(message)
 			isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, message)
-			guardConnectionAtEvent = guardRateLimitedConnectionActive()
+			guardConnectionAtEvent := guardRateLimitedConnectionActive()
 			// A retained 429 socket is usable only while it continues to emit
 			// rate-limit semantics. Any other `error` envelope is an upstream
 			// failure; evict it before the client sees the frame so the handler

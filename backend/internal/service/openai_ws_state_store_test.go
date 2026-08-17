@@ -62,7 +62,8 @@ func TestOpenAIWSStateStore_GuardBindingsDoNotExpire(t *testing.T) {
 
 	// A guard binding uses the zero expiry sentinel and must remain available
 	// across the ordinary cleanup interval.
-	store := raw.(*defaultOpenAIWSStateStore)
+	store, ok := raw.(*defaultOpenAIWSStateStore)
+	require.True(t, ok)
 	store.lastCleanupUnixNano.Store(time.Now().Add(-2 * openAIWSStateStoreCleanupInterval).UnixNano())
 	store.maybeCleanup()
 	_, ok = raw.GetResponseConn("resp_guard_persistent")
@@ -119,7 +120,8 @@ func TestOpenAIWSStateStore_OrdinaryDeletesPreserveGuardTuple(t *testing.T) {
 
 func TestOpenAIWSStateStore_ConditionalResponseDeleteChecksConnection(t *testing.T) {
 	raw := NewOpenAIWSStateStore(nil)
-	store := raw.(*defaultOpenAIWSStateStore)
+	store, ok := raw.(*defaultOpenAIWSStateStore)
+	require.True(t, ok)
 	ctx := context.Background()
 	require.NoError(t, raw.BindResponseAccount(ctx, 4, "resp_conditional", 801, time.Minute))
 	raw.BindResponseConn("resp_conditional", "conn_new", time.Minute)
@@ -143,8 +145,10 @@ func TestOpenAIWSStateStore_ConditionalResponseDeleteChecksConnection(t *testing
 
 func TestOpenAIWSStateStore_ConditionalGuardDeleteRequiresExactConnection(t *testing.T) {
 	raw := NewOpenAIWSStateStore(nil)
-	store := raw.(*defaultOpenAIWSStateStore)
-	guardStore := raw.(openAIWSGuardBindingStore)
+	store, ok := raw.(*defaultOpenAIWSStateStore)
+	require.True(t, ok)
+	guardStore, ok := raw.(openAIWSGuardBindingStore)
+	require.True(t, ok)
 	ctx := context.Background()
 	guardStore.BindGuardResponse(6, "resp_guard_conditional", 902, "conn_guard_conditional")
 	cleaner := openAIWSContinuationBindingCleaner(store)
@@ -159,13 +163,14 @@ func TestOpenAIWSStateStore_ConditionalGuardDeleteRequiresExactConnection(t *tes
 	accountID, err = raw.GetResponseAccount(ctx, 6, "resp_guard_conditional")
 	require.NoError(t, err)
 	require.Zero(t, accountID)
-	_, ok := raw.GetResponseConn("resp_guard_conditional")
+	_, ok = raw.GetResponseConn("resp_guard_conditional")
 	require.False(t, ok)
 }
 
 func TestOpenAIWSStateStore_PoolEvictionClearsExactConnectionBindings(t *testing.T) {
 	raw := NewOpenAIWSStateStore(nil)
-	store := raw.(*defaultOpenAIWSStateStore)
+	store, ok := raw.(*defaultOpenAIWSStateStore)
+	require.True(t, ok)
 	pool := newOpenAIWSConnPool(nil)
 	defer pool.Close()
 	pool.setClientDialerForTest(&openAIWSFakeDialer{})
@@ -180,7 +185,8 @@ func TestOpenAIWSStateStore_PoolEvictionClearsExactConnectionBindings(t *testing
 	require.NotNil(t, lease)
 
 	connID := lease.ConnID()
-	guardStore := raw.(openAIWSGuardBindingStore)
+	guardStore, ok := raw.(openAIWSGuardBindingStore)
+	require.True(t, ok)
 	guardStore.BindGuardResponse(9, "resp_pool_evicted", account.ID, connID)
 	guardStore.BindGuardSession(9, "session_pool_evicted", account.ID, connID)
 	raw.BindSessionTurnState(9, "session_pool_evicted", "turn_state_pool_evicted", time.Hour)

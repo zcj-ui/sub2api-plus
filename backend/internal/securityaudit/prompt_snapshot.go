@@ -456,9 +456,7 @@ func contentTexts(value any) []string {
 				}
 				continue
 			}
-			for _, text := range toolInteractionTexts(object) {
-				result = append(result, text)
-			}
+			result = append(result, toolInteractionTexts(object)...)
 		}
 		return result
 	case map[string]any:

@@ -1,10 +1,18 @@
 # Sub2API Plus 更新日志
 
-当前准备版本：`0.2.3`
+当前准备版本：`0.2.4`
 
 发布日期：2026-08-18
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
+
+## 0.2.4 发布门禁与 WebSocket 状态清理
+
+- 修复正式 CI 在 `golangci-lint v2.9` 下发现的未使用函数、无效赋值、未检查类型断言和静态检查问题，保持 WebSocket 429 守护、会话租约和错误切换语义不变。
+- 清理不再使用的状态容量兼容 helper，并为状态存储测试补齐类型断言检查，避免测试 panic 被误判为运行时成功。
+- 重新验证 OpenAI WebSocket ingress/v2、HTTP bridge、额度/调度状态存储和安全审计路径；本地 Go 测试与同版本 golangci-lint 均通过。
+
+验证结果：`internal/service`、`internal/securityaudit` 测试通过，`golangci-lint v2.9` 全仓 `0 issues`，`gofmt` 与 `git diff --check` 通过。`v0.2.3` 标签曾因 CI 外部 schema 超时及随后暴露的 lint 问题未生成 Release；本版本使用新标签发布，不重写历史标签。
 
 ## 0.2.3 OpenAI/Codex 正式兼容性与账户运营增强
 

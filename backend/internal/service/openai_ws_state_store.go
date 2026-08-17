@@ -788,20 +788,6 @@ func openAIWSBindingActive(expiresAt, now time.Time) bool {
 	return expiresAt.IsZero() || now.Before(expiresAt)
 }
 
-func ensureBindingCapacityLegacy[T any](bindings map[string]T, incomingKey string, maxEntries int) {
-	if len(bindings) < maxEntries || maxEntries <= 0 {
-		return
-	}
-	if _, exists := bindings[incomingKey]; exists {
-		return
-	}
-	// 固定上限保护：淘汰任意一项，优先保证内存有界。
-	for key := range bindings {
-		delete(bindings, key)
-		return
-	}
-}
-
 // ensureBindingCapacity applies the optional eviction policy and reports
 // whether a slot is available. Existing callers that ignore the return value
 // retain the original bounded-map behavior.
