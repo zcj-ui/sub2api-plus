@@ -5,14 +5,17 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
 type updatingProxyRepoStub struct {
 	*proxyRepoStub
-	proxy       *Proxy
-	updateCalls int
+	proxy             *Proxy
+	updateCalls       int
+	accountSummaries  []ProxyAccountSummary
+	accountSummaryErr error
 }
 
 func (s *updatingProxyRepoStub) GetByID(context.Context, int64) (*Proxy, error) {
@@ -25,6 +28,101 @@ func (s *updatingProxyRepoStub) Update(_ context.Context, proxy *Proxy) error {
 	copy := *proxy
 	s.proxy = &copy
 	return nil
+}
+
+func (s *updatingProxyRepoStub) ListAccountSummariesByProxyID(_ context.Context, _ int64) ([]ProxyAccountSummary, error) {
+	if s.accountSummaryErr != nil {
+		return nil, s.accountSummaryErr
+	}
+	return append([]ProxyAccountSummary(nil), s.accountSummaries...), nil
+}
+
+type openAIWSInvalidatorSpy struct {
+	accountIDs []int64
+}
+
+func (s *openAIWSInvalidatorSpy) InvalidateOpenAIWSConnections(accountID int64) {
+	s.accountIDs = append(s.accountIDs, accountID)
+}
+
+type runtimeBlockerWithOpenAIWSInvalidator struct {
+	openAIWSInvalidatorSpy
+}
+
+func (runtimeBlockerWithOpenAIWSInvalidator) BlockAccountScheduling(*Account, time.Time, string) {}
+
+func (runtimeBlockerWithOpenAIWSInvalidator) ClearAccountSchedulingBlock(int64) {}
+
+func TestProxyServiceUpdateInvalidatesDeduplicatedAccountConnections(t *testing.T) {
+	repo := &updatingProxyRepoStub{
+		proxyRepoStub: &proxyRepoStub{},
+		proxy:         &Proxy{ID: 9, Protocol: "http", Host: "old.example", Port: 8080, Status: StatusActive},
+		accountSummaries: []ProxyAccountSummary{
+			{ID: 41, Platform: PlatformOpenAI},
+			{ID: 41, Platform: PlatformOpenAI},
+			{ID: 0, Platform: PlatformOpenAI},
+			{ID: 52, Platform: PlatformOpenAI},
+			{ID: 63, Platform: PlatformAnthropic},
+		},
+	}
+	invalidator := &openAIWSInvalidatorSpy{}
+	svc := NewProxyService(repo, invalidator)
+	host := "new.example"
+
+	_, err := svc.Update(context.Background(), 9, UpdateProxyRequest{Host: &host})
+
+	require.NoError(t, err)
+	require.Equal(t, []int64{41, 52}, invalidator.accountIDs)
+}
+
+func TestProxyServiceDeleteInvalidatesConnectionsAfterSuccessfulDelete(t *testing.T) {
+	repo := &updatingProxyRepoStub{
+		proxyRepoStub: &proxyRepoStub{},
+		proxy:         &Proxy{ID: 9, Protocol: "http", Host: "proxy.example", Port: 8080, Status: StatusActive},
+		accountSummaries: []ProxyAccountSummary{
+			{ID: 61, Platform: PlatformOpenAI},
+			{ID: 61, Platform: PlatformOpenAI},
+		},
+	}
+	invalidator := &openAIWSInvalidatorSpy{}
+	svc := NewProxyService(repo, invalidator)
+
+	err := svc.Delete(context.Background(), 9)
+
+	require.NoError(t, err)
+	require.Equal(t, []int64{9}, repo.deletedIDs)
+	require.Equal(t, []int64{61}, invalidator.accountIDs)
+}
+
+func TestAdminProxyMutationsInvalidateOpenAIWSConnections(t *testing.T) {
+	repo := &updatingProxyRepoStub{
+		proxyRepoStub: &proxyRepoStub{},
+		proxy:         &Proxy{ID: 9, Protocol: "http", Host: "proxy.example", Port: 8080, Status: StatusActive},
+		accountSummaries: []ProxyAccountSummary{
+			{ID: 73, Platform: PlatformOpenAI},
+		},
+	}
+	runtime := &runtimeBlockerWithOpenAIWSInvalidator{}
+	svc := &adminServiceImpl{proxyRepo: repo, runtimeBlocker: runtime}
+
+	_, err := svc.UpdateProxy(context.Background(), 9, &UpdateProxyInput{
+		Host:           "new.example",
+		FallbackMode:   FallbackModeNone,
+		ExpiryWarnDays: 7,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []int64{73}, runtime.accountIDs)
+
+	runtime.accountIDs = nil
+	err = svc.DeleteProxy(context.Background(), 9)
+	require.NoError(t, err)
+	require.Equal(t, []int64{73}, runtime.accountIDs)
+
+	runtime.accountIDs = nil
+	result, err := svc.BatchDeleteProxies(context.Background(), []int64{10, 11})
+	require.NoError(t, err)
+	require.Equal(t, []int64{10, 11}, result.DeletedIDs)
+	require.Equal(t, []int64{73, 73}, runtime.accountIDs)
 }
 
 func TestBothProxyUpdateServicesUseRepositoryUpdateBoundary(t *testing.T) {

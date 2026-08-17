@@ -3021,7 +3021,7 @@
         </div>
       </div>
 
-      <!-- OpenAI/Codex 429 guard（仅 OpenAI OAuth） -->
+      <!-- 奸商模式（仅 OpenAI OAuth） -->
       <div
         v-if="form.platform === 'openai' && form.type === 'oauth'"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3878,7 +3878,7 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
-const codex429GuardEnabled = ref(true)
+const codex429GuardEnabled = ref(false)
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
   { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
@@ -4804,7 +4804,7 @@ const resetForm = () => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
-  codex429GuardEnabled.value = true
+  codex429GuardEnabled.value = false
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
   webSearchEmulationMode.value = 'default'

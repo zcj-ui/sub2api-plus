@@ -288,14 +288,13 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
-  it('OpenAI OAuth 批量编辑可统一关闭卡429开关', async () => {
+  it('OpenAI OAuth 批量编辑默认统一关闭奸商模式', async () => {
     const wrapper = mountModal({
       selectedPlatforms: ['openai'],
       selectedTypes: ['oauth']
     })
 
     await wrapper.get('#bulk-edit-codex-429-guard-enabled').setValue(true)
-    await wrapper.get('[data-testid="bulk-edit-codex-429-guard-toggle"]').trigger('click')
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 

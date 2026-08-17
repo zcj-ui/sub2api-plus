@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -81,13 +83,20 @@ type openAIWSHandshakeCompatibilityKey struct {
 }
 
 type openAIWSConnLease struct {
-	pool      *openAIWSConnPool
-	accountID int64
-	conn      *openAIWSConn
-	queueWait time.Duration
-	connPick  time.Duration
-	reused    bool
-	released  atomic.Bool
+	pool                          *openAIWSConnPool
+	accountID                     int64
+	conn                          *openAIWSConn
+	queueWait                     time.Duration
+	connPick                      time.Duration
+	reused                        bool
+	openAI429GuardActiveAtAcquire bool
+	openAIRuntimeBlockGeneration  uint64
+	// openAI429GuardProven records that this lease was the exact connection
+	// observed or selected for a confirmed 429 guard. It remains true after
+	// pool eviction so failure handling can switch accounts instead of
+	// redialing the same account after the cooldown expires.
+	openAI429GuardProven atomic.Bool
+	released             atomic.Bool
 }
 
 func (l *openAIWSConnLease) activeConn() (*openAIWSConn, error) {
@@ -241,12 +250,21 @@ func (l *openAIWSConnLease) Release() {
 }
 
 type openAIWSConn struct {
-	id string
-	ws openAIWSClientConn
+	id        string
+	accountID int64
+	ws        openAIWSClientConn
+	// onClose is installed by the owning pool for real dialed connections. It
+	// lets out-of-band eviction (idle ping, max-age cleanup, account reset)
+	// invalidate the exact response/session bindings that point at this socket.
+	onClose func(accountID int64, connID string)
 
 	handshakeHeaders       http.Header
 	handshakeCompatibility openAIWSHandshakeCompatibilityKey
 	routingAffinity        string
+	proxyURL               string
+	wsURL                  string
+	proxyURLKnown          bool
+	wsURLKnown             bool
 
 	leaseCh   chan struct{}
 	closedCh  chan struct{}
@@ -259,12 +277,23 @@ type openAIWSConn struct {
 	createdAtNano atomic.Int64
 	lastUsedNano  atomic.Int64
 	prewarmed     atomic.Bool
+	// guardConfirmed429Generation is positive only after this exact pooled
+	// socket has observed the confirming 429 for the corresponding runtime
+	// block generation. It prevents ordinary sticky bindings from promoting a
+	// newly dialed connection into the permanent guard socket.
+	guardConfirmed429Generation atomic.Uint64
+	// guard429CandidateGeneration is non-zero only for sockets already present
+	// in the pool when a confirmed Codex OAuth 429 block begins. Binding the
+	// candidate to the exact runtime generation prevents stale evidence from a
+	// prior block from promoting the socket in a later block.
+	guard429CandidateGeneration atomic.Uint64
 }
 
-func newOpenAIWSConn(id string, _ int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
+func newOpenAIWSConn(id string, accountID int64, ws openAIWSClientConn, handshakeHeaders http.Header) *openAIWSConn {
 	now := time.Now()
 	conn := &openAIWSConn{
 		id:               id,
+		accountID:        accountID,
 		ws:               ws,
 		handshakeHeaders: cloneHeader(handshakeHeaders),
 		leaseCh:          make(chan struct{}, 1),
@@ -348,6 +377,9 @@ func (c *openAIWSConn) close() {
 		close(c.closedCh)
 		if c.ws != nil {
 			_ = c.ws.Close()
+		}
+		if c.onClose != nil {
+			c.onClose(c.accountID, c.id)
 		}
 		select {
 		case c.leaseCh <- struct{}{}:
@@ -542,6 +574,29 @@ func (c *openAIWSConn) matchesHandshakeCompatibility(compatibility openAIWSHands
 	return c != nil && c.handshakeCompatibility == compatibility
 }
 
+func (c *openAIWSConn) matchesProxyURL(proxyURL string) bool {
+	if c == nil {
+		return false
+	}
+	if !c.proxyURLKnown && c.proxyURL == "" {
+		// Test/custom pool fixtures created before proxy identity was tracked
+		// have no metadata. Treat them as unknown rather than as direct, while
+		// every real dial records proxyURLKnown below.
+		return true
+	}
+	return c.proxyURL == normalizeOpenAIWSProxyURL(proxyURL)
+}
+
+func (c *openAIWSConn) matchesWSURL(wsURL string) bool {
+	if c == nil {
+		return false
+	}
+	if !c.wsURLKnown && c.wsURL == "" {
+		return true
+	}
+	return c.wsURL == normalizeOpenAIWSURL(wsURL)
+}
+
 func (c *openAIWSConn) matchesRoutingAffinity(routingAffinity string) bool {
 	return c != nil && c.routingAffinity == routingAffinity
 }
@@ -561,18 +616,19 @@ func (c *openAIWSConn) markPrewarmed() {
 }
 
 type openAIWSAccountPool struct {
-	mu            sync.Mutex
-	conns         map[string]*openAIWSConn
-	pinnedConns   map[string]int
-	changedCh     chan struct{}
-	creating      int
-	generation    uint64
-	lastCleanupAt time.Time
-	lastAcquire   *openAIWSAcquireRequest
-	prewarmActive bool
-	prewarmUntil  time.Time
-	prewarmFails  int
-	prewarmFailAt time.Time
+	mu               sync.Mutex
+	conns            map[string]*openAIWSConn
+	pinnedConns      map[string]int
+	guardPinnedUntil map[string]time.Time
+	changedCh        chan struct{}
+	creating         int
+	generation       uint64
+	lastCleanupAt    time.Time
+	lastAcquire      *openAIWSAcquireRequest
+	prewarmActive    bool
+	prewarmUntil     time.Time
+	prewarmFails     int
+	prewarmFailAt    time.Time
 }
 
 func (ap *openAIWSAccountPool) changeChannelLocked() chan struct{} {
@@ -620,6 +676,9 @@ type openAIWSConnPool struct {
 	cfg *config.Config
 	// 通过接口解耦底层 WS 客户端实现，默认使用 coder/websocket。
 	clientDialer openAIWSClientDialer
+
+	guardBindingInvalidatorMu sync.RWMutex
+	guardBindingInvalidator   func(accountID int64, connID string)
 
 	accounts sync.Map // key: int64(accountID), value: *openAIWSAccountPool
 	seq      atomic.Uint64
@@ -673,6 +732,29 @@ func (p *openAIWSConnPool) setClientDialerForTest(dialer openAIWSClientDialer) {
 		return
 	}
 	p.clientDialer = dialer
+}
+
+// setGuardBindingInvalidator wires the process-local WS state store to the
+// transport pool. The callback is optional for standalone pool users.
+func (p *openAIWSConnPool) setGuardBindingInvalidator(invalidator func(accountID int64, connID string)) {
+	if p == nil {
+		return
+	}
+	p.guardBindingInvalidatorMu.Lock()
+	p.guardBindingInvalidator = invalidator
+	p.guardBindingInvalidatorMu.Unlock()
+}
+
+func (p *openAIWSConnPool) notifyGuardBindingInvalidated(accountID int64, connID string) {
+	if p == nil || accountID <= 0 || strings.TrimSpace(connID) == "" {
+		return
+	}
+	p.guardBindingInvalidatorMu.RLock()
+	invalidator := p.guardBindingInvalidator
+	p.guardBindingInvalidatorMu.RUnlock()
+	if invalidator != nil {
+		invalidator(accountID, strings.TrimSpace(connID))
+	}
 }
 
 // Close 停止后台 worker 并关闭所有空闲连接，应在优雅关闭时调用。
@@ -884,7 +966,7 @@ retryAcquire:
 				return nil, errOpenAIWSPreferredConnUnavailable
 			}
 			preferredConn, ok := ap.conns[preferredConnID]
-			if !ok || !preferredConn.matchesHandshakeCompatibility(compatibility) {
+			if !ok || !preferredConn.matchesHandshakeCompatibility(compatibility) || !preferredConn.matchesProxyURL(req.ProxyURL) || !preferredConn.matchesWSURL(req.WSURL) {
 				p.recordConnPickDuration(time.Since(pickStartedAt))
 				ap.mu.Unlock()
 				closeOpenAIWSConns(evicted)
@@ -967,7 +1049,7 @@ retryAcquire:
 		}
 
 		if preferredConnID != "" {
-			if conn, ok := ap.conns[preferredConnID]; ok && conn.matchesHandshakeCompatibility(compatibility) && conn.tryAcquire() {
+			if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(req.ProxyURL) && conn.matchesWSURL(req.WSURL) && conn.tryAcquire() {
 				connPick := time.Since(pickStartedAt)
 				p.recordConnPickDuration(connPick)
 				ap.mu.Unlock()
@@ -993,7 +1075,7 @@ retryAcquire:
 		// A routing hint is advisory at WebSocket dial time. Prefer a pooled
 		// connection whose handshake used the same hint, but do not make that
 		// preference a continuation compatibility requirement.
-		best := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity)
+		best := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity, req.ProxyURL, req.WSURL)
 		if best != nil && best.tryAcquire() {
 			connPick := time.Since(pickStartedAt)
 			p.recordConnPickDuration(connPick)
@@ -1016,7 +1098,7 @@ retryAcquire:
 			return lease, nil
 		}
 		for _, conn := range ap.conns {
-			if conn == nil || conn == best || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesRoutingAffinity(routingAffinity) {
+			if conn == nil || conn == best || p.isPermanentGuardConnLocked(ap, conn.id) || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesProxyURL(req.ProxyURL) || !conn.matchesWSURL(req.WSURL) || !conn.matchesRoutingAffinity(routingAffinity) {
 				continue
 			}
 			if conn.tryAcquire() {
@@ -1044,13 +1126,13 @@ retryAcquire:
 	}
 
 	if !req.ForceNewConn && len(ap.conns)+ap.creating >= effectiveMaxConns {
-		affine := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity)
-		if idle := p.pickOldestIdleConnWithoutHandshakeCompatibilityOrRoutingAffinityLocked(ap, compatibility, routingAffinity); idle != nil {
+		affine := p.pickLeastBusyConnWithRoutingAffinityLocked(ap, compatibility, routingAffinity, req.ProxyURL, req.WSURL)
+		if idle := p.pickOldestIdleConnWithoutHandshakeCompatibilityOrRoutingAffinityLocked(ap, compatibility, routingAffinity, req.ProxyURL, req.WSURL); idle != nil {
 			delete(ap.conns, idle.id)
 			evicted = append(evicted, idle)
 			p.metrics.scaleDownTotal.Add(1)
 		} else if affine == nil {
-			compatible := p.pickLeastBusyConnLocked(ap, "", compatibility)
+			compatible := p.pickLeastBusyConnLocked(ap, "", compatibility, req.ProxyURL, req.WSURL)
 			if compatible != nil {
 				// Capacity is full and every compatible connection is busy. The
 				// hint remains soft here: queue on a compatible connection below.
@@ -1067,6 +1149,12 @@ retryAcquire:
 				ap.mu.Unlock()
 				closeOpenAIWSConns(evicted)
 				return nil, errOpenAIWSConnClosed
+			}
+			if !p.hasNonGuardConnLocked(ap) && p.hasPermanentGuardPinLocked(ap) {
+				p.recordConnPickDuration(time.Since(pickStartedAt))
+				ap.mu.Unlock()
+				closeOpenAIWSConns(evicted)
+				return nil, errOpenAIWSConnQueueFull
 			}
 			changedCh := ap.changeChannelLocked()
 			ap.mu.Unlock()
@@ -1150,7 +1238,7 @@ retryAcquire:
 	}
 
 acquireAtCapacity:
-	target := p.pickLeastBusyConnLocked(ap, req.PreferredConnID, compatibility)
+	target := p.pickLeastBusyConnLocked(ap, req.PreferredConnID, compatibility, req.ProxyURL, req.WSURL)
 	connPick := time.Since(pickStartedAt)
 	p.recordConnPickDuration(connPick)
 	if target == nil {
@@ -1245,6 +1333,8 @@ func (p *openAIWSConnPool) pickOldestIdleConnWithoutHandshakeCompatibilityOrRout
 	ap *openAIWSAccountPool,
 	compatibility openAIWSHandshakeCompatibilityKey,
 	routingAffinity string,
+	proxyURL string,
+	wsURL string,
 ) *openAIWSConn {
 	if ap == nil || len(ap.conns) == 0 {
 		return nil
@@ -1252,8 +1342,14 @@ func (p *openAIWSConnPool) pickOldestIdleConnWithoutHandshakeCompatibilityOrRout
 	var oldest *openAIWSConn
 	for _, conn := range ap.conns {
 		if conn == nil ||
-			(conn.matchesHandshakeCompatibility(compatibility) && conn.matchesRoutingAffinity(routingAffinity)) ||
-			conn.isLeased() || conn.waiters.Load() > 0 || p.isConnPinnedLocked(ap, conn.id) {
+			(conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) && conn.matchesRoutingAffinity(routingAffinity)) ||
+			conn.isLeased() || conn.waiters.Load() > 0 {
+			continue
+		}
+		// A guard pin protects a still-valid upstream identity. If the account's
+		// proxy or WS target changed, that identity is stale and must not block
+		// the replacement dial indefinitely; only matching targets remain pinned.
+		if p.isConnPinnedLocked(ap, conn.id) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) {
 			continue
 		}
 		if oldest == nil || conn.lastUsedAt().Before(oldest.lastUsedAt()) {
@@ -1273,9 +1369,10 @@ func (p *openAIWSConnPool) getOrCreateAccountPool(accountID int64) *openAIWSAcco
 		}
 	}
 	ap := &openAIWSAccountPool{
-		conns:       make(map[string]*openAIWSConn),
-		pinnedConns: make(map[string]int),
-		changedCh:   make(chan struct{}),
+		conns:            make(map[string]*openAIWSConn),
+		pinnedConns:      make(map[string]int),
+		guardPinnedUntil: make(map[string]time.Time),
+		changedCh:        make(chan struct{}),
 	}
 	actual, _ := p.accounts.LoadOrStore(accountID, ap)
 	if typed, ok := actual.(*openAIWSAccountPool); ok && typed != nil {
@@ -1312,10 +1409,95 @@ func (p *openAIWSConnPool) notifyAccountPoolChanged(accountID int64) {
 }
 
 func (p *openAIWSConnPool) isConnPinnedLocked(ap *openAIWSAccountPool, connID string) bool {
-	if ap == nil || connID == "" || len(ap.pinnedConns) == 0 {
+	if ap == nil || connID == "" {
 		return false
 	}
-	return ap.pinnedConns[connID] > 0
+	if ap.pinnedConns[connID] > 0 {
+		return true
+	}
+	if until, ok := ap.guardPinnedUntil[connID]; ok {
+		// A zero expiry is a deliberate permanent guard pin. It is released
+		// only when the connection is evicted/closed or the account pool is
+		// explicitly invalidated.
+		if until.IsZero() || time.Now().Before(until) {
+			return true
+		}
+		delete(ap.guardPinnedUntil, connID)
+	}
+	return false
+}
+
+// isPermanentGuardConnLocked reports the sentinel pin used by a confirmed
+// Codex 429 continuation. Normal Acquire paths must never reuse this socket:
+// only a ForcePreferredConn continuation with the exact local binding may use
+// it, otherwise unrelated clients can inherit upstream conversation state.
+func (p *openAIWSConnPool) isPermanentGuardConnLocked(ap *openAIWSAccountPool, connID string) bool {
+	if ap == nil || connID == "" {
+		return false
+	}
+	until, pinned := ap.guardPinnedUntil[connID]
+	return pinned && until.IsZero()
+}
+
+func (p *openAIWSConnPool) hasNonGuardConnLocked(ap *openAIWSAccountPool) bool {
+	if ap == nil {
+		return false
+	}
+	for connID, conn := range ap.conns {
+		if conn != nil && !p.isPermanentGuardConnLocked(ap, connID) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPermanentGuardPinLocked reports whether an account still has a live
+// confirmed-429 socket. Expired TTL pins do not suppress prewarming; stale
+// permanent entries are removed here so an evicted socket cannot strand the
+// account's creation budget indefinitely.
+func (p *openAIWSConnPool) hasPermanentGuardPinLocked(ap *openAIWSAccountPool) bool {
+	if ap == nil || len(ap.guardPinnedUntil) == 0 {
+		return false
+	}
+	removed := false
+	for connID, until := range ap.guardPinnedUntil {
+		if !until.IsZero() {
+			continue
+		}
+		conn, exists := ap.conns[connID]
+		if !exists || conn == nil {
+			delete(ap.guardPinnedUntil, connID)
+			removed = true
+			continue
+		}
+		select {
+		case <-conn.closedCh:
+			delete(ap.guardPinnedUntil, connID)
+			removed = true
+		default:
+			return true
+		}
+	}
+	if removed {
+		ap.signalChangedLocked()
+	}
+	return false
+}
+
+// HasPermanentGuardPin reports whether an account has a live connection
+// reserved by the confirmed Codex OAuth 429 guard. The caller still needs the
+// exact local connection identifier and ForcePreferredConn to acquire it.
+func (p *openAIWSConnPool) HasPermanentGuardPin(accountID int64) bool {
+	if p == nil || accountID <= 0 {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return p.hasPermanentGuardPinLocked(ap)
 }
 
 func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now time.Time, maxConns int) []*openAIWSConn {
@@ -1331,6 +1513,9 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
 			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, id)
+			}
 			continue
 		}
 		select {
@@ -1338,6 +1523,9 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
+			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, id)
 			}
 			evicted = append(evicted, conn)
 			continue
@@ -1350,6 +1538,9 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			delete(ap.conns, id)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, id)
+			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, id)
 			}
 			evicted = append(evicted, conn)
 		}
@@ -1369,6 +1560,9 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 				delete(ap.conns, id)
 				if len(ap.pinnedConns) > 0 {
 					delete(ap.pinnedConns, id)
+				}
+				if len(ap.guardPinnedUntil) > 0 {
+					delete(ap.guardPinnedUntil, id)
 				}
 				continue
 			}
@@ -1391,6 +1585,9 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, conn.id)
 			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, conn.id)
+			}
 			evicted = append(evicted, conn)
 		}
 		if redundant > 0 {
@@ -1408,13 +1605,15 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	ap *openAIWSAccountPool,
 	preferredConnID string,
 	compatibility openAIWSHandshakeCompatibilityKey,
+	proxyURL string,
+	wsURL string,
 ) *openAIWSConn {
 	if ap == nil || len(ap.conns) == 0 {
 		return nil
 	}
 	preferredConnID = stringsTrim(preferredConnID)
 	if preferredConnID != "" {
-		if conn, ok := ap.conns[preferredConnID]; ok && conn.matchesHandshakeCompatibility(compatibility) {
+		if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) {
 			return conn
 		}
 	}
@@ -1422,7 +1621,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	var bestWaiters int32
 	var bestLastUsed time.Time
 	for _, conn := range ap.conns {
-		if conn == nil || !conn.matchesHandshakeCompatibility(compatibility) {
+		if conn == nil || p.isPermanentGuardConnLocked(ap, conn.id) || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesProxyURL(proxyURL) || !conn.matchesWSURL(wsURL) {
 			continue
 		}
 		waiters := conn.waiters.Load()
@@ -1442,6 +1641,8 @@ func (p *openAIWSConnPool) pickLeastBusyConnWithRoutingAffinityLocked(
 	ap *openAIWSAccountPool,
 	compatibility openAIWSHandshakeCompatibilityKey,
 	routingAffinity string,
+	proxyURL string,
+	wsURL string,
 ) *openAIWSConn {
 	if ap == nil || len(ap.conns) == 0 {
 		return nil
@@ -1451,7 +1652,10 @@ func (p *openAIWSConnPool) pickLeastBusyConnWithRoutingAffinityLocked(
 	var bestLastUsed time.Time
 	for _, conn := range ap.conns {
 		if conn == nil ||
+			p.isPermanentGuardConnLocked(ap, conn.id) ||
 			!conn.matchesHandshakeCompatibility(compatibility) ||
+			!conn.matchesProxyURL(proxyURL) ||
+			!conn.matchesWSURL(wsURL) ||
 			!conn.matchesRoutingAffinity(routingAffinity) {
 			continue
 		}
@@ -1514,6 +1718,9 @@ func (p *openAIWSConnPool) ensureTargetIdleAsync(accountID int64) {
 	ap.mu.Lock()
 	defer ap.mu.Unlock()
 	if ap.lastAcquire == nil {
+		return
+	}
+	if p.hasPermanentGuardPinLocked(ap) {
 		return
 	}
 	if ap.prewarmActive {
@@ -1597,9 +1804,26 @@ func (p *openAIWSConnPool) prewarmConns(accountID int64, req openAIWSAcquireRequ
 		generation = generations[0]
 	}
 	staleTarget := false
+	remainingReservations := total
+	releaseReservationsLocked := func(ap *openAIWSAccountPool) {
+		if ap == nil || remainingReservations <= 0 {
+			return
+		}
+		// ensureTargetIdleAsync reserves all requested slots up front. If a
+		// guard pin appears while a dial is in flight, release every slot that
+		// has not yet been consumed; otherwise the account can remain stuck at
+		// `creating > 0` and suppress future legitimate acquires.
+		if ap.creating >= remainingReservations {
+			ap.creating -= remainingReservations
+		} else {
+			ap.creating = 0
+		}
+		remainingReservations = 0
+	}
 	defer func() {
 		if ap, ok := p.getAccountPool(accountID); ok && ap != nil {
 			ap.mu.Lock()
+			releaseReservationsLocked(ap)
 			ap.prewarmActive = false
 			ap.signalChangedLocked()
 			ap.mu.Unlock()
@@ -1613,6 +1837,22 @@ func (p *openAIWSConnPool) prewarmConns(accountID int64, req openAIWSAcquireRequ
 	}()
 
 	for i := 0; i < total; i++ {
+		// Avoid starting any new dial after a confirmed guard socket exists.
+		// The in-flight result is checked again below, because the pin can be
+		// established while dialConn is blocked in the handshake.
+		if ap, ok := p.getAccountPool(accountID); ok && ap != nil {
+			ap.mu.Lock()
+			guardPinned := p.hasPermanentGuardPinLocked(ap)
+			if guardPinned {
+				releaseReservationsLocked(ap)
+				ap.signalChangedLocked()
+			}
+			ap.mu.Unlock()
+			if guardPinned {
+				return
+			}
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), p.dialTimeout()+openAIWSConnPrewarmExtraDelay)
 		conn, err := p.dialConn(ctx, req)
 		cancel()
@@ -1625,8 +1865,11 @@ func (p *openAIWSConnPool) prewarmConns(accountID int64, req openAIWSAcquireRequ
 			return
 		}
 		ap.mu.Lock()
-		if ap.creating > 0 {
-			ap.creating--
+		if remainingReservations > 0 {
+			if ap.creating > 0 {
+				ap.creating--
+			}
+			remainingReservations--
 		}
 		if err != nil {
 			ap.prewarmFails++
@@ -1634,6 +1877,12 @@ func (p *openAIWSConnPool) prewarmConns(accountID int64, req openAIWSAcquireRequ
 			ap.signalChangedLocked()
 			ap.mu.Unlock()
 			continue
+		}
+		if p.hasPermanentGuardPinLocked(ap) {
+			ap.signalChangedLocked()
+			ap.mu.Unlock()
+			conn.close()
+			return
 		}
 		if ap.generation != generation || ap.lastAcquire == nil {
 			ap.mu.Unlock()
@@ -1678,6 +1927,7 @@ func (p *openAIWSConnPool) ClearAccount(accountID int64) {
 	for id, conn := range ap.conns {
 		delete(ap.conns, id)
 		delete(ap.pinnedConns, id)
+		delete(ap.guardPinnedUntil, id)
 		if conn != nil {
 			conns = append(conns, conn)
 		}
@@ -1704,6 +1954,9 @@ func (p *openAIWSConnPool) evictConn(accountID int64, connID string) {
 			delete(ap.conns, connID)
 			if len(ap.pinnedConns) > 0 {
 				delete(ap.pinnedConns, connID)
+			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, connID)
 			}
 			ap.signalChangedLocked()
 		}
@@ -1736,6 +1989,406 @@ func (p *openAIWSConnPool) PinConn(accountID int64, connID string) bool {
 	}
 	ap.pinnedConns[connID]++
 	return true
+}
+
+// PinConnUntil keeps a guard continuation connection out of idle cleanup until
+// the response sticky binding expires. It is separate from session pins so a
+// normal unpin cannot release a guard pin early.
+func (p *openAIWSConnPool) PinConnUntil(accountID int64, connID string, until time.Time) bool {
+	if p == nil || accountID <= 0 || until.IsZero() || !until.After(time.Now()) {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	if _, exists := ap.conns[connID]; !exists {
+		return false
+	}
+	if ap.guardPinnedUntil == nil {
+		ap.guardPinnedUntil = make(map[string]time.Time)
+	}
+	if previous, exists := ap.guardPinnedUntil[connID]; !exists || (!previous.IsZero() && until.After(previous)) {
+		ap.guardPinnedUntil[connID] = until
+	}
+	return true
+}
+
+func markGuardConnConfirmedLocked(ap *openAIWSAccountPool, connID string, generation uint64) bool {
+	if ap == nil || generation == 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	conn, exists := ap.conns[connID]
+	if !exists || conn == nil {
+		return false
+	}
+	select {
+	case <-conn.closedCh:
+		return false
+	default:
+	}
+	conn.guardConfirmed429Generation.Store(generation)
+	return true
+}
+
+// MarkGuardConnConfirmed records positive evidence on one exact pooled socket.
+// A generation of zero is never valid. The proof is intentionally stored on
+// the connection rather than in account/session state so a later ordinary
+// response binding cannot promote a newly dialed socket into the guard route.
+func (p *openAIWSConnPool) MarkGuardConnConfirmed(accountID int64, connID string, generation uint64) bool {
+	if p == nil || accountID <= 0 || generation == 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return markGuardConnConfirmedLocked(ap, connID, generation)
+}
+
+// MarkExistingConnsAs429GuardCandidates records the boundary between old and
+// new sockets for one account. It is called immediately before a confirmed
+// Codex OAuth 429 runtime block becomes visible. The pool lock makes a dial
+// published afterwards ineligible, even if another Acquire later reuses it.
+// A zero generation is ignored so callers cannot create unscoped proof.
+func (p *openAIWSConnPool) MarkExistingConnsAs429GuardCandidates(accountID int64, generations ...uint64) {
+	p.markExistingConnsAs429GuardCandidatesAt(accountID, time.Time{}, generations...)
+}
+
+// markExistingConnsAs429GuardCandidatesAt optionally applies a creation-time
+// cutoff. The runtime blocker uses the cutoff captured before it waits on the
+// pool mutex, so a socket created during that handoff cannot be promoted into
+// the old-connection guard merely because it published before the pool lock
+// became available.
+func (p *openAIWSConnPool) markExistingConnsAs429GuardCandidatesAt(accountID int64, cutoff time.Time, generations ...uint64) {
+	if p == nil || accountID <= 0 || len(generations) == 0 || generations[0] == 0 {
+		return
+	}
+	generation := generations[0]
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	for _, conn := range ap.conns {
+		if conn == nil {
+			continue
+		}
+		select {
+		case <-conn.closedCh:
+			continue
+		default:
+			if !cutoff.IsZero() {
+				createdAt := conn.createdAt()
+				if !createdAt.IsZero() && createdAt.After(cutoff) {
+					continue
+				}
+			}
+			conn.guard429CandidateGeneration.Store(generation)
+		}
+	}
+}
+
+// MarkAndPinGuardConnConfirmed atomically records the proof and installs the
+// permanent pin under one account-pool lock. This closes the small handoff
+// window where a caller could otherwise mark a socket and then lose the
+// generation before a separate pin operation.
+func (p *openAIWSConnPool) MarkAndPinGuardConnConfirmed(accountID int64, connID string, generation uint64) bool {
+	if p == nil || accountID <= 0 || generation == 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	conn, exists := ap.conns[connID]
+	if !exists || conn == nil || conn.guard429CandidateGeneration.Load() != generation {
+		return false
+	}
+	if !markGuardConnConfirmedLocked(ap, connID, generation) {
+		return false
+	}
+	return p.pinGuardConnLocked(ap, connID, generation, true)
+}
+
+func (p *openAIWSConnPool) pinGuardConnLocked(ap *openAIWSAccountPool, connID string, generation uint64, requireProof bool) bool {
+	if ap == nil || stringsTrim(connID) == "" {
+		return false
+	}
+	connID = stringsTrim(connID)
+	conn, exists := ap.conns[connID]
+	if !exists || conn == nil {
+		return false
+	}
+	select {
+	case <-conn.closedCh:
+		return false
+	default:
+	}
+	if requireProof && (generation == 0 || conn.guardConfirmed429Generation.Load() != generation) {
+		return false
+	}
+	if ap.guardPinnedUntil == nil {
+		ap.guardPinnedUntil = make(map[string]time.Time)
+	}
+	// A Codex account has one retained 429 continuation socket. Keep the
+	// first live permanent pin; a replacement connection must fail over rather
+	// than silently creating a second long-lived route for the same account.
+	for existingID, until := range ap.guardPinnedUntil {
+		if existingID == connID || !until.IsZero() {
+			continue
+		}
+		existing, exists := ap.conns[existingID]
+		if !exists || existing == nil {
+			delete(ap.guardPinnedUntil, existingID)
+			continue
+		}
+		select {
+		case <-existing.closedCh:
+			delete(ap.guardPinnedUntil, existingID)
+		default:
+			return false
+		}
+	}
+	// time.Time{} is the permanent-pin sentinel. Do not downgrade an
+	// already-permanent pin if an older caller still supplies a TTL.
+	ap.guardPinnedUntil[connID] = time.Time{}
+	ap.signalChangedLocked()
+	return true
+}
+
+// PinGuardConnForGeneration permanently protects a socket only after the
+// socket itself has recorded the same confirmed-429 generation.
+func (p *openAIWSConnPool) PinGuardConnForGeneration(accountID int64, connID string, generation uint64) bool {
+	if p == nil || accountID <= 0 || generation == 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return p.pinGuardConnLocked(ap, connID, generation, true)
+}
+
+// PinGuardConn is retained for narrow legacy/test callers that already have
+// an independently validated connection. Production 429 handling uses
+// PinGuardConnForGeneration, which requires the per-connection proof.
+func (p *openAIWSConnPool) PinGuardConn(accountID int64, connID string) bool {
+	if p == nil || accountID <= 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return p.pinGuardConnLocked(ap, connID, 0, false)
+}
+
+// detachGuardConns removes every connection retained by the 429 guard for one
+// account and returns them for closing by the caller. Callers that transition
+// account runtime state should invoke this while holding the per-account
+// runtime lock, then close the returned sockets after releasing that lock.
+func (p *openAIWSConnPool) detachGuardConns(accountID int64) []*openAIWSConn {
+	if p == nil || accountID <= 0 {
+		return nil
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return nil
+	}
+	ap.mu.Lock()
+	toClose := make([]*openAIWSConn, 0, len(ap.guardPinnedUntil))
+	changed := false
+	for connID, until := range ap.guardPinnedUntil {
+		if !until.IsZero() {
+			// PinConnUntil is a normal TTL retention mechanism. A confirmed-429
+			// failure must only detach permanent guard reservations.
+			continue
+		}
+		changed = true
+		delete(ap.guardPinnedUntil, connID)
+		if len(ap.pinnedConns) > 0 {
+			delete(ap.pinnedConns, connID)
+		}
+		if conn, exists := ap.conns[connID]; exists {
+			delete(ap.conns, connID)
+			if conn != nil {
+				toClose = append(toClose, conn)
+			}
+		}
+	}
+	if changed {
+		ap.generation++
+		ap.signalChangedLocked()
+	}
+	ap.mu.Unlock()
+	return toClose
+}
+
+// InvalidateGuardConns removes every connection retained by the 429 guard for
+// one account. It is used when a stronger non-429 account failure is observed:
+// the old socket must not be reused after the failure, even if its lease is
+// otherwise healthy. Connections are detached under the pool lock and closed
+// afterwards so close callbacks never run while the pool mutex is held.
+func (p *openAIWSConnPool) InvalidateGuardConns(accountID int64) {
+	toClose := p.detachGuardConns(accountID)
+	closeOpenAIWSConns(toClose)
+}
+
+// IsGuardConnPinned reports whether the exact connection is still present and
+// permanently retained by the 429 guard. A normal session pin or an expired
+// TTL pin does not satisfy this check.
+func (p *openAIWSConnPool) IsGuardConnPinned(accountID int64, connID string) bool {
+	if p == nil || accountID <= 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	conn, exists := ap.conns[connID]
+	if !exists || conn == nil {
+		return false
+	}
+	select {
+	case <-conn.closedCh:
+		return false
+	default:
+	}
+	until, pinned := ap.guardPinnedUntil[connID]
+	if !pinned {
+		return false
+	}
+	if until.IsZero() || time.Now().Before(until) {
+		return until.IsZero()
+	}
+	delete(ap.guardPinnedUntil, connID)
+	ap.signalChangedLocked()
+	return false
+}
+
+// PermanentGuardConnID returns the single live socket retained by the Codex
+// 429 guard, when one exists.  The guard deliberately permits only one
+// permanent reservation per account; exposing its id lets the request-level
+// forwarder continue an already-selected account even when an HTTP request
+// does not carry a response_id/session marker.  Callers must still set
+// ForcePreferredConn so an ordinary pool acquire can never borrow the socket.
+func (p *openAIWSConnPool) PermanentGuardConnID(accountID int64) (string, bool) {
+	if p == nil || accountID <= 0 {
+		return "", false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return "", false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	now := time.Now()
+	for connID, until := range ap.guardPinnedUntil {
+		// A zero expiry is the permanent guard sentinel.  TTL pins are normal
+		// sticky retention and must not become a 429 continuation route.
+		if !until.IsZero() {
+			if !now.Before(until) {
+				delete(ap.guardPinnedUntil, connID)
+				ap.signalChangedLocked()
+			}
+			continue
+		}
+		conn, exists := ap.conns[connID]
+		if !exists || conn == nil {
+			delete(ap.guardPinnedUntil, connID)
+			ap.signalChangedLocked()
+			continue
+		}
+		select {
+		case <-conn.closedCh:
+			delete(ap.guardPinnedUntil, connID)
+			ap.signalChangedLocked()
+			continue
+		default:
+			return connID, true
+		}
+	}
+	return "", false
+}
+
+// IsGuardConnCandidate reports whether the exact live socket existed when the
+// current guard transition began. A pinned socket is also a candidate. This is
+// intentionally distinct from ordinary session pins and is used only while a
+// confirming 429 event is being classified.
+func (p *openAIWSConnPool) IsGuardConnCandidate(accountID int64, connID string, generations ...uint64) bool {
+	if p == nil || accountID <= 0 {
+		return false
+	}
+	connID = stringsTrim(connID)
+	if connID == "" {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return false
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	conn, exists := ap.conns[connID]
+	if !exists || conn == nil {
+		return false
+	}
+	select {
+	case <-conn.closedCh:
+		return false
+	default:
+	}
+	candidateGeneration := conn.guard429CandidateGeneration.Load()
+	if len(generations) > 0 && generations[0] != 0 {
+		return candidateGeneration == generations[0]
+	}
+	if candidateGeneration != 0 {
+		return true
+	}
+	until, pinned := ap.guardPinnedUntil[connID]
+	return pinned && until.IsZero()
 }
 
 func (p *openAIWSConnPool) UnpinConn(accountID int64, connID string) {
@@ -1800,8 +2453,13 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	}
 	id := p.nextConnID(req.Account.ID)
 	pooledConn := newOpenAIWSConn(id, req.Account.ID, conn, handshakeHeaders)
+	pooledConn.onClose = p.notifyGuardBindingInvalidated
 	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Headers)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)
+	pooledConn.proxyURL = normalizeOpenAIWSProxyURL(req.ProxyURL)
+	pooledConn.wsURL = normalizeOpenAIWSURL(req.WSURL)
+	pooledConn.proxyURLKnown = true
+	pooledConn.wsURLKnown = true
 	return pooledConn, nil
 }
 
@@ -1966,8 +2624,8 @@ func (p *openAIWSConnPool) dialTimeout() time.Duration {
 func cloneOpenAIWSAcquireRequest(req openAIWSAcquireRequest) openAIWSAcquireRequest {
 	copied := req
 	copied.Headers = cloneHeader(req.Headers)
-	copied.WSURL = stringsTrim(req.WSURL)
-	copied.ProxyURL = stringsTrim(req.ProxyURL)
+	copied.WSURL = normalizeOpenAIWSURL(req.WSURL)
+	copied.ProxyURL = normalizeOpenAIWSProxyURL(req.ProxyURL)
 	copied.PreferredConnID = stringsTrim(req.PreferredConnID)
 	return copied
 }
@@ -1981,8 +2639,8 @@ func cloneOpenAIWSAcquireRequestPtr(req *openAIWSAcquireRequest) *openAIWSAcquir
 }
 
 func sameOpenAIWSPrewarmTarget(a, b openAIWSAcquireRequest) bool {
-	return stringsTrim(a.WSURL) == stringsTrim(b.WSURL) &&
-		stringsTrim(a.ProxyURL) == stringsTrim(b.ProxyURL) &&
+	return normalizeOpenAIWSURL(a.WSURL) == normalizeOpenAIWSURL(b.WSURL) &&
+		normalizeOpenAIWSProxyURL(a.ProxyURL) == normalizeOpenAIWSProxyURL(b.ProxyURL) &&
 		normalizeOpenAIWSHandshakeCompatibility(a.Headers) == normalizeOpenAIWSHandshakeCompatibility(b.Headers)
 }
 
@@ -2015,6 +2673,36 @@ func normalizeOpenAIWSHandshakeCompatibility(headers http.Header) openAIWSHandsh
 	return openAIWSHandshakeCompatibilityKey{
 		betaFeatures: normalizeOpenAIWSBetaFeatures(headers),
 	}
+}
+
+// normalizeOpenAIWSProxyURL gives pooled connections the same proxy identity
+// as the dialer. In particular, socks5 is canonicalized to socks5h by the
+// shared parser, while malformed values remain distinct instead of matching a
+// valid connection accidentally.
+func normalizeOpenAIWSProxyURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if normalized, _, err := proxyurl.Parse(trimmed); err == nil {
+		return normalized
+	}
+	return trimmed
+}
+
+func normalizeOpenAIWSURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed == nil || parsed.Scheme == "" || parsed.Host == "" {
+		return trimmed
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func normalizeOpenAIWSRoutingAffinity(headers http.Header) string {

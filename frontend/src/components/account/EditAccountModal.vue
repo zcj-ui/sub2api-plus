@@ -2019,7 +2019,7 @@
         </div>
       </div>
 
-      <!-- OpenAI/Codex 429 guard（仅 OpenAI OAuth） -->
+      <!-- 奸商模式（仅 OpenAI OAuth） -->
       <div
         v-if="account?.platform === 'openai' && account?.type === 'oauth'"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3023,7 +3023,7 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
-const codex429GuardEnabled = ref(true)
+const codex429GuardEnabled = ref(false)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
@@ -3484,7 +3484,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
-  codex429GuardEnabled.value = true
+  codex429GuardEnabled.value = false
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
@@ -3542,7 +3542,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
         : 'off')
-      codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled !== false
+      codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled === true
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined

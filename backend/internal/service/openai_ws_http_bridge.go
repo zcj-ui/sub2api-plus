@@ -286,6 +286,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	sawDone := false
 	wroteDownstream := false
 	clientDisconnected := false
+	rateLimitSignalHandled := false
 	mappedModel := ""
 	needModelReplace := false
 	var mappedModelBytes []byte
@@ -298,6 +299,19 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		if needModelReplace {
 			mappedModelBytes = []byte(mappedModel)
 		}
+	}
+	recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
+		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+		if !isRateLimit || rateLimitSignalHandled {
+			return isRateLimit
+		}
+		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
+			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, resp.Header, responseBody, canonicalOpenAIAccountSchedulingModel(account, originalModel))
+		} else {
+			s.persistOpenAIWSRateLimitSignal(ctx, account, resp.Header, responseBody, codeRaw, errTypeRaw, errMsgRaw)
+		}
+		rateLimitSignalHandled = true
+		return true
 	}
 
 	resultWithUsage := func() *OpenAIForwardResult {
@@ -401,7 +415,14 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			if errMessage == "" {
 				errMessage = "upstream error event"
 			}
-			statusCode := openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
+			statusCode := openAIWSPayloadUpstreamStatus(upstreamMessage)
+			if statusCode == 0 {
+				statusCode = openAIWSErrorHTTPStatusFromRawWithMessage(errCodeRaw, errTypeRaw, errMsgRaw)
+			}
+			isRateLimit := false
+			if account.Platform == PlatformOpenAI {
+				isRateLimit = recordRateLimitSignal(statusCode, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
+			}
 			shouldFailover := s.shouldFailoverOpenAIUpstreamResponse(statusCode, errMessage, upstreamMessage)
 			if account.Platform == PlatformGrok {
 				// SSE error events do not carry an HTTP status. The local status
@@ -414,7 +435,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 					shouldFailover = s.shouldFailoverGrokUpstreamError(statusCode, upstreamMessage)
 					s.handleGrokAccountUpstreamError(ctx, account, statusCode, resp.Header, upstreamMessage)
 				}
-			} else if shouldFailover {
+			} else if shouldFailover && !isRateLimit {
 				accountStatus := statusCode
 				if transientStatus := openAIWSPayloadTransientStatus(upstreamMessage); transientStatus != 0 {
 					accountStatus = transientStatus
@@ -426,6 +447,13 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
 			}
 			upstreamEventErr = errors.New(errMessage)
+		}
+		if eventType == "response.failed" && account.Platform == PlatformOpenAI {
+			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
+			isRateLimit := recordRateLimitSignal(openAIWSPayloadUpstreamStatus(upstreamMessage), errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
+			if turn == 1 && !wroteDownstream && isRateLimit {
+				return nil, newOpenAIUpstreamFailoverError(http.StatusTooManyRequests, resp.Header, upstreamMessage, "rate limit exceeded", false)
+			}
 		}
 
 		// 客户端写出副本改写容量降载码：Codex 对 error/response.failed 中的

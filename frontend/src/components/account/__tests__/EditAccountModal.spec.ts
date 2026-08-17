@@ -467,7 +467,7 @@ describe('EditAccountModal', () => {
     )
   })
 
-  it('defaults legacy OpenAI OAuth accounts to the 429 guard enabled', async () => {
+  it('defaults legacy OpenAI OAuth accounts to profit mode disabled', async () => {
     const account = buildAccount()
     account.type = 'oauth'
     updateAccountMock.mockReset()
@@ -477,11 +477,11 @@ describe('EditAccountModal', () => {
 
     const wrapper = mountModal(account)
     const toggle = wrapper.get('[data-testid="edit-codex-429-guard-toggle"]')
-    expect(toggle.attributes('aria-checked')).toBe('true')
+    expect(toggle.attributes('aria-checked')).toBe('false')
 
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
-    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_codex_429_guard_enabled).toBe(true)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_codex_429_guard_enabled).toBe(false)
   })
 
   it('loads and saves an explicitly disabled OpenAI OAuth 429 guard', async () => {

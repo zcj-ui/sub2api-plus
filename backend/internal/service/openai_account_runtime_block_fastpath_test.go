@@ -32,6 +32,45 @@ func TestOpenAI429FastPath_RequiresTwoOAuthResponsesBeforeCoolingDown(t *testing
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }
 
+func TestOpenAI429FastPath_GuardStaysActiveAfterConfirmedFallbackCooldown(t *testing.T) {
+	tests := []struct {
+		name       string
+		guard      bool
+		wantActive bool
+		wantReason string
+	}{
+		{name: "enabled", guard: true, wantActive: true, wantReason: "429"},
+		{name: "disabled", guard: false, wantActive: false, wantReason: "429_fallback"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &openAI429SnapshotRepo{}
+			rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+			svc := &OpenAIGatewayService{accountRepo: repo, rateLimitService: rateLimitService}
+			rateLimitService.SetAccountRuntimeBlocker(svc)
+			account := &Account{
+				ID:       420,
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				Extra:    map[string]any{OpenAICodex429GuardEnabledExtraKey: tt.guard},
+			}
+
+			// No reset header exercises the short fallback branch. The first
+			// signal is observational only; the second is the confirmed state.
+			svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+			require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+
+			svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+			require.Equal(t, tt.wantActive, svc.isOpenAI429GuardRuntimeBlocked(account))
+
+			reason, ok := svc.openaiAccountRuntimeBlockReason.Load(account.ID)
+			require.True(t, ok)
+			require.Equal(t, tt.wantReason, reason)
+		})
+	}
+}
+
 func TestOpenAI429FastPath_ConfirmationExpiresAndSuccessClearsIt(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	account := &Account{ID: 44, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
@@ -730,6 +769,233 @@ func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlock(t *testing.T) {
 
 	svc.ClearAccountSchedulingBlock(account.ID)
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlockResets429Streak(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	account := &Account{ID: 4701, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now), "first signal should remain observational")
+	svc.BlockAccountScheduling(account, now.Add(time.Minute), "429")
+	svc.ClearAccountSchedulingBlock(account.ID)
+
+	// Clearing a recovered account starts a fresh confirmation generation; a
+	// single new 429 must not combine with the pre-clear observation.
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now.Add(time.Second)))
+}
+
+func TestOpenAIRuntimeBlockSnapshotTracksReasonAndGeneration(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	account := &Account{ID: 4702, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+
+	initial := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.False(t, initial.Active)
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "upstream_disable")
+	generic := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, generic.Active)
+	require.Equal(t, "upstream_disable", generic.Reason)
+
+	// A non-429 runtime failure is stronger than a subsequent 429 signal. The
+	// latter must not relabel the active block as a guard and re-enable an old
+	// socket before the auth/transport condition is explicitly cleared.
+	svc.BlockAccountScheduling(account, time.Now().Add(2*time.Minute), "429")
+	confirmed := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, confirmed.Active)
+	require.Equal(t, "upstream_disable", confirmed.Reason)
+	require.Equal(t, generic.Generation, confirmed.Generation)
+
+	lease := &openAIWSConnLease{}
+	svc.stampOpenAIWSLeaseRuntimeBlockState(account.ID, lease, initial)
+	require.True(t, lease.openAI429GuardActiveAtAcquire)
+	require.Equal(t, confirmed.Generation, lease.openAIRuntimeBlockGeneration)
+
+	svc.ClearAccountSchedulingBlock(account.ID)
+	cleared := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.False(t, cleared.Active)
+	require.Greater(t, cleared.Generation, confirmed.Generation)
+
+	svc.BlockAccountScheduling(account, time.Now().Add(2*time.Minute), "429")
+	fresh429 := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, fresh429.Active)
+	require.Equal(t, "429", fresh429.Reason)
+	require.Greater(t, fresh429.Generation, cleared.Generation)
+}
+
+func TestOpenAI429Guard_OnlyPreBlockPoolSocketMayProveConfirmation(t *testing.T) {
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          4704,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	oldConn := newOpenAIWSConn("guard-candidate-old", account.ID, nil, nil)
+	ap.mu.Lock()
+	ap.conns[oldConn.id] = oldConn
+	ap.mu.Unlock()
+
+	// The block transition marks only connections that were already in the
+	// pool. A concurrent dial that publishes afterwards must stay ineligible,
+	// even if a later Acquire reports it as reused.
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	newConn := newOpenAIWSConn("guard-candidate-new", account.ID, nil, nil)
+	ap.mu.Lock()
+	ap.conns[newConn.id] = newConn
+	ap.mu.Unlock()
+
+	oldLease := &openAIWSConnLease{pool: pool, accountID: account.ID, conn: oldConn, reused: true}
+	require.True(t, svc.markOpenAI429GuardConnectionProof(account, oldLease))
+	require.True(t, pool.IsGuardConnPinned(account.ID, oldConn.id))
+
+	newLease := &openAIWSConnLease{pool: pool, accountID: account.ID, conn: newConn, reused: true}
+	require.False(t, svc.markOpenAI429GuardConnectionProof(account, newLease))
+	require.False(t, pool.IsGuardConnPinned(account.ID, newConn.id))
+}
+
+func TestOpenAI429Guard_Repeated429KeepsCandidateGenerationUntilProof(t *testing.T) {
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	account := &Account{
+		ID:          4705,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	oldConn := newOpenAIWSConn("guard-repeat-old", account.ID, nil, nil)
+	ap.mu.Lock()
+	ap.conns[oldConn.id] = oldConn
+	ap.mu.Unlock()
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	first := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	svc.BlockAccountScheduling(account, time.Now().Add(2*time.Minute), "429")
+	second := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+
+	require.True(t, first.Active)
+	require.True(t, second.Active)
+	require.Equal(t, "429", second.Reason)
+	require.Equal(t, first.Generation, second.Generation, "extending the same 429 block must retain its candidate epoch")
+	lease := &openAIWSConnLease{pool: pool, accountID: account.ID, conn: oldConn}
+	require.True(t, svc.markOpenAI429GuardConnectionProof(account, lease))
+	require.True(t, pool.IsGuardConnPinned(account.ID, oldConn.id))
+}
+
+func TestOpenAI429Guard_PermanentReservationKeepsOrdinarySchedulingBlocked(t *testing.T) {
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	account := &Account{
+		ID:          4707,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey: true,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool}
+	require.Same(t, pool, svc.getOpenAIWSConnPool())
+
+	ap := pool.getOrCreateAccountPool(account.ID)
+	conn := newOpenAIWSConn("guard-reservation-schedule", account.ID, nil, nil)
+	ap.mu.Lock()
+	ap.conns[conn.id] = conn
+	ap.mu.Unlock()
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	snapshot := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, snapshot.Active)
+	require.True(t, pool.MarkAndPinGuardConnConfirmed(account.ID, conn.id, snapshot.Generation))
+
+	// The original cooldown may expire while the old socket stays healthy. At
+	// that point normal scheduling must still skip the account; only the exact
+	// guard continuation may force-acquire this connection.
+	svc.openaiAccountRuntimeBlockUntil.Store(account.ID, time.Now().Add(-time.Second))
+	svc.openaiAccountRuntimeBlockReason.Store(account.ID, "429")
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, pool.IsGuardConnPinned(account.ID, conn.id))
+}
+
+func TestOpenAI429Guard_Non429BlockEvictsRetainedConnection(t *testing.T) {
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	account := &Account{
+		ID:          4706,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	oldConn := newOpenAIWSConn("guard-non429-old", account.ID, nil, nil)
+	ap.mu.Lock()
+	ap.conns[oldConn.id] = oldConn
+	ap.mu.Unlock()
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	lease := &openAIWSConnLease{pool: pool, accountID: account.ID, conn: oldConn}
+	require.True(t, svc.markOpenAI429GuardConnectionProof(account, lease))
+	require.True(t, pool.IsGuardConnPinned(account.ID, oldConn.id))
+
+	svc.BlockAccountScheduling(account, time.Now().Add(2*time.Minute), "upstream_disable")
+	block := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, block.Active)
+	require.Equal(t, "upstream_disable", block.Reason)
+	require.False(t, pool.IsGuardConnPinned(account.ID, oldConn.id))
+	require.False(t, svc.markOpenAI429GuardConnectionProof(account, lease), "a non-429 runtime state must reject late proof publication")
+	select {
+	case <-oldConn.closedCh:
+	default:
+		t.Fatal("non-429 block must immediately evict the retained guard socket")
+	}
+}
+
+func TestOpenAIRuntimeBlockClearLeavesPostReset429Streak(t *testing.T) {
+	counter := &sharedOpenAI429CounterCache{}
+	rateLimit := NewRateLimitService(nil, nil, nil, nil, nil)
+	rateLimit.SetOpenAI429CounterCache(counter)
+	svc := &OpenAIGatewayService{rateLimitService: rateLimit}
+	account := &Account{ID: 4703, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	now := time.Now()
+
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now))
+	svc.BlockAccountScheduling(account, now.Add(time.Minute), "429")
+	svc.ClearAccountSchedulingBlock(account.ID)
+
+	// The post-clear observation starts a fresh remote/local generation; the
+	// following signal, rather than the pre-clear one, is the confirmer.
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, now.Add(time.Second)))
+	require.True(t, svc.confirmOpenAIOAuth429(account.ID, now.Add(2*time.Second)))
 }
 
 func TestShouldStopOpenAIOAuth429Failover_OnlyDuringStorm(t *testing.T) {

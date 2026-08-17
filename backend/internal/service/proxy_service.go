@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -37,6 +38,57 @@ type ProxyRepository interface {
 	CountExpiringSoon(ctx context.Context, now time.Time) (int64, error)
 }
 
+// OpenAIWSConnectionInvalidator is implemented by the OpenAI gateway service.
+// Proxy changes must close pooled upstream sockets so subsequent requests use
+// the new proxy configuration instead of keeping a stale connection alive.
+type OpenAIWSConnectionInvalidator interface {
+	InvalidateOpenAIWSConnections(accountID int64)
+}
+
+func listProxyAccountSummaries(ctx context.Context, repo ProxyRepository, proxyID int64) ([]ProxyAccountSummary, error) {
+	if repo == nil || proxyID <= 0 {
+		return nil, nil
+	}
+	return repo.ListAccountSummariesByProxyID(ctx, proxyID)
+}
+
+func notifyOpenAIWSConnectionsInvalidator(invalidator OpenAIWSConnectionInvalidator, summaries []ProxyAccountSummary) {
+	if invalidator == nil {
+		return
+	}
+
+	seen := make(map[int64]struct{}, len(summaries))
+	for _, summary := range summaries {
+		// Repository rows always carry a platform. Treat an empty value as a
+		// legacy/test summary, but explicitly exclude non-OpenAI accounts.
+		if summary.ID <= 0 || (summary.Platform != "" && summary.Platform != PlatformOpenAI) {
+			continue
+		}
+		if _, ok := seen[summary.ID]; ok {
+			continue
+		}
+		seen[summary.ID] = struct{}{}
+		invalidator.InvalidateOpenAIWSConnections(summary.ID)
+	}
+}
+
+// invalidateOpenAIWSConnectionsForProxy looks up accounts currently using a
+// proxy and invalidates each OpenAI account's pooled websocket connections.
+// The repository lookup error is returned so callers can log it while keeping
+// the proxy mutation itself successful.
+func invalidateOpenAIWSConnectionsForProxy(ctx context.Context, repo ProxyRepository, invalidator OpenAIWSConnectionInvalidator, proxyID int64) error {
+	if repo == nil || invalidator == nil || proxyID <= 0 {
+		return nil
+	}
+
+	summaries, err := listProxyAccountSummaries(ctx, repo, proxyID)
+	if err != nil {
+		return fmt.Errorf("list accounts for proxy %d: %w", proxyID, err)
+	}
+	notifyOpenAIWSConnectionsInvalidator(invalidator, summaries)
+	return nil
+}
+
 // CreateProxyRequest 创建代理请求
 type CreateProxyRequest struct {
 	Name     string `json:"name"`
@@ -60,14 +112,17 @@ type UpdateProxyRequest struct {
 
 // ProxyService 代理管理服务
 type ProxyService struct {
-	proxyRepo ProxyRepository
+	proxyRepo     ProxyRepository
+	wsInvalidator OpenAIWSConnectionInvalidator
 }
 
 // NewProxyService 创建代理服务实例
-func NewProxyService(proxyRepo ProxyRepository) *ProxyService {
-	return &ProxyService{
-		proxyRepo: proxyRepo,
+func NewProxyService(proxyRepo ProxyRepository, invalidators ...OpenAIWSConnectionInvalidator) *ProxyService {
+	service := &ProxyService{proxyRepo: proxyRepo}
+	if len(invalidators) > 0 {
+		service.wsInvalidator = invalidators[0]
 	}
+	return service
 }
 
 // Create 创建代理
@@ -157,6 +212,10 @@ func (s *ProxyService) Update(ctx context.Context, id int64, req UpdateProxyRequ
 		return nil, fmt.Errorf("update proxy: %w", err)
 	}
 
+	if err := invalidateOpenAIWSConnectionsForProxy(ctx, s.proxyRepo, s.wsInvalidator, id); err != nil {
+		slog.Warn("failed to invalidate OpenAI websocket connections after proxy update", "proxy_id", id, "error", err)
+	}
+
 	return proxy, nil
 }
 
@@ -168,9 +227,19 @@ func (s *ProxyService) Delete(ctx context.Context, id int64) error {
 		return fmt.Errorf("get proxy: %w", err)
 	}
 
+	var summaries []ProxyAccountSummary
+	if s.wsInvalidator != nil {
+		summaries, err = listProxyAccountSummaries(ctx, s.proxyRepo, id)
+		if err != nil {
+			slog.Warn("failed to list accounts before proxy deletion", "proxy_id", id, "error", err)
+			summaries = nil
+		}
+	}
+
 	if err := s.proxyRepo.Delete(ctx, id); err != nil {
 		return fmt.Errorf("delete proxy: %w", err)
 	}
+	notifyOpenAIWSConnectionsInvalidator(s.wsInvalidator, summaries)
 
 	return nil
 }

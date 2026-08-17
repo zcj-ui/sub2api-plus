@@ -1283,7 +1283,15 @@ func (s *RateLimitService) apply429FallbackRateLimit(ctx context.Context, accoun
 
 	resetAt := time.Now().Add(cooldown)
 	slog.Warn("rate_limit_429_fallback_used", "account_id", account.ID, "platform", account.Platform, "reason", reason, "using_default", cooldown.String())
-	s.notifyAccountSchedulingBlocked(account, resetAt, "429_fallback")
+	// An OAuth 429 reaches this fallback only after the explicit two-signal
+	// confirmation in HandleUpstreamError. Preserve the canonical reason so
+	// the local WebSocket guard can distinguish that confirmed state from
+	// unrelated temporary scheduling blocks and keep its healthy connection.
+	runtimeReason := "429_fallback"
+	if isOpenAIOAuthAccount(account) && account.Codex429GuardEnabled() {
+		runtimeReason = "429"
+	}
+	s.notifyAccountSchedulingBlocked(account, resetAt, runtimeReason)
 	if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
 		slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
 	}

@@ -622,6 +622,16 @@ func TestOpenAIGatewayService_GenerateSessionHash_ContentFallback(t *testing.T) 
 	require.NotEqual(t, hash, hashDifferent, "different content should produce different hash")
 }
 
+func TestOpenAIGatewayService_GenerateSessionHash_ModelOnlyFallsThrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+
+	svc := &OpenAIGatewayService{}
+	require.Empty(t, svc.GenerateSessionHash(c, []byte(`{"model":"gpt-5.1"}`)))
+}
+
 func TestOpenAIGatewayService_GenerateSessionHash_ExplicitSignalWinsOverContent(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rec := httptest.NewRecorder()

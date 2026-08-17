@@ -936,6 +936,38 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	}
 
 	completedTurns := atomic.Int32{}
+	var rateLimitSignalMu sync.Mutex
+	rateLimitSignalTurns := make(map[int32]struct{})
+	recordRateLimitSignal := func(turn int32, upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, payload []byte) bool {
+		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+		if !isRateLimit {
+			return false
+		}
+		if turn <= 0 {
+			turn = 1
+		}
+		rateLimitSignalMu.Lock()
+		if _, seen := rateLimitSignalTurns[turn]; seen {
+			rateLimitSignalMu.Unlock()
+			return true
+		}
+		rateLimitSignalTurns[turn] = struct{}{}
+		if len(rateLimitSignalTurns) > 256 {
+			cutoff := turn - 128
+			for seenTurn := range rateLimitSignalTurns {
+				if seenTurn < cutoff {
+					delete(rateLimitSignalTurns, seenTurn)
+				}
+			}
+		}
+		rateLimitSignalMu.Unlock()
+		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
+			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, handshakeHeaders, payload)
+		} else {
+			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, payload, codeRaw, errTypeRaw, errMsgRaw)
+		}
+		return true
+	}
 	turnLifecycle := newOpenAIWSPassthroughTurnLifecycle(true)
 	clientFrameConn := &openAIWSClientFrameConn{
 		conn:                 clientConn,
@@ -1208,20 +1240,34 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					return nil
 				}
 				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
+				if eventType == "response.failed" {
+					errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
+					upstreamStatus := openAIWSPayloadUpstreamStatus(payload)
+					turnNo := completedTurns.Load() + 1
+					isRateLimit := recordRateLimitSignal(turnNo, upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, payload)
+					if !wroteDownstream && isRateLimit {
+						return &UpstreamFailoverError{
+							StatusCode:      http.StatusTooManyRequests,
+							ResponseBody:    append([]byte(nil), payload...),
+							ResponseHeaders: cloneHeader(handshakeHeaders),
+						}
+					}
+				}
 				if isOpenAIWSTerminalEvent(eventType) {
 					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
 				}
 				if eventType == "error" {
 					s.handleOpenAIWSErrorEventTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
 				}
-				if wroteDownstream || eventType != "error" {
+				if eventType != "error" {
 					return nil
 				}
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
-				if !isOpenAIWSRateLimitError(errCodeRaw, errTypeRaw, errMsgRaw) {
+				turnNo := completedTurns.Load() + 1
+				isRateLimit := recordRateLimitSignal(turnNo, openAIWSPayloadUpstreamStatus(payload), errCodeRaw, errTypeRaw, errMsgRaw, payload)
+				if wroteDownstream || !isRateLimit {
 					return nil
 				}
-				s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, payload, errCodeRaw, errTypeRaw, errMsgRaw)
 				logOpenAIWSV2Passthrough(
 					"relay_rate_limit_failover account_id=%d err_code=%s err_type=%s err_message=%s",
 					account.ID,

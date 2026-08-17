@@ -23,7 +23,7 @@ Sub2API Plus 基于 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 持�
 - 对已选择账户执行一键盘点：额度、积分、重置窗口、代理连通性和测活状态一次完成。
 - OpenAI 账户固定代理出口；代理丢失或配置错误时明确失败，不静默直连。
 - OpenAI/Codex 两次明确 429 才进入账户冷却；有可用 Credit 时不因本地阈值提前停调。
-- “卡429”合成工具历史只作用于符合条件的 OpenAI/Codex 请求；Claude Code、compact、真实工具续链和 Shadow/Spark 不注入。
+- “奸商模式”（技术上为卡429策略）默认关闭，只作用于符合条件且显式开启的 OpenAI/Codex 请求；Claude Code、compact、真实工具续链和 Shadow/Spark 不注入。
 - 调度器优先在并发容量内复用少量健康账户，达到容量后再扩展更多账户。
 - 兼容根地址、`/v1`、完整端点和常见反代上游的 OpenAI、Anthropic、Gemini 请求格式。
 

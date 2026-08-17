@@ -20,6 +20,19 @@ type openAISnapshotCacheStub struct {
 	accountsByID     map[int64]*Account
 }
 
+func (s *openAISnapshotCacheStub) CaptureBucketWriteToken(_ context.Context, bucket SchedulerBucket) (SchedulerBucketWriteToken, error) {
+	return SchedulerBucketWriteToken{Bucket: bucket, Epoch: 1}, nil
+}
+
+func (s *openAISnapshotCacheStub) SetSnapshot(_ context.Context, _ SchedulerBucket, _ SchedulerBucketWriteToken, accounts []Account) error {
+	s.snapshotAccounts = make([]*Account, 0, len(accounts))
+	for i := range accounts {
+		account := accounts[i]
+		s.snapshotAccounts = append(s.snapshotAccounts, &account)
+	}
+	return nil
+}
+
 type schedulerTestOpenAIAccountRepo struct {
 	AccountRepository
 	accounts []Account

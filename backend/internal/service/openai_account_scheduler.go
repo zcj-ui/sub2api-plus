@@ -21,6 +21,7 @@ import (
 
 const (
 	openAIAccountScheduleLayerPreviousResponse = "previous_response_id"
+	openAIAccountScheduleLayer429Continuation  = "429_guard_continuation"
 	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
@@ -89,9 +90,13 @@ type OpenAIAccountScheduleRequest struct {
 }
 
 type OpenAIAccountScheduleDecision struct {
-	Layer               string
-	StickyPreviousHit   bool
-	StickySessionHit    bool
+	Layer             string
+	StickyPreviousHit bool
+	StickySessionHit  bool
+	// ContinuationLease is true only when an already rate-limited OpenAI OAuth
+	// account is reused through a still-local pooled WebSocket connection.
+	// It is never set for a new session or for a remote/cache-only response ID.
+	ContinuationLease   bool
 	CandidateCount      int
 	TopK                int
 	LatencyMs           int64
@@ -2232,6 +2237,38 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	platform = normalizeOpenAICompatiblePlatform(platform)
 	decision := OpenAIAccountScheduleDecision{}
+	// Pricing restrictions are a request-level gate and must run before every
+	// scheduling fast path, including a 429-guard continuation. A bound old
+	// connection does not grant permission to use a restricted model/channel.
+	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
+		slog.Warn("channel pricing restriction blocked request",
+			"group_id", derefGroupID(groupID),
+			"model", requestedModel)
+		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
+	}
+	if selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
+		ctx,
+		groupID,
+		platform,
+		previousResponseID,
+		sessionHash,
+		requestedModel,
+		excludedIDs,
+		requiredTransport,
+		requiredCapability,
+		requireCompact,
+		requiredImageCapability,
+	); continuationErr != nil {
+		return nil, decision, continuationErr
+	} else if continuation && selection != nil && selection.Account != nil {
+		decision.Layer = openAIAccountScheduleLayer429Continuation
+		decision.StickyPreviousHit = strings.TrimSpace(previousResponseID) != ""
+		decision.StickySessionHit = !decision.StickyPreviousHit && strings.TrimSpace(sessionHash) != ""
+		decision.ContinuationLease = true
+		decision.SelectedAccountID = selection.Account.ID
+		decision.SelectedAccountType = selection.Account.Type
+		return selection, decision, nil
+	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
@@ -2287,13 +2324,6 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		}
 	}
 
-	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
-		slog.Warn("channel pricing restriction blocked request",
-			"group_id", derefGroupID(groupID),
-			"model", requestedModel)
-		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
-	}
-
 	var stickyAccountID int64
 	if sessionHash != "" && s.cache != nil {
 		if accountID, err := s.getStickySessionAccountID(ctx, groupID, sessionHash); err == nil && accountID > 0 {
@@ -2325,6 +2355,228 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
 	})
+}
+
+// selectOpenAI429GuardContinuation is the only scheduling escape hatch for a
+// rate-limited OpenAI OAuth account. It requires a local response/session
+// binding plus the exact permanently guard-pinned socket in this process. The
+// ingress layer then force-acquires that connection, so a cache record can
+// never turn into a fresh request against a limited account.
+func (s *OpenAIGatewayService) selectOpenAI429GuardContinuation(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+	requiredImageCapability OpenAIImagesCapability,
+) (*AccountSelectionResult, bool, error) {
+	if s == nil || normalizeOpenAICompatiblePlatform(platform) != PlatformOpenAI ||
+		requiredTransport != OpenAIUpstreamTransportResponsesWebsocketV2Ingress ||
+		requiredImageCapability != "" {
+		return nil, false, nil
+	}
+	responseID := strings.TrimSpace(previousResponseID)
+	store := s.getOpenAIWSStateStore()
+	if store == nil {
+		return nil, false, nil
+	}
+	group := derefGroupID(groupID)
+	responseConnID := ""
+	accountID := int64(0)
+	var err error
+	if responseID != "" {
+		// A response binding is a pair: never combine its connection with a
+		// session binding (or vice versa), since that can produce account A +
+		// connection B and force-close a healthy socket as "unavailable".
+		if connID, ok := store.GetResponseConn(responseID); ok {
+			responseConnID = connID
+			accountID, err = store.GetResponseAccount(ctx, group, responseID)
+			if err != nil || accountID <= 0 {
+				return nil, false, nil
+			}
+		} else {
+			return nil, false, nil
+		}
+	} else if strings.TrimSpace(sessionHash) != "" {
+		// OAuth Responses requests commonly use store=false. A reconnect may
+		// omit previous_response_id while still carrying the stable session hash;
+		// prefer the process-local guard tuple, then fall back to the ordinary
+		// sticky account cache for non-guard sessions.
+		if guardStore, ok := store.(openAIWSGuardBindingStore); ok {
+			if guardAccountID, guardConnID, guardOK := guardStore.GetGuardSession(group, strings.TrimSpace(sessionHash)); guardOK {
+				accountID = guardAccountID
+				responseConnID = strings.TrimSpace(guardConnID)
+			}
+		}
+		if accountID <= 0 {
+			if connID, ok := store.GetSessionConn(group, strings.TrimSpace(sessionHash)); ok {
+				responseConnID = connID
+				accountID, err = s.getStickySessionAccountID(ctx, groupID, strings.TrimSpace(sessionHash))
+				if err != nil || accountID <= 0 {
+					return nil, false, nil
+				}
+			} else {
+				return nil, false, nil
+			}
+		}
+	} else {
+		return nil, false, nil
+	}
+	if err != nil || accountID <= 0 {
+		// Sticky state is an optimization. A cache/store read failure must not
+		// turn into a gateway-wide scheduling outage; the normal scheduler can
+		// still choose a healthy account.
+		return nil, false, nil
+	}
+	if _, excluded := excludedIDs[accountID]; excluded {
+		return nil, false, nil
+	}
+	account, err := s.getSchedulableAccount(ctx, accountID)
+	if err != nil {
+		// A sticky guard binding is only an optimization. A transient account
+		// repository failure must fall back to normal scheduling instead of
+		// turning one stale continuation into a gateway-wide error.
+		slog.Warn("openai_429_guard_account_lookup_failed", "account_id", accountID, "error", err)
+		return nil, false, nil
+	}
+	if account == nil {
+		// The account was removed or is no longer schedulable. Remove the local
+		// tuple so future reconnects do not keep probing a dead socket.
+		s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+		return nil, false, nil
+	}
+	// A guard continuation is deliberately allowed to use a permanently
+	// retained socket after the account's short 429 cooldown. That makes the
+	// account snapshot insufficient here: a proxy edit can otherwise leave the
+	// continuation holding an old Proxy relation and redial through the stale
+	// egress address after the pool was invalidated. Hydrate the account from
+	// the repository before evaluating the continuation and passing it to the
+	// WebSocket forwarder. This rare path prioritizes exact egress identity over
+	// avoiding one database read.
+	if s.accountRepo != nil {
+		latest, latestErr := s.accountRepo.GetByID(ctx, accountID)
+		if latestErr != nil || latest == nil {
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+		account = latest
+	}
+	// A guard tuple is only an escape hatch for the account's confirmed 429
+	// state. A different active runtime block (auth/transport/admin/etc.) must
+	// suppress the tuple even when an old socket pin remains in the pool.
+	blockSnapshot := s.openAIAccountRuntimeBlockSnapshot(account.ID)
+	if blockSnapshot.Active && blockSnapshot.Reason != "429" {
+		return nil, false, nil
+	}
+	if !s.isOpenAIWS429GuardConnectionPinned(account, responseConnID) {
+		// A just-confirmed block may have been recorded before the terminal
+		// response binding was published. Promote the exact bound socket once;
+		// never fall back to another connection for a guard continuation.
+		if !s.isOpenAIWS429GuardConnectionActive(account) {
+			// The runtime block may have expired after this socket was evicted.
+			// Drop only the stale tuple owned by this account/connection so the
+			// ordinary scheduler can choose a healthy account on the next pass.
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+		s.pinOpenAI429GuardConnection(account, responseConnID)
+		if !s.isOpenAIWS429GuardConnectionPinned(account, responseConnID) {
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+	}
+	if !s.isOpenAI429GuardContinuationEligible(ctx, account, responseConnID, groupID, requestedModel, requiredCapability, requireCompact) {
+		return nil, false, nil
+	}
+	if !s.isOpenAI429GuardPooledWSMode(account) {
+		return nil, false, nil
+	}
+	s.pinOpenAI429GuardConnection(account, responseConnID)
+
+	result, acquireErr := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+	if acquireErr != nil {
+		return nil, false, acquireErr
+	}
+	if result != nil && result.Acquired {
+		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+			Account:     account,
+			Acquired:    true,
+			ReleaseFunc: result.ReleaseFunc,
+		}), true, nil
+	}
+	if s.concurrencyService == nil {
+		return nil, false, nil
+	}
+	cfg := s.schedulingConfig()
+	return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+		Account: account,
+		WaitPlan: &AccountWaitPlan{
+			AccountID:      account.ID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		},
+	}), true, nil
+}
+
+func (s *OpenAIGatewayService) isOpenAI429GuardContinuationEligible(
+	ctx context.Context,
+	account *Account,
+	connID string,
+	groupID *int64,
+	requestedModel string,
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() ||
+		!account.IsActive() || !account.Schedulable || account.HasFailedHealthProbe() ||
+		!s.isOpenAIWS429GuardConnectionPinned(account, connID) {
+		return false
+	}
+	now := time.Now()
+	if account.AutoPauseOnExpired && account.ExpiresAt != nil && !now.Before(*account.ExpiresAt) {
+		return false
+	}
+	if account.IsOverloaded() || (account.TempUnschedulableUntil != nil && now.Before(*account.TempUnschedulableUntil)) {
+		return false
+	}
+	if !s.openAIAccountMatchesSchedulingGroup(account, groupID) ||
+		(requestedModel != "" && !account.IsModelSupported(requestedModel)) ||
+		!account.SupportsOpenAIEndpointCapability(requiredCapability) ||
+		(requireCompact && openAICompactSupportTier(account) == 0) ||
+		s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel) ||
+		s.isOpenAIAccountBlockedBySchedulingThreshold(ctx, account) ||
+		s.isOpenAIProxyStreamQuarantined(ctx, account) {
+		return false
+	}
+	if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
+		return false
+	}
+	if vetoed, _ := openAIProfitControlVetoReason(ctx, account); vetoed {
+		return false
+	}
+	return true
+}
+
+func (s *OpenAIGatewayService) isOpenAI429GuardPooledWSMode(account *Account) bool {
+	if s == nil || account == nil ||
+		s.getOpenAIWSProtocolResolver().Resolve(account).Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
+		return false
+	}
+	if s.cfg == nil || !s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled {
+		return true
+	}
+	switch account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault) {
+	case OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeShared:
+		return true
+	default:
+		return false
+	}
 }
 
 func accountSupportsOpenAICapabilities(account *Account, requiredCapability OpenAIEndpointCapability, requiredImageCapability OpenAIImagesCapability) bool {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	coderws "github.com/coder/websocket"
@@ -60,6 +61,176 @@ func TestIsOpenAIWSIngressPreviousResponseNotFound(t *testing.T) {
 	require.True(t, isOpenAIWSIngressPreviousResponseNotFound(
 		wrapOpenAIWSIngressTurnError(openAIWSIngressStagePreviousResponseNotFound, errors.New("previous response not found"), false),
 	))
+}
+
+func TestIsOpenAIWS429GuardSwitchableAcquireError(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, isOpenAIWS429GuardSwitchableAcquireError(context.DeadlineExceeded))
+	require.False(t, isOpenAIWS429GuardSwitchableAcquireError(context.Canceled))
+	require.False(t, isOpenAIWS429GuardSwitchableAcquireError(errOpenAIWSConnQueueFull))
+	require.True(t, isOpenAIWS429GuardSwitchableAcquireError(errOpenAIWSPreferredConnUnavailable))
+	require.True(t, isOpenAIWS429GuardSwitchableAcquireError(errors.New("preferred websocket ping failed")))
+}
+
+func TestOpenAIWS429GuardContinuationBlockedByNon429Runtime(t *testing.T) {
+	t.Parallel()
+
+	account := &Account{
+		ID:       4292,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+	}
+	svc := &OpenAIGatewayService{}
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.False(t, svc.isOpenAIWS429GuardContinuationBlockedByNon429Runtime(account))
+
+	// A later auth/transport/admin block must revoke the exception even when
+	// the old 429 pin itself is still present.
+	svc.BlockAccountScheduling(account, time.Now().Add(2*time.Minute), "authentication")
+	require.True(t, svc.isOpenAIWS429GuardContinuationBlockedByNon429Runtime(account))
+
+	svc.ClearAccountSchedulingBlock(account.ID)
+	require.False(t, svc.isOpenAIWS429GuardContinuationBlockedByNon429Runtime(account))
+}
+
+func TestOpenAIWS429GuardContinuationActiveKeepsLeaseAfterRuntimeExpiry(t *testing.T) {
+	t.Parallel()
+
+	account := &Account{
+		ID:       4291,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{OpenAICodex429GuardEnabledExtraKey: true},
+	}
+	svc := &OpenAIGatewayService{}
+	svc.openaiAccountRuntimeBlockUntil.Store(account.ID, time.Now().Add(-time.Second))
+	svc.openaiAccountRuntimeBlockReason.Store(account.ID, "429")
+
+	// The live retention gate must expire, while the continuation lease remains
+	// eligible to fail over immediately if the old socket later breaks.
+	require.False(t, svc.isOpenAIWS429GuardConnectionActive(account))
+	require.True(t, svc.isOpenAIWS429GuardContinuationActive(account, true))
+	require.False(t, svc.isOpenAIWS429GuardContinuationActive(account, false))
+
+	account.Extra[OpenAICodex429GuardEnabledExtraKey] = false
+	require.False(t, svc.isOpenAIWS429GuardContinuationActive(account, true))
+}
+
+func TestOpenAIWS429GuardAccountActiveForLeaseKeepsAcquireProofAfterRuntimeExpiry(t *testing.T) {
+	t.Parallel()
+
+	account := &Account{
+		ID:       4293,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{OpenAICodex429GuardEnabledExtraKey: true},
+	}
+	svc := &OpenAIGatewayService{}
+	svc.openaiAccountRuntimeBlockUntil.Store(account.ID, time.Now().Add(-time.Second))
+	svc.openaiAccountRuntimeBlockReason.Store(account.ID, "429")
+
+	lease := &openAIWSConnLease{openAI429GuardActiveAtAcquire: true}
+	require.True(t, svc.isOpenAIWS429GuardAccountActiveForLease(account, lease), "acquire-time guard proof must survive cooldown expiry")
+	require.False(t, svc.isOpenAIWS429GuardContinuationActive(account, false), "an unpinned lease must not become a healthy guard continuation")
+	require.True(t, svc.isOpenAIWS429GuardContinuationActiveForLease(account, lease, false), "the acquire-time proof must still enable failure failover")
+
+	lease.openAI429GuardActiveAtAcquire = false
+	lease.openAI429GuardProven.Store(true)
+	require.True(t, svc.isOpenAIWS429GuardAccountActiveForLease(account, lease), "a previously pinned lease must remain failure-eligible after eviction")
+	require.True(t, svc.isOpenAIWS429GuardContinuationActiveForLease(account, lease, false))
+
+	lease.openAI429GuardProven.Store(false)
+	require.False(t, svc.isOpenAIWS429GuardAccountActiveForLease(account, lease), "an unguarded lease must not inherit an expired runtime block")
+	require.False(t, svc.isOpenAIWS429GuardContinuationActiveForLease(account, lease, false))
+
+	apiKeyAccount := &Account{
+		ID:       4294,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Extra:    map[string]any{OpenAICodex429GuardEnabledExtraKey: true},
+	}
+	apiKeyLease := &openAIWSConnLease{openAI429GuardActiveAtAcquire: true}
+	require.False(t, svc.isOpenAIWS429GuardAccountActiveForLease(apiKeyAccount, apiKeyLease), "Codex guard must remain OAuth-only")
+	require.False(t, svc.isOpenAIWS429GuardContinuationActiveForLease(apiKeyAccount, apiKeyLease, false), "API-key leases must not inherit Codex guard failover")
+}
+
+func TestIsOpenAIWS429GuardSwitchableTurnErrorDoesNotReplayClientDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// A client write may fail before any bytes are committed. The ingress path
+	// must still close the turn rather than replaying it to another account.
+	err := NewOpenAIWSClientCloseError(
+		coderws.StatusGoingAway,
+		"client disconnected while upstream continuation was draining",
+		io.EOF,
+	)
+	require.False(t, isOpenAIWS429GuardSwitchableTurnError(err))
+}
+
+func TestIsOpenAIWS429GuardSwitchableTurnErrorDoesNotReplayAfterLifecycleFrame(t *testing.T) {
+	t.Parallel()
+
+	err := wrapOpenAIWSIngressTurnErrorWithSemantic(
+		"read_upstream",
+		errors.New("upstream read timeout"),
+		true,
+		false,
+	)
+	require.False(t, isOpenAIWS429GuardSwitchableTurnError(err))
+
+	err = wrapOpenAIWSIngressTurnErrorWithSemantic(
+		"read_upstream",
+		errors.New("upstream websocket returned malformed Responses event JSON"),
+		true,
+		true,
+	)
+	require.False(t, isOpenAIWS429GuardSwitchableTurnError(err), "semantic output must never be replayed after a malformed upstream frame")
+}
+
+func TestNormalizeOpenAIWSProxyURL(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "", normalizeOpenAIWSProxyURL("  "))
+	require.Equal(t, "http://proxy.example:8080", normalizeOpenAIWSProxyURL(" http://proxy.example:8080 "))
+	require.Equal(t, "socks5h://proxy.example:1080", normalizeOpenAIWSProxyURL("socks5://proxy.example:1080"))
+	// Invalid values remain distinct and are never normalized to direct.
+	require.Equal(t, "not a proxy", normalizeOpenAIWSProxyURL("not a proxy"))
+}
+
+func TestIsOpenAIWS429GuardReplaySafe(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, isOpenAIWS429GuardReplaySafe("", nil, false))
+	require.False(t, isOpenAIWS429GuardReplaySafe("resp_ordinary", []json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"next"}`),
+	}, true))
+	require.False(t, isOpenAIWS429GuardReplaySafe("resp_tool", []json.RawMessage{
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_1","output":"ok"}`),
+	}, true))
+	require.True(t, isOpenAIWS429GuardReplaySafe("resp_tool", []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_1","output":"ok"}`),
+	}, true))
+}
+
+func TestHasOpenAIWSVerifiedReplayHistory(t *testing.T) {
+	t.Parallel()
+
+	prior := []json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"hello"}`),
+	}
+	merged := []json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"hello"}`),
+		json.RawMessage(`{"type":"input_text","text":"next"}`),
+	}
+
+	require.False(t, hasOpenAIWSVerifiedReplayHistory(nil, false, merged, true), "an external first-frame continuation has no locally verified history")
+	require.False(t, hasOpenAIWSVerifiedReplayHistory(prior, true, nil, true), "an empty replay cannot rebuild a continuation")
+	require.False(t, hasOpenAIWSVerifiedReplayHistory(prior, true, []json.RawMessage{
+		json.RawMessage(`{"type":"input_text","text":"different"}`),
+	}, true), "a divergent input must not be treated as a replay")
+	require.True(t, hasOpenAIWSVerifiedReplayHistory(prior, true, merged, true))
 }
 
 func TestOpenAIWSIngressPreviousResponseRecoveryEnabled(t *testing.T) {

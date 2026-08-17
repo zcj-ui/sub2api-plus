@@ -26,6 +26,16 @@ type openAIOAuth429StreakState struct {
 	RemoteResetPending bool
 }
 
+// openAIRuntimeBlockSnapshot is read under the per-account runtime lock. The
+// generation lets WebSocket acquisition distinguish a socket obtained before
+// a block transition from one obtained while a block was already in force.
+type openAIRuntimeBlockSnapshot struct {
+	Generation uint64
+	Until      time.Time
+	Reason     string
+	Active     bool
+}
+
 type openAIOAuth429ConfirmedContextKey struct{}
 
 func withOpenAIOAuth429Confirmed(ctx context.Context) context.Context {
@@ -199,6 +209,9 @@ func (s *OpenAIGatewayService) clearOpenAIOAuth429Streak(accountID int64) {
 	if s == nil || accountID <= 0 {
 		return
 	}
+	// Reset the distributed mirror before taking the local runtime lock. A
+	// concurrent confirmation that starts after this reset belongs to the
+	// fresh generation and must not be erased by a late local cleanup.
 	if s.rateLimitService != nil {
 		s.rateLimitService.clearOpenAIOAuth429Streak(accountID)
 	}
@@ -206,6 +219,94 @@ func (s *OpenAIGatewayService) clearOpenAIOAuth429Streak(accountID int64) {
 	mu.Lock()
 	defer mu.Unlock()
 	s.openaiOAuth429Streak.Delete(accountID)
+}
+
+// openAIAccountRuntimeBlockSnapshot returns a coherent reason/generation pair
+// for one account. Expired entries are retired while holding the same lock used
+// by BlockAccountScheduling and ClearAccountSchedulingBlock, so an acquire
+// cannot observe a half-cleared block.
+func (s *OpenAIGatewayService) openAIAccountRuntimeBlockSnapshot(accountID int64) openAIRuntimeBlockSnapshot {
+	if s == nil || accountID <= 0 {
+		return openAIRuntimeBlockSnapshot{}
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+	return s.openAIAccountRuntimeBlockSnapshotLocked(accountID)
+}
+
+// openAIAccountRuntimeBlockSnapshotLocked is the lock-held implementation of
+// openAIAccountRuntimeBlockSnapshot. Callers that need to act on the snapshot
+// and mutate pool state must keep the account runtime lock until that action is
+// complete, so a clear or non-429 transition cannot invalidate the decision.
+func (s *OpenAIGatewayService) openAIAccountRuntimeBlockSnapshotLocked(accountID int64) openAIRuntimeBlockSnapshot {
+	snapshot := openAIRuntimeBlockSnapshot{}
+	if raw, ok := s.openaiAccountRuntimeBlockGeneration.Load(accountID); ok {
+		snapshot.Generation, _ = raw.(uint64)
+	}
+	if raw, ok := s.openaiAccountRuntimeBlockReason.Load(accountID); ok {
+		snapshot.Reason = strings.TrimSpace(fmt.Sprint(raw))
+	}
+	rawUntil, ok := s.openaiAccountRuntimeBlockUntil.Load(accountID)
+	if !ok {
+		return snapshot
+	}
+	until, ok := rawUntil.(time.Time)
+	if !ok || until.IsZero() || !time.Now().Before(until) {
+		s.openaiAccountRuntimeBlockUntil.Delete(accountID)
+		s.openaiAccountRuntimeBlockReason.Delete(accountID)
+		snapshot.Generation = s.openaiAccountRuntimeBlockSequence.Add(1)
+		s.openaiAccountRuntimeBlockGeneration.Store(accountID, snapshot.Generation)
+		snapshot.Reason = ""
+		return snapshot
+	}
+	snapshot.Until = until
+	snapshot.Active = true
+	return snapshot
+}
+
+// stampOpenAIWSLeaseRuntimeBlockState records a coherent block view around a
+// pool acquire. Treating any active block, or a generation transition during
+// acquire, as guarded keeps failure handling conservative. Exact-socket proof
+// is separately enforced by the pool's pre-block candidate marker.
+func (s *OpenAIGatewayService) stampOpenAIWSLeaseRuntimeBlockState(
+	accountID int64,
+	lease *openAIWSConnLease,
+	before openAIRuntimeBlockSnapshot,
+) {
+	if s == nil || lease == nil {
+		return
+	}
+	after := s.openAIAccountRuntimeBlockSnapshot(accountID)
+	lease.openAIRuntimeBlockGeneration = after.Generation
+	lease.openAI429GuardActiveAtAcquire = before.Active || after.Active || before.Generation != after.Generation
+	if pool := s.getOpenAIWSConnPool(); pool != nil && pool.IsGuardConnPinned(accountID, lease.ConnID()) {
+		lease.openAI429GuardProven.Store(true)
+	}
+}
+
+// markOpenAI429GuardConnectionProof records positive evidence that this exact
+// pooled socket observed the confirming OAuth 429. Ordinary response/session
+// bindings are deliberately insufficient: a socket opened after the block
+// must never be promoted into the permanent guard connection later.
+func (s *OpenAIGatewayService) markOpenAI429GuardConnectionProof(account *Account, lease *openAIWSConnLease) bool {
+	if s == nil || account == nil || lease == nil || !account.Codex429GuardEnabled() ||
+		!account.IsOpenAIOAuth() ||
+		!s.isOpenAI429GuardPooledWSMode(account) {
+		return false
+	}
+	mu := s.openAIAccountRuntimeBlockLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	snapshot := s.openAIAccountRuntimeBlockSnapshotLocked(account.ID)
+	if !snapshot.Active || snapshot.Reason != "429" || snapshot.Generation == 0 {
+		return false
+	}
+	pool := s.getOpenAIWSConnPool()
+	if pool == nil {
+		return false
+	}
+	return pool.MarkAndPinGuardConnConfirmed(account.ID, lease.ConnID(), snapshot.Generation)
 }
 
 func shouldCooldownOpenAITransientUpstreamError(statusCode int, responseBody []byte) bool {
@@ -251,8 +352,41 @@ func (s *OpenAIGatewayService) BlockAccountScheduling(account *Account, until ti
 	}
 	mu := s.openAIAccountRuntimeBlockLock(account.ID)
 	mu.Lock()
-	defer mu.Unlock()
 	_, _ = s.blockAccountSchedulingLocked(account, until, reason)
+	var guardConns []*openAIWSConn
+	if strings.TrimSpace(reason) != "429" {
+		snapshot := s.openAIAccountRuntimeBlockSnapshotLocked(account.ID)
+		if snapshot.Active && snapshot.Reason != "429" {
+			if pool := s.existingOpenAIWSConnPool(); pool != nil {
+				guardConns = pool.detachGuardConns(account.ID)
+			}
+		}
+	}
+	mu.Unlock()
+	// A non-429 account failure invalidates the old guarded socket. Do this
+	// after releasing the runtime lock because closing a websocket invokes the
+	// local binding invalidator, which may perform its own synchronization. The
+	// socket was already detached under the same runtime lock, so it cannot race
+	// with a fresh 429 guard generation.
+	closeOpenAIWSConns(guardConns)
+}
+
+// shouldMarkOpenAI429GuardCandidatesLocked recognizes the first transition
+// into a confirmed Codex OAuth 429 block. It intentionally does not mark
+// sockets when a different active block is overwritten, nor when an existing
+// 429 block is merely extended: either case could promote a socket opened
+// after the original 429 transition.
+func (s *OpenAIGatewayService) shouldMarkOpenAI429GuardCandidatesLocked(account *Account, reason string) bool {
+	if s == nil || account == nil || strings.TrimSpace(reason) != "429" ||
+		!account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	current, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	if !ok {
+		return true
+	}
+	until, ok := current.(time.Time)
+	return !ok || until.IsZero() || !time.Now().Before(until)
 }
 
 func (s *OpenAIGatewayService) openAIAccountRuntimeBlockLock(accountID int64) *sync.Mutex {
@@ -266,42 +400,80 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockLock(accountID int64) *s
 }
 
 func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, until time.Time, reason string) (uint64, bool) {
-	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
-	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
+	if s == nil || account == nil || account.ID <= 0 {
+		return 0, false
+	}
 	now := time.Now()
 	blockUntil := until
 	if blockUntil.IsZero() || !blockUntil.After(now) {
 		blockUntil = now.Add(openAIStopSchedulingBridgeCooldown)
 	}
 
-	for {
-		current, loaded := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
-		if !loaded {
-			actual, stored := s.openaiAccountRuntimeBlockUntil.LoadOrStore(account.ID, blockUntil)
-			if !stored {
-				s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
-				return generation, true
-			}
-			current = actual
-		}
+	currentRaw, loaded := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	currentUntil, validUntil := currentRaw.(time.Time)
+	active := loaded && validUntil && !currentUntil.IsZero() && now.Before(currentUntil)
+	currentReason := ""
+	if rawReason, ok := s.openaiAccountRuntimeBlockReason.Load(account.ID); ok {
+		currentReason = strings.TrimSpace(fmt.Sprint(rawReason))
+	}
+	currentGeneration := uint64(0)
+	if rawGeneration, ok := s.openaiAccountRuntimeBlockGeneration.Load(account.ID); ok {
+		currentGeneration, _ = rawGeneration.(uint64)
+	}
 
-		currentUntil, ok := current.(time.Time)
-		if !ok || currentUntil.IsZero() {
-			if s.openaiAccountRuntimeBlockUntil.CompareAndSwap(account.ID, current, blockUntil) {
-				s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
-				return generation, true
+	if active {
+		incomingReason := strings.TrimSpace(reason)
+		// A confirmed non-429 block is stronger than a later 429 signal until
+		// the account is explicitly cleared. Never relabel the same active
+		// interval as a 429 guard, otherwise a stale socket could bypass the
+		// transport/auth failure.
+		if currentReason != "429" && incomingReason == "429" {
+			if currentGeneration == 0 {
+				currentGeneration = s.openaiAccountRuntimeBlockSequence.Add(1)
+				s.openaiAccountRuntimeBlockGeneration.Store(account.ID, currentGeneration)
 			}
-			continue
+			return currentGeneration, false
 		}
-		if !blockUntil.After(currentUntil) {
-			s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
-			return generation, false
+		// Extending the same block does not create a new epoch. In particular,
+		// a second 429 may arrive before the old socket has observed the first
+		// one; its candidate proof must still match the active guard epoch.
+		extends := blockUntil.After(currentUntil)
+		s.storeOpenAIAccountRuntimeBlockReason(account.ID, incomingReason)
+		nextReason := ""
+		if rawReason, ok := s.openaiAccountRuntimeBlockReason.Load(account.ID); ok {
+			nextReason = strings.TrimSpace(fmt.Sprint(rawReason))
 		}
-		if s.openaiAccountRuntimeBlockUntil.CompareAndSwap(account.ID, current, blockUntil) {
-			s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
-			return generation, true
+		reasonChanged := nextReason != currentReason
+		if !extends && !reasonChanged {
+			if currentGeneration == 0 {
+				currentGeneration = s.openaiAccountRuntimeBlockSequence.Add(1)
+				s.openaiAccountRuntimeBlockGeneration.Store(account.ID, currentGeneration)
+			}
+			return currentGeneration, false
+		}
+		if currentGeneration == 0 || reasonChanged {
+			currentGeneration = s.openaiAccountRuntimeBlockSequence.Add(1)
+			s.openaiAccountRuntimeBlockGeneration.Store(account.ID, currentGeneration)
+		}
+		if extends {
+			s.openaiAccountRuntimeBlockUntil.Store(account.ID, blockUntil)
+		}
+		return currentGeneration, true
+	}
+
+	// A missing, malformed, or expired block starts a fresh epoch. Mark the
+	// pool boundary before publishing the new runtime state so sockets dialed
+	// after this point cannot become guard candidates.
+	generation := s.openaiAccountRuntimeBlockSequence.Add(1)
+	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
+	if s.shouldMarkOpenAI429GuardCandidatesLocked(account, reason) {
+		if pool := s.getOpenAIWSConnPool(); pool != nil {
+			pool.markExistingConnsAs429GuardCandidatesAt(account.ID, now, generation)
 		}
 	}
+	s.openaiAccountRuntimeBlockUntil.Store(account.ID, blockUntil)
+	s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
+	return generation, true
 }
 
 func (s *OpenAIGatewayService) storeOpenAIAccountRuntimeBlockReason(accountID int64, reason string) {
@@ -324,12 +496,13 @@ func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	if s == nil || accountID <= 0 {
 		return
 	}
+	s.clearOpenAIOAuth429Streak(accountID)
 	mu := s.openAIAccountRuntimeBlockLock(accountID)
 	mu.Lock()
-	defer mu.Unlock()
 	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
 	s.openaiAccountRuntimeBlockReason.Delete(accountID)
 	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
+	mu.Unlock()
 }
 
 func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) bool {
@@ -344,19 +517,19 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 			s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 			s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 			s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
-			return false
+			return s.hasOpenAI429GuardReservation(account)
 		}
 	}
 	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
 	if !ok {
-		return false
+		return s.hasOpenAI429GuardReservation(account)
 	}
 	cooldownUntil, ok := value.(time.Time)
 	if !ok || cooldownUntil.IsZero() {
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
-		return false
+		return s.hasOpenAI429GuardReservation(account)
 	}
 	if time.Now().Before(cooldownUntil) {
 		return true
@@ -364,7 +537,59 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 	s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
-	return false
+	return s.hasOpenAI429GuardReservation(account)
+}
+
+// hasOpenAI429GuardReservation keeps ordinary scheduling away from an account
+// whose only live route is a local WebSocket retained after a confirmed Codex
+// OAuth 429. The continuation selector is the sole exception and force-acquires
+// the exact bound socket instead of treating this account as generally usable.
+func (s *OpenAIGatewayService) hasOpenAI429GuardReservation(account *Account) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	pool := s.existingOpenAIWSConnPool()
+	return pool != nil && pool.HasPermanentGuardPin(account.ID)
+}
+
+// openAI429GuardRuntimeBlockUntil returns the local expiry for a confirmed
+// OAuth 429 block. The expiry is used both by scheduling and by the WebSocket
+// pool pin so an otherwise healthy old connection outlives normal idle/max-age
+// cleanup while that confirmed state remains active.
+func (s *OpenAIGatewayService) openAI429GuardRuntimeBlockUntil(account *Account) (time.Time, bool) {
+	if s == nil || account == nil || account.ID <= 0 {
+		return time.Time{}, false
+	}
+	mu := s.openAIAccountRuntimeBlockLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	reason, _ := s.openaiAccountRuntimeBlockReason.Load(account.ID)
+	if strings.TrimSpace(fmt.Sprint(reason)) != "429" {
+		return time.Time{}, false
+	}
+	value, ok := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	if !ok {
+		return time.Time{}, false
+	}
+	until, ok := value.(time.Time)
+	if !ok || until.IsZero() {
+		return time.Time{}, false
+	}
+	if !time.Now().Before(until) {
+		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
+		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
+		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// isOpenAI429GuardRuntimeBlocked distinguishes the confirmed OAuth 429 block
+// from every other temporary scheduling block. It intentionally requires the
+// in-process reason because response-to-connection affinity is local too.
+func (s *OpenAIGatewayService) isOpenAI429GuardRuntimeBlocked(account *Account) bool {
+	_, active := s.openAI429GuardRuntimeBlockUntil(account)
+	return active
 }
 
 func (s *OpenAIGatewayService) getOpenAIAccountModelTransientState() *openAIAccountModelTransientState {

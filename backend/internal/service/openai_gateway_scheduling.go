@@ -152,7 +152,10 @@ func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) 
 
 	sessionID := explicitOpenAIRequestSessionID(c, body)
 	if sessionID == "" && len(body) > 0 {
-		sessionID = deriveOpenAIContentSessionSeed(body)
+		// Content affinity is useful only with a meaningful user/input anchor.
+		// A model-only frame must fall through to the caller's per-client seed;
+		// otherwise unrelated clients can share one sticky upstream connection.
+		sessionID = deriveOpenAIAnchoredContentSessionSeed(body)
 	}
 	if sessionID == "" {
 		return ""

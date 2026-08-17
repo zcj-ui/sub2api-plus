@@ -666,6 +666,11 @@ type UpstreamFailoverError struct {
 	NextAccountAction        NextAccountAction
 	ClientStatusCode         int
 	ClientMessage            string
+	// WSResume is set only for an uncommitted Responses WebSocket turn that
+	// has been rebuilt for a different upstream account. It is intentionally
+	// nil for HTTP/SSE paths and for WebSocket turns that have written semantic
+	// output, where replay would duplicate client-visible work.
+	WSResume *OpenAIWSResumeState
 }
 
 func (e *UpstreamFailoverError) Error() string {

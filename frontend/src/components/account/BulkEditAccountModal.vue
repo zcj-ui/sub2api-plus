@@ -931,7 +931,7 @@
         </div>
       </div>
 
-      <!-- 卡429开关（严格仅 OpenAI OAuth） -->
+      <!-- 奸商模式（严格仅 OpenAI OAuth） -->
       <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0" for="bulk-edit-codex-429-guard-enabled">
@@ -1596,7 +1596,7 @@ const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OF
 const upstreamBillingAutoProbeMode = ref<'enabled' | 'disabled'>('enabled')
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
-const codex429GuardEnabled = ref(true)
+const codex429GuardEnabled = ref(false)
 const allowOveragesEnabled = ref(false)
 
 const handleBulkAllowOveragesChange = (enabled: boolean) => {
@@ -2173,7 +2173,7 @@ watch(
       enableCodexCLIOnly.value = false
       enableCodexCLIOnlyAppServer.value = false
       enableCodex429Guard.value = false
-      codex429GuardEnabled.value = true
+      codex429GuardEnabled.value = false
       enableAllowOverages.value = false
       allowOveragesEnabled.value = false
       enableCodexFingerprintMode.value = false

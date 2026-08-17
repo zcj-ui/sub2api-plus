@@ -182,25 +182,24 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     )
   })
 
-  it('shows the 429 guard only for OpenAI OAuth and includes it in Codex imports', async () => {
+  it('shows the profit mode only for OpenAI OAuth and keeps it disabled by default', async () => {
     const wrapper = mountModal()
     await selectButtonByText(wrapper, 'OpenAI')
 
     const toggle = wrapper.get('[data-testid="create-codex-429-guard-toggle"]')
-    expect(toggle.attributes('aria-checked')).toBe('true')
+    expect(toggle.attributes('aria-checked')).toBe('false')
 
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
     await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
     await flushPromises()
 
-    expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.openai_codex_429_guard_enabled).toBe(true)
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.openai_codex_429_guard_enabled).toBe(false)
   })
 
-  it('can disable the 429 guard and omits it from OpenAI API key accounts', async () => {
+  it('keeps profit mode disabled by default and omits it from OpenAI API key accounts', async () => {
     const wrapper = mountModal()
     await selectButtonByText(wrapper, 'OpenAI')
-    await wrapper.get('[data-testid="create-codex-429-guard-toggle"]').trigger('click')
     await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
     await wrapper.get('form#create-account-form').trigger('submit.prevent')
     await wrapper.get('[data-testid="import-codex-session"]').trigger('click')

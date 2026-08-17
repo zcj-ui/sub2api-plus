@@ -286,6 +286,10 @@ type OpenAIForwardResult struct {
 
 	wsReplayInput       []json.RawMessage
 	wsReplayInputExists bool
+	// wsConnectionBroken records a terminal upstream failure that was already
+	// visible to the client. Ingress must close rather than reuse the same
+	// client session, because replaying a partially visible turn is unsafe.
+	wsConnectionBroken bool
 }
 
 // SucceededForScheduling reports whether this result is an upstream success
@@ -433,6 +437,7 @@ type OpenAIGatewayService struct {
 	liveAttestationCipher SecretEncryptor
 
 	openaiWSPoolOnce               sync.Once
+	openaiWSPoolRef                atomic.Pointer[openAIWSConnPool]
 	openaiWSStateStoreOnce         sync.Once
 	openaiSchedulerOnce            sync.Once
 	openaiProxyStreamCircuitOnce   sync.Once
@@ -660,6 +665,14 @@ func (s *OpenAIGatewayService) CloseOpenAIWSPool() {
 }
 
 func (s *OpenAIGatewayService) InvalidateAgentIdentityWSConnections(accountID int64) {
+	s.InvalidateOpenAIWSConnections(accountID)
+}
+
+// InvalidateOpenAIWSConnections closes every pooled upstream socket for an
+// account. Account proxy/credential changes must invalidate a live guard pin
+// immediately; otherwise a long-lived old WebSocket could bypass the newly
+// configured egress proxy until its natural failure.
+func (s *OpenAIGatewayService) InvalidateOpenAIWSConnections(accountID int64) {
 	if pool := s.getOpenAIWSConnPool(); pool != nil {
 		pool.ClearAccount(accountID)
 	}

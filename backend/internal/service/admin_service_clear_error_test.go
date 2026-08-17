@@ -20,6 +20,15 @@ type accountRepoStubForClearAccountError struct {
 	clearTempUnschedCalls    int
 }
 
+type clearAccountErrorRuntimeRecorder struct {
+	runtimeBlockRecorder
+	invalidatedIDs []int64
+}
+
+func (r *clearAccountErrorRuntimeRecorder) InvalidateOpenAIWSConnections(accountID int64) {
+	r.invalidatedIDs = append(r.invalidatedIDs, accountID)
+}
+
 func (r *accountRepoStubForClearAccountError) GetByID(ctx context.Context, id int64) (*Account, error) {
 	return r.account, nil
 }
@@ -70,7 +79,7 @@ func TestAdminService_ClearAccountError_AlsoClearsRecoverableRuntimeState(t *tes
 			TempUnschedulableReason: "missing refresh token",
 		},
 	}
-	blocker := &runtimeBlockRecorder{}
+	blocker := &clearAccountErrorRuntimeRecorder{}
 	svc := &adminServiceImpl{accountRepo: repo, runtimeBlocker: blocker}
 
 	updated, err := svc.ClearAccountError(context.Background(), 31)
@@ -85,4 +94,5 @@ func TestAdminService_ClearAccountError_AlsoClearsRecoverableRuntimeState(t *tes
 	require.Nil(t, updated.TempUnschedulableUntil)
 	require.Empty(t, updated.TempUnschedulableReason)
 	require.Equal(t, []int64{31}, blocker.clearedIDs)
+	require.Equal(t, []int64{31}, blocker.invalidatedIDs)
 }

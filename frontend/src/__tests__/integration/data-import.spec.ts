@@ -140,7 +140,7 @@ describe('ImportDataModal', () => {
         accounts: [makeAccount('a')]
       }),
       skip_default_group_bind: true,
-      codex_429_guard_enabled: true,
+      codex_429_guard_enabled: false,
       confirm_overages_risk: false
     })
   })
@@ -182,13 +182,13 @@ describe('ImportDataModal', () => {
         accounts: [makeAccount('a'), makeAccount('b')]
       }),
       skip_default_group_bind: true,
-      codex_429_guard_enabled: true,
+      codex_429_guard_enabled: false,
       confirm_overages_risk: false
     })
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.dataImportSuccess')
   })
 
-  it('卡429开关关闭时把 false 传给导入接口', async () => {
+  it('奸商模式默认关闭时把 false 传给导入接口', async () => {
     const { adminAPI } = await import('@/api/admin')
     vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
       proxy_created: 0,
@@ -198,8 +198,6 @@ describe('ImportDataModal', () => {
       account_failed: 0
     })
     const wrapper = mountModal()
-    await wrapper.get('[data-test="codex-429-guard-toggle"]').trigger('click')
-
     const input = wrapper.find('input[type="file"]')
     setInputFiles(input.element, [
       makeJsonFile('codex.json', JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [makeAccount('codex')] }))

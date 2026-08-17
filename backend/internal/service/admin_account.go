@@ -63,6 +63,64 @@ func (s *adminServiceImpl) GetAccountsByIDs(ctx context.Context, ids []int64) ([
 	return accounts, nil
 }
 
+func (s *adminServiceImpl) invalidateOpenAIWSConnections(accountID int64) {
+	if s == nil || s.runtimeBlocker == nil || accountID <= 0 {
+		return
+	}
+	if invalidator, ok := s.runtimeBlocker.(interface {
+		InvalidateOpenAIWSConnections(int64)
+	}); ok {
+		invalidator.InvalidateOpenAIWSConnections(accountID)
+	}
+}
+
+// invalidateOpenAIWSConnectionsForCredentialFamily closes pooled OpenAI
+// sockets for a parent account and every Spark shadow that inherits its
+// credential/proxy identity. A shadow has its own account ID and pool, so
+// invalidating only the parent would leave an old proxy or Authorization value
+// live on the shadow connection.
+func (s *adminServiceImpl) invalidateOpenAIWSConnectionsForCredentialFamily(ctx context.Context, account *Account) {
+	if s == nil || account == nil || account.ID <= 0 {
+		return
+	}
+	s.invalidateOpenAIWSConnections(account.ID)
+	// Spark shadows are only valid for OpenAI OAuth parents. Avoid probing the
+	// shadow repository for API-key, non-OpenAI, or shadow accounts; this also
+	// keeps lightweight read-only repository implementations source-compatible.
+	if account.Platform != PlatformOpenAI || !account.IsOpenAIOAuth() || account.IsCredentialShadow() || s.accountRepo == nil {
+		return
+	}
+	shadows := s.listShadowsForOpenAIWSInvalidation(ctx, account.ID)
+	for _, shadow := range shadows {
+		if shadow != nil {
+			s.invalidateOpenAIWSConnections(shadow.ID)
+		}
+	}
+}
+
+// listShadowsForOpenAIWSInvalidation is deliberately best effort. Some narrow
+// repository test doubles (and older integrations) embed an optional
+// AccountRepository implementation; invoking a promoted method on a nil
+// embedded interface panics. Shadow discovery only broadens invalidation, so a
+// lookup failure must never make an otherwise successful account update fail.
+func (s *adminServiceImpl) listShadowsForOpenAIWSInvalidation(ctx context.Context, parentID int64) (shadows []*Account) {
+	if s == nil || s.accountRepo == nil || parentID <= 0 {
+		return nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Warn("panic listing spark shadows for OpenAI websocket invalidation", "account_id", parentID, "recover", recovered)
+			shadows = nil
+		}
+	}()
+	listed, err := s.accountRepo.ListShadowsByParent(ctx, parentID)
+	if err != nil {
+		slog.Warn("failed to list spark shadows for OpenAI websocket invalidation", "account_id", parentID, "error", err)
+		return nil
+	}
+	return listed
+}
+
 const maxAccountNameRunes = 100
 const duplicateAccountOperationIDExtraKey = "duplicate_operation_id"
 
@@ -585,6 +643,10 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
+	previousProxyID := int64(0)
+	if account.ProxyID != nil {
+		previousProxyID = *account.ProxyID
+	}
 	var normalizedExtra map[string]any
 	if input.Extra != nil {
 		effectiveType := account.Type
@@ -879,6 +941,10 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	// 影子自身 proxy 不可独立编辑(见上),故对影子的更新不触发传播。
 	if input.ProxyID != nil && !account.IsCredentialShadow() {
 		if err := s.propagateProxyToShadows(ctx, id, account.ProxyID); err != nil {
+			// The parent update has already committed. Do not leave its or a
+			// partially-updated shadow's pooled socket using the old egress when
+			// propagation reports an error.
+			s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, account)
 			return nil, err
 		}
 	}
@@ -895,6 +961,20 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
+	_, guardSettingChanged := input.Extra[OpenAICodex429GuardEnabledExtraKey]
+	if input.ProxyID != nil || len(input.Credentials) > 0 || guardSettingChanged {
+		nextProxyID := int64(0)
+		if updated.ProxyID != nil {
+			nextProxyID = *updated.ProxyID
+		}
+		if input.ProxyID != nil && nextProxyID != previousProxyID {
+			s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, updated)
+		} else if len(input.Credentials) > 0 {
+			s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, updated)
+		} else if guardSettingChanged {
+			s.invalidateOpenAIWSConnections(id)
+		}
+	}
 	return updated, nil
 }
 
@@ -907,6 +987,19 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	delete(updates, OllamaCloudUsageSessionExtraKey)
 	delete(updates, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(updates, OllamaCloudUsageSnapshotExtraKey)
+	var accountForInvalidation *Account
+	guardSettingChanged := false
+	if _, exists := updates[OpenAICodex429GuardEnabledExtraKey]; exists {
+		account, err := s.accountRepo.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := ValidateOpenAICodex429GuardExtra(account.Platform, account.Type, updates); err != nil {
+			return err
+		}
+		accountForInvalidation = account
+		guardSettingChanged = true
+	}
 	if _, exists := updates[openAILongContextBillingEnabledKey]; exists {
 		account, err := s.accountRepo.GetByID(ctx, id)
 		if err != nil {
@@ -919,7 +1012,13 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 	if len(updates) == 0 {
 		return nil
 	}
-	return s.accountRepo.UpdateExtra(ctx, id, updates)
+	if err := s.accountRepo.UpdateExtra(ctx, id, updates); err != nil {
+		return err
+	}
+	if guardSettingChanged && accountForInvalidation != nil {
+		s.invalidateOpenAIWSConnections(accountForInvalidation.ID)
+	}
+	return nil
 }
 
 // BulkUpdateAccounts updates multiple accounts in one request.
@@ -1160,6 +1259,27 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	if _, err := s.accountRepo.BulkUpdate(ctx, input.AccountIDs, repoUpdates); err != nil {
 		return nil, err
 	}
+	if repoUpdates.ProxyID != nil || len(input.Credentials) > 0 {
+		targetsByID := make(map[int64]*Account, len(cachedTargets))
+		for _, account := range cachedTargets {
+			if account != nil {
+				targetsByID[account.ID] = account
+			}
+		}
+		for _, accountID := range input.AccountIDs {
+			if account := targetsByID[accountID]; account != nil {
+				s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, account)
+			} else {
+				// The target was already validated above; retain the direct
+				// invalidation fallback for custom repositories that omit a row.
+				s.invalidateOpenAIWSConnections(accountID)
+			}
+		}
+	} else if hasCodex429GuardUpdate {
+		for _, accountID := range input.AccountIDs {
+			s.invalidateOpenAIWSConnections(accountID)
+		}
+	}
 
 	// 将 proxy 变更传播到每个目标账号的 spark 影子账号
 	if repoUpdates.ProxyID != nil {
@@ -1278,7 +1398,19 @@ func (s *adminServiceImpl) DeleteAccount(ctx context.Context, id int64) error {
 	if err != nil {
 		return fmt.Errorf("list spark shadows for cascade delete: %w", err)
 	}
+	// A deleted credential family must not leave a live pooled OpenAI socket
+	// behind. In particular, a permanent 429 guard pin is otherwise only
+	// removed lazily on a later scheduling attempt.
+	s.invalidateOpenAIWSConnections(id)
 	for _, shadow := range shadows {
+		if shadow != nil {
+			s.invalidateOpenAIWSConnections(shadow.ID)
+		}
+	}
+	for _, shadow := range shadows {
+		if shadow == nil {
+			continue
+		}
 		if err := s.accountRepo.Delete(ctx, shadow.ID); err != nil {
 			return fmt.Errorf("cascade delete spark shadow %d: %w", shadow.ID, err)
 		}
@@ -1317,6 +1449,12 @@ func (s *adminServiceImpl) ClearAccountError(ctx context.Context, id int64) (*Ac
 	if s.runtimeBlocker != nil {
 		s.runtimeBlocker.ClearAccountSchedulingBlock(id)
 	}
+	// Clearing an account error is an explicit operator recovery action. Drop
+	// any permanent Codex 429 guard socket here so the account can be selected
+	// through a fresh authenticated/proxy-validated connection. The generic
+	// runtime-block clear intentionally preserves guard continuations used by a
+	// still-live client session after a normal cooldown expiry.
+	s.invalidateOpenAIWSConnections(id)
 	return s.accountRepo.GetByID(ctx, id)
 }
 
@@ -1344,7 +1482,14 @@ func (s *adminServiceImpl) RevertAccountProxyFallback(ctx context.Context, id in
 	if err != nil {
 		return fmt.Errorf("get account after proxy revert: %w", err)
 	}
-	return s.propagateProxyToShadows(ctx, id, account.ProxyID)
+	if err := s.propagateProxyToShadows(ctx, id, account.ProxyID); err != nil {
+		// The parent proxy has already changed. Invalidate the family even when
+		// a partial shadow propagation fails so no old egress survives.
+		s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, account)
+		return err
+	}
+	s.invalidateOpenAIWSConnectionsForCredentialFamily(ctx, account)
+	return nil
 }
 
 // CreateShadow 为指定 OpenAI OAuth 母账号创建 spark 维度影子账号（一母一影）。

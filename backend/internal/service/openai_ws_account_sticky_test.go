@@ -48,6 +48,291 @@ func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_Hit(t *testing.T
 	}
 }
 
+func TestOpenAIGatewayService_SelectAccountWithScheduler_Codex429GuardContinuation(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2301)
+	account := Account{
+		ID:          2302,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	cache := &stubGatewayCache{}
+	store := NewOpenAIWSStateStore(cache)
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	conn := newOpenAIWSConn("guard_scheduler_conn", account.ID, nil, nil)
+	ap := pool.getOrCreateAccountPool(account.ID)
+	ap.conns[conn.id] = conn
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_guard_scheduler", account.ID, time.Hour))
+	store.BindResponseConn("resp_guard_scheduler", conn.id, time.Hour)
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{account}},
+		cache:              cache,
+		cfg:                cfg,
+		openaiWSStateStore: store,
+		openaiWSPool:       pool,
+	}
+	svc.BlockAccountScheduling(&account, time.Now().Add(time.Minute), "429")
+	guardSnapshot := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, guardSnapshot.Active)
+	require.Equal(t, "429", guardSnapshot.Reason)
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, conn.id, guardSnapshot.Generation), "only the exact socket that observed the confirming 429 may be promoted")
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"resp_guard_scheduler",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		true,
+		false,
+		PlatformOpenAI,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, account.ID, selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayer429Continuation, decision.Layer)
+	require.True(t, decision.ContinuationLease)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+
+	// Once the exact socket is guard-pinned, its continuation remains eligible
+	// even after the short account-level cooldown has expired.
+	svc.ClearAccountSchedulingBlock(account.ID)
+	selection, decision, err = svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"resp_guard_scheduler",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		true,
+		false,
+		PlatformOpenAI,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, account.ID, selection.Account.ID)
+	require.Equal(t, openAIAccountScheduleLayer429Continuation, decision.Layer)
+	require.True(t, decision.ContinuationLease)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+
+	ap.mu.Lock()
+	_, pinned := ap.guardPinnedUntil[conn.id]
+	ap.mu.Unlock()
+	require.True(t, pinned, "continuation selection must retain the exact pooled connection")
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_Codex429GuardDoesNotPromoteUnprovenSocket(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2316)
+	account := Account{
+		ID:          2317,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	cache := &stubGatewayCache{}
+	store := NewOpenAIWSStateStore(cache)
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{account}},
+		cache:              cache,
+		cfg:                cfg,
+		openaiWSStateStore: store,
+		openaiWSPool:       pool,
+	}
+	svc.BlockAccountScheduling(&account, time.Now().Add(time.Minute), "429")
+
+	// This socket was opened after the account entered the confirmed block and
+	// has only an ordinary response binding. The binding must not grant it a
+	// permanent guard pin.
+	conn := newOpenAIWSConn("guard_scheduler_unproven_conn", account.ID, nil, nil)
+	ap := pool.getOrCreateAccountPool(account.ID)
+	ap.conns[conn.id] = conn
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_guard_unproven", account.ID, time.Hour))
+	store.BindResponseConn("resp_guard_unproven", conn.id, time.Hour)
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"resp_guard_unproven",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		true,
+		false,
+		PlatformOpenAI,
+	)
+	require.Nil(t, selection)
+	require.NotEqual(t, openAIAccountScheduleLayer429Continuation, decision.Layer)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
+	require.False(t, pool.IsGuardConnPinned(account.ID, conn.id))
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_Codex429GuardContinuationHydratesFreshProxy(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2306)
+	proxyID := int64(2307)
+	staleAccount := &Account{
+		ID:          2308,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"access_token": "access-token"},
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "old-proxy.example", Port: 8080},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	freshAccount := *staleAccount
+	freshAccount.Proxy = &Proxy{ID: proxyID, Protocol: "http", Host: "new-proxy.example", Port: 8080}
+
+	cache := &stubGatewayCache{}
+	store := NewOpenAIWSStateStore(cache)
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	conn := newOpenAIWSConn("guard_scheduler_proxy_conn", freshAccount.ID, nil, nil)
+	ap := pool.getOrCreateAccountPool(freshAccount.ID)
+	ap.conns[conn.id] = conn
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_guard_fresh_proxy", freshAccount.ID, time.Hour))
+	store.BindResponseConn("resp_guard_fresh_proxy", conn.id, time.Hour)
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{freshAccount}},
+		cache:              cache,
+		cfg:                cfg,
+		openaiWSStateStore: store,
+		openaiWSPool:       pool,
+		schedulerSnapshot: &SchedulerSnapshotService{
+			cache:       &openAISnapshotCacheStub{accountsByID: map[int64]*Account{freshAccount.ID: staleAccount}},
+			accountRepo: stubOpenAIAccountRepo{accounts: []Account{freshAccount}},
+		},
+	}
+	svc.BlockAccountScheduling(&freshAccount, time.Now().Add(time.Minute), "429")
+	guardSnapshot := svc.openAIAccountRuntimeBlockSnapshot(freshAccount.ID)
+	require.True(t, pool.MarkGuardConnConfirmed(freshAccount.ID, conn.id, guardSnapshot.Generation))
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"resp_guard_fresh_proxy",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		true,
+		false,
+		PlatformOpenAI,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.Equal(t, openAIAccountScheduleLayer429Continuation, decision.Layer)
+	require.NotNil(t, selection.Account.Proxy)
+	require.Equal(t, "new-proxy.example", selection.Account.Proxy.Host)
+	if selection.ReleaseFunc != nil {
+		selection.ReleaseFunc()
+	}
+}
+
+func TestOpenAIGatewayService_SelectAccountWithScheduler_Codex429GuardRejectsGenericBlock(t *testing.T) {
+	ctx := context.Background()
+	groupID := int64(2311)
+	account := Account{
+		ID:          2312,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		GroupIDs:    []int64{groupID},
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	cache := &stubGatewayCache{}
+	store := NewOpenAIWSStateStore(cache)
+	cfg := newOpenAIWSV2TestConfig()
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+	conn := newOpenAIWSConn("guard_scheduler_generic_conn", account.ID, nil, nil)
+	ap := pool.getOrCreateAccountPool(account.ID)
+	ap.conns[conn.id] = conn
+	require.NoError(t, store.BindResponseAccount(ctx, groupID, "resp_guard_generic", account.ID, time.Hour))
+	store.BindResponseConn("resp_guard_generic", conn.id, time.Hour)
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        stubOpenAIAccountRepo{accounts: []Account{account}},
+		cache:              cache,
+		cfg:                cfg,
+		openaiWSStateStore: store,
+		openaiWSPool:       pool,
+	}
+	svc.BlockAccountScheduling(&account, time.Now().Add(time.Minute), "upstream_disable")
+
+	selection, decision, err := svc.SelectAccountWithSchedulerForCapability(
+		ctx,
+		&groupID,
+		"resp_guard_generic",
+		"",
+		"gpt-5.1",
+		nil,
+		OpenAIUpstreamTransportResponsesWebsocketV2Ingress,
+		OpenAIEndpointCapabilityChatCompletions,
+		false,
+		true,
+		false,
+		PlatformOpenAI,
+	)
+	require.Nil(t, selection)
+	require.NotEqual(t, openAIAccountScheduleLayer429Continuation, decision.Layer)
+	require.ErrorIs(t, err, ErrNoAvailableAccounts)
+}
+
 func TestOpenAIGatewayService_SelectAccountByPreviousResponseID_QuotaAutoPausedMiss(t *testing.T) {
 	ctx := context.Background()
 	groupID := int64(23)

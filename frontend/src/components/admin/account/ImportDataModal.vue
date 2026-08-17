@@ -140,7 +140,7 @@ const dragDepth = ref(0)
 const dragActive = computed(() => dragDepth.value > 0)
 const hasCreatedData = ref(false)
 const result = ref<AdminDataImportResult | null>(null)
-const codex429GuardEnabled = ref(true)
+const codex429GuardEnabled = ref(false)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFilesLabel = computed(() => {
@@ -160,7 +160,7 @@ watch(
       dragDepth.value = 0
       hasCreatedData.value = false
       result.value = null
-      codex429GuardEnabled.value = true
+      codex429GuardEnabled.value = false
       if (fileInput.value) {
         fileInput.value.value = ''
       }

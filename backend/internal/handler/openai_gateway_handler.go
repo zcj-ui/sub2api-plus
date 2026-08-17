@@ -25,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 )
 
@@ -1821,11 +1822,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
-	sessionHash := h.gatewayService.GenerateSessionHashWithFallback(
-		c,
-		firstMessage,
-		openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID),
-	)
+	// A WebSocket without an explicit session signal gets a per-connection
+	// fallback. Content/model-only frames are not stable conversation IDs and
+	// must never reuse another client's local upstream socket.
+	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, firstMessage)
+	if sessionHash == "" {
+		fallbackSeed := openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID) + ":" + uuid.NewString()
+		sessionHash = h.gatewayService.GenerateSessionHashWithFallback(c, nil, fallbackSeed)
+	}
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -1877,6 +1881,67 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	requiredCapability := service.OpenAIEndpointCapabilityChatCompletions
 	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage) && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
+	}
+	applyWSResume := func(resume *service.OpenAIWSResumeState) bool {
+		if resume == nil || len(resume.ReplayPayload) == 0 {
+			return false
+		}
+		if resume.SessionHash != "" && resume.SessionHash != sessionHash {
+			return false
+		}
+		model := strings.TrimSpace(resume.OriginalModel)
+		if model == "" {
+			return false
+		}
+		payload := append([]byte(nil), resume.ReplayPayload...)
+		if !gjson.ValidBytes(payload) || strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" {
+			return false
+		}
+		var setModelErr error
+		payload, setModelErr = sjson.SetBytes(payload, "model", model)
+		if setModelErr != nil {
+			return false
+		}
+		coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
+		if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+			return false
+		}
+
+		firstMessage = payload
+		reqModel = model
+		previousResponseID = ""
+		previousResponseIDKind = service.OpenAIPreviousResponseIDKindEmpty
+		firstMessageToolCoverage = coverage
+		previousResponseCanMove = true
+		imageIntent = service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
+		if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
+			return false
+		}
+		if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
+			platform, ok := service.DetectModelPlatform(reqModel)
+			if !ok || platform != service.PlatformOpenAI {
+				return false
+			}
+			ctx = service.WithResolvedTargetPlatform(ctx, platform)
+			c.Request = c.Request.WithContext(service.WithResolvedTargetPlatform(c.Request.Context(), platform))
+		}
+		requestPlatform = openAICompatibleRequestPlatform(ctx, apiKey)
+		if requestPlatform != service.PlatformOpenAI {
+			return false
+		}
+		requiredTransport = service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
+		requiredCapability = service.OpenAIEndpointCapabilityChatCompletions
+		if imageIntent {
+			requiredCapability = service.OpenAIEndpointCapabilityResponses
+		}
+		channelMappingWS, _ = h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, reqModel)
+		setOpsRequestContext(c, reqModel, true)
+		reqLog.Warn("openai.websocket_429_guard_resuming_turn",
+			zap.Int("turn", resume.Turn),
+			zap.Int64("failed_account_id", resume.FailedAccountID),
+			zap.String("failed_conn_id", resume.FailedConnID),
+		)
+		return true
 	}
 
 	// 分组利润控制：WS 桥按连接装配定价上下文并装门（选号与抢槽共用该
@@ -2034,10 +2099,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// openAIWSTurnPricing 的注释——绝不能用建连时刻初始化。
 		var turnPricing openAIWSTurnPricing
 		hooks := &service.OpenAIWSIngressHooks{
-			ClientLifecycleContext:  clientLifecycleCtx,
-			InitialRequestModel:     reqModel,
-			MaxReasoningEffort:      maxReasoningEffort,
-			ReasoningEffortMappings: reasoningEffortMappings,
+			ClientLifecycleContext:    clientLifecycleCtx,
+			InitialRequestModel:       reqModel,
+			SessionHash:               sessionHash,
+			Force429GuardContinuation: scheduleDecision.ContinuationLease,
+			MaxReasoningEffort:        maxReasoningEffort,
+			ReasoningEffortMappings:   reasoningEffortMappings,
 			BeforeRequest: func(turn int, payload []byte, originalModel string) error {
 				c.Set(securityAuditWSTurnContextKey, turn)
 				if turn == 1 {
@@ -2222,16 +2289,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		wsFirstMessage := firstMessage
-		// 切组/会话失配防护：previous_response_id 未在当前分组命中粘连账号（StickyPreviousHit=false），
-		// 说明该会话链不属于本次调度到的账号，原样转发会触发上游会话链鉴权失败（“鉴权失败，请检查 API Key”）。
-		// 故剥离首包里的 previous_response_id，改用首包内 input 重建上下文；带 function_call_output 的
-		// 工具续链无法重建，保持原样。仅作用于首轮首包，后续 turn 的续链由 WS 转发层既有逻辑处理。
-		if previousResponseID != "" && !scheduleDecision.StickyPreviousHit && previousResponseCanMove {
-			wsFirstMessage = service.RemovePreviousResponseIDFromBody(wsFirstMessage)
-			reqLog.Debug("openai.websocket_previous_response_id_stripped_cross_group",
+		// A previous_response_id is scoped to the upstream account/session that
+		// created it. If the scheduler cannot prove the response binding belongs
+		// to the selected account, stripping the id would turn a continuation
+		// delta into a new, contextless request. Keep the conversation intact and
+		// fail closed; only the explicit WS resume path may rebuild a full payload.
+		if previousResponseID != "" && !scheduleDecision.StickyPreviousHit {
+			reqLog.Warn("openai.websocket_previous_response_binding_unavailable",
 				zap.Int64("account_id", account.ID),
 				zap.String("schedule_layer", scheduleDecision.Layer),
 			)
+			closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation binding unavailable; please reconnect")
+			return
 		}
 
 		// WebSocket 首包可能很大，hash 必须在 hooks 外算成字符串，避免 AfterTurn 闭包保活请求体。
@@ -2241,6 +2310,18 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				if handleWSFailover(account, failoverErr) {
+					if failoverErr.WSResume != nil {
+						if !applyWSResume(failoverErr.WSResume) {
+							closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
+							return
+						}
+					} else if strings.TrimSpace(previousResponseID) != "" {
+						// A raw previous_response_id is only meaningful to the old
+						// upstream account. Do not strip it and send a delta-only
+						// request to a replacement account without a verified replay.
+						closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
+						return
+					}
 					continue
 				}
 				return

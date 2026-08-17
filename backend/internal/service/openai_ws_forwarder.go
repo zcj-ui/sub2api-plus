@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -58,8 +59,9 @@ var openAIWSIngressPreflightPingIdle = 20 * time.Second
 
 // openAIWSFallbackError 表示可安全回退到 HTTP 的 WS 错误（尚未写下游）。
 type openAIWSFallbackError struct {
-	Reason string
-	Err    error
+	Reason         string
+	Err            error
+	KeepConnection bool
 }
 
 func (e *openAIWSFallbackError) Error() string {
@@ -83,6 +85,22 @@ func wrapOpenAIWSFallback(reason string, err error) error {
 	return &openAIWSFallbackError{Reason: strings.TrimSpace(reason), Err: err}
 }
 
+// wrapOpenAIWSFallbackKeepConnection marks a semantic upstream failure whose
+// pooled socket is still healthy. The caller must return the error to the
+// client, but may release the lease without evicting the connection.
+func wrapOpenAIWSFallbackKeepConnection(reason string, err error) error {
+	return &openAIWSFallbackError{
+		Reason:         strings.TrimSpace(reason),
+		Err:            err,
+		KeepConnection: true,
+	}
+}
+
+func openAIWSFallbackKeepsConnection(err error) bool {
+	var fallbackErr *openAIWSFallbackError
+	return errors.As(err, &fallbackErr) && fallbackErr != nil && fallbackErr.KeepConnection
+}
+
 // OpenAIWSClientCloseError 表示应以指定 WebSocket close code 主动关闭客户端连接的错误。
 type OpenAIWSClientCloseError struct {
 	statusCode coderws.StatusCode
@@ -91,9 +109,10 @@ type OpenAIWSClientCloseError struct {
 }
 
 type openAIWSIngressTurnError struct {
-	stage           string
-	cause           error
-	wroteDownstream bool
+	stage                   string
+	cause                   error
+	wroteDownstream         bool
+	wroteSemanticDownstream bool
 }
 
 func (e *openAIWSIngressTurnError) Error() string {
@@ -114,13 +133,18 @@ func (e *openAIWSIngressTurnError) Unwrap() error {
 }
 
 func wrapOpenAIWSIngressTurnError(stage string, cause error, wroteDownstream bool) error {
+	return wrapOpenAIWSIngressTurnErrorWithSemantic(stage, cause, wroteDownstream, wroteDownstream)
+}
+
+func wrapOpenAIWSIngressTurnErrorWithSemantic(stage string, cause error, wroteDownstream, wroteSemanticDownstream bool) error {
 	if cause == nil {
 		return nil
 	}
 	return &openAIWSIngressTurnError{
-		stage:           strings.TrimSpace(stage),
-		cause:           cause,
-		wroteDownstream: wroteDownstream,
+		stage:                   strings.TrimSpace(stage),
+		cause:                   cause,
+		wroteDownstream:         wroteDownstream,
+		wroteSemanticDownstream: wroteSemanticDownstream,
 	}
 }
 
@@ -143,6 +167,174 @@ func isOpenAIWSIngressTurnRetryable(err error) bool {
 	}
 }
 
+// isOpenAIWS429GuardSwitchableTurnError accepts only upstream-side failures
+// before a client-visible event has been committed. Client read/write errors,
+// policy failures and a canceled request must stay on the normal close path.
+func isOpenAIWS429GuardSwitchableTurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var failoverErr *UpstreamFailoverError
+	if errors.As(err, &failoverErr) {
+		return failoverErr != nil
+	}
+	var turnErr *openAIWSIngressTurnError
+	if !errors.As(err, &turnErr) || turnErr == nil || turnErr.wroteSemanticDownstream {
+		return false
+	}
+	switch turnErr.stage {
+	case "write_upstream":
+		return true
+	case "read_upstream":
+		// A lifecycle preamble may already mean the upstream accepted the
+		// request. Replaying after that point can duplicate a side effect even
+		// when no token has reached the client yet.
+		return !turnErr.wroteDownstream
+	case "upstream_error_event", "upstream_response_failed", openAIWSIngressStagePreviousResponseNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+// isOpenAIWS429GuardConnectionActive reports whether the account has already
+// crossed the explicit two-signal OAuth 429 confirmation threshold. A guard
+// flag alone is not enough: the first 429 must still follow normal failover.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardConnectionActive(account *Account) bool {
+	return s != nil && account != nil && account.Codex429GuardEnabled() &&
+		account.IsOpenAIOAuth() && s.isOpenAI429GuardRuntimeBlocked(account)
+}
+
+// isOpenAIWS429GuardConnectionPinned is the connection-lifetime half of the
+// guard. Once a confirmed 429 has pinned a pooled socket, the account cooldown
+// may expire without making that socket eligible for ordinary cleanup or a
+// different account. The pool remains the source of truth for liveness.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardConnectionPinned(account *Account, connID string) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	pool := s.getOpenAIWSConnPool()
+	return pool != nil && pool.IsGuardConnPinned(account.ID, connID)
+}
+
+// isOpenAIWS429GuardConnectionCandidate is narrower than general pool reuse:
+// it identifies only the socket that was already pooled when the confirmed
+// 429 block began. It may receive the confirming event, but it is not retained
+// until that event has been positively pinned.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardConnectionCandidate(account *Account, connID string, generations ...uint64) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	pool := s.getOpenAIWSConnPool()
+	return pool != nil && pool.IsGuardConnCandidate(account.ID, connID, generations...)
+}
+
+// isOpenAIWS429GuardConnectionRetained allows a healthy, already-pinned old
+// connection to keep serving after the short account-level 429 cooldown. A
+// runtime block is still required before the first pin is created.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardConnectionRetained(account *Account, connID string) bool {
+	if s.isOpenAIWS429GuardContinuationBlockedByNon429Runtime(account) {
+		return false
+	}
+	if strings.TrimSpace(connID) != "" {
+		return s.isOpenAIWS429GuardConnectionPinned(account, connID)
+	}
+	return s.isOpenAIWS429GuardConnectionActive(account)
+}
+
+// isOpenAIWS429GuardAccountActiveForLease keeps the acquire-time guard proof
+// authoritative after the short runtime cooldown expires. A socket acquired
+// during the guard window is still unproven until that exact lease observes the
+// confirming 429 and must be evicted on a later non-rate-limit failure.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardAccountActiveForLease(account *Account, lease *openAIWSConnLease) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() || lease == nil {
+		return false
+	}
+	return lease.openAI429GuardActiveAtAcquire || lease.openAI429GuardProven.Load() || s.isOpenAIWS429GuardConnectionActive(account)
+}
+
+// isOpenAIWS429GuardContinuationActiveForLease carries the acquire-time guard
+// state through cooldown expiry. It is scoped to the current lease, so a later
+// ordinary socket cannot inherit continuation failover behavior.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardContinuationActiveForLease(account *Account, lease *openAIWSConnLease, leaseRequested bool) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	return s.isOpenAIWS429GuardContinuationActive(account, leaseRequested) ||
+		(lease != nil && (lease.openAI429GuardActiveAtAcquire || lease.openAI429GuardProven.Load()))
+}
+
+// isOpenAIWS429GuardContinuationActive keeps the connection-affinity lease
+// separate from the live 429 retention state. A continuation selected while a
+// confirmed block was active must still fail over safely if its socket breaks
+// after the block expires; only rate-limit classification should consult the
+// live runtime block directly.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardContinuationActive(account *Account, leaseRequested bool) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	return leaseRequested || s.isOpenAIWS429GuardConnectionActive(account)
+}
+
+// isOpenAIWS429GuardContinuationBlockedByNon429Runtime prevents a long-lived
+// guarded ingress lease from bypassing a later auth/transport/admin block. A
+// confirmed 429 is the sole runtime block that may keep the old socket alive;
+// an empty reason is treated as non-429 so an unknown block fails closed.
+func (s *OpenAIGatewayService) isOpenAIWS429GuardContinuationBlockedByNon429Runtime(account *Account) bool {
+	if s == nil || account == nil {
+		return false
+	}
+	snapshot := s.openAIAccountRuntimeBlockSnapshot(account.ID)
+	return snapshot.Active && snapshot.Reason != "429"
+}
+
+// isOpenAIWS429GuardSwitchableAcquireError distinguishes a failed preferred
+// connection from a healthy connection that is merely occupied. The latter
+// must keep its binding so a concurrent turn cannot silently move accounts.
+func isOpenAIWS429GuardSwitchableAcquireError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errOpenAIWSConnQueueFull) {
+		return false
+	}
+	if errors.Is(err, errOpenAIWSPreferredConnUnavailable) || errors.Is(err, errOpenAIWSConnClosed) {
+		return true
+	}
+	var dialErr *openAIWSDialError
+	if errors.As(err, &dialErr) {
+		return true
+	}
+	// A non-context error from the preferred-connection health probe is an
+	// upstream transport failure and is eligible for immediate migration.
+	return true
+}
+
+// isOpenAIWS429GuardReplaySafe reports whether removing a previous response
+// identifier still leaves enough client-visible context to issue a new turn.
+// Ordinary assistant history lives only upstream, so only a complete tool
+// call/output pair is replayable from the local snapshot.
+func isOpenAIWS429GuardReplaySafe(previousResponseID string, replayInput []json.RawMessage, replayInputExists bool) bool {
+	if strings.TrimSpace(previousResponseID) == "" {
+		return true
+	}
+	return replayInputExists &&
+		openAIWSRawItemsHasFunctionCallOutput(replayInput) &&
+		openAIWSRawItemsHaveToolCallContextForOutputs(replayInput)
+}
+
+// hasOpenAIWSVerifiedReplayHistory reports whether a continuation can be
+// rebuilt from locally observed input rather than from an opaque upstream
+// response id. Both snapshots must be non-empty, and the current replay must
+// retain the prior local snapshot as its prefix.
+func hasOpenAIWSVerifiedReplayHistory(
+	previousInput []json.RawMessage,
+	previousInputExists bool,
+	currentInput []json.RawMessage,
+	currentInputExists bool,
+) bool {
+	return previousInputExists && len(previousInput) > 0 &&
+		currentInputExists && len(currentInput) > 0 &&
+		openAIWSRawItemsHasPrefix(currentInput, previousInput)
+}
+
 func openAIWSIngressTurnRetryReason(err error) string {
 	var turnErr *openAIWSIngressTurnError
 	if !errors.As(err, &turnErr) || turnErr == nil {
@@ -162,7 +354,7 @@ func isOpenAIWSIngressPreviousResponseNotFound(err error) bool {
 	if strings.TrimSpace(turnErr.stage) != openAIWSIngressStagePreviousResponseNotFound {
 		return false
 	}
-	return !turnErr.wroteDownstream
+	return !turnErr.wroteSemanticDownstream
 }
 
 // NewOpenAIWSClientCloseError 创建一个客户端 WS 关闭错误。
@@ -215,6 +407,15 @@ type OpenAIWSIngressHooks struct {
 	// before channel or account mapping. Ingress modes preserve it for usage
 	// attribution while MapRequestModel determines the upstream model.
 	InitialRequestModel string
+	// SessionHash is resolved by the authenticated handler for this client
+	// WebSocket. It is used only when a frame lacks an explicit session signal,
+	// so content-only/model-only frames cannot borrow another client's socket.
+	SessionHash string
+	// Force429GuardContinuation makes the first turn use the exact pooled
+	// connection associated with a 429-guard continuation lease. The pool
+	// verifies that connection atomically instead of silently opening another
+	// connection for the rate-limited account.
+	Force429GuardContinuation bool
 	// MaxReasoningEffort limits explicit reasoning effort values for this WS session.
 	MaxReasoningEffort string
 	// ReasoningEffortMappings rewrites explicit effort values for this WS session.
@@ -227,6 +428,23 @@ type OpenAIWSIngressHooks struct {
 	AfterTurn       func(turn int, result *OpenAIForwardResult, turnErr error)
 }
 
+// OpenAIWSResumeState carries a fully rebuilt, not-yet-client-visible turn
+// from a failed pooled WebSocket connection back to the WebSocket handler.
+// The handler may select another account and send ReplayPayload once; callers
+// must leave this nil when the original turn wrote any downstream bytes.
+type OpenAIWSResumeState struct {
+	ReplayPayload []byte
+	// OriginalModel is the client-facing model before the failed account's
+	// channel/account mapping. A replacement account must re-run mapping from
+	// this value rather than treating the old upstream model as client input.
+	OriginalModel      string
+	SessionHash        string
+	PreviousResponseID string
+	FailedAccountID    int64
+	FailedConnID       string
+	Turn               int
+}
+
 func (s *OpenAIGatewayService) getOpenAIWSConnPool() *openAIWSConnPool {
 	if s == nil {
 		return nil
@@ -236,7 +454,27 @@ func (s *OpenAIGatewayService) getOpenAIWSConnPool() *openAIWSConnPool {
 			s.openaiWSPool = newOpenAIWSConnPool(s.cfg)
 		}
 	})
-	return s.openaiWSPool
+	pool := s.openaiWSPool
+	if pool != nil {
+		s.openaiWSPoolRef.Store(pool)
+		pool.setGuardBindingInvalidator(func(accountID int64, connID string) {
+			store := s.getOpenAIWSStateStore()
+			if invalidator, ok := store.(openAIWSConnectionBindingInvalidator); ok {
+				invalidator.invalidateConnectionBindings(accountID, connID)
+			}
+		})
+	}
+	return pool
+}
+
+// existingOpenAIWSConnPool returns an already initialized pool without
+// starting WebSocket workers solely to invalidate a connection that does not
+// exist. Every real guard pin flows through getOpenAIWSConnPool first.
+func (s *OpenAIGatewayService) existingOpenAIWSConnPool() *openAIWSConnPool {
+	if s == nil {
+		return nil
+	}
+	return s.openaiWSPoolRef.Load()
 }
 
 func (s *OpenAIGatewayService) getOpenAIWSPassthroughDialer() openAIWSClientDialer {

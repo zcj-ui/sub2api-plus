@@ -44,6 +44,113 @@ func TestOpenAIWSConnPool_CleanupStaleAndTrimIdle(t *testing.T) {
 	require.NotNil(t, ap.conns["idle_new"], "newer idle should be kept")
 }
 
+func TestOpenAIWSConnPool_GuardPinSurvivesMaxAgeUntilTTL(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	ap := pool.getOrCreateAccountPool(11)
+	conn := newOpenAIWSConn("guard_pin", 11, nil, nil)
+	conn.createdAtNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	ap.conns[conn.id] = conn
+
+	require.True(t, pool.PinConnUntil(11, conn.id, time.Now().Add(time.Minute)))
+	evicted := pool.cleanupAccountLocked(ap, time.Now(), pool.maxConnsHardCap())
+	require.Empty(t, evicted)
+	require.NotNil(t, ap.conns[conn.id])
+
+	ap.guardPinnedUntil[conn.id] = time.Now().Add(-time.Second)
+	evicted = pool.cleanupAccountLocked(ap, time.Now(), pool.maxConnsHardCap())
+	require.Len(t, evicted, 1)
+	closeOpenAIWSConns(evicted)
+}
+
+func TestOpenAIWSConnPool_StaleGuardPinDoesNotBlockProxyReplacement(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	ap := pool.getOrCreateAccountPool(13)
+	conn := newOpenAIWSConn("stale_guard_proxy", 13, nil, nil)
+	conn.proxyURL = normalizeOpenAIWSProxyURL("http://old-proxy.example:8080")
+	conn.proxyURLKnown = true
+	conn.wsURL = normalizeOpenAIWSURL("wss://old-upstream.example/v1")
+	conn.wsURLKnown = true
+	ap.conns[conn.id] = conn
+	require.True(t, pool.PinConnUntil(13, conn.id, time.Now().Add(time.Hour)))
+
+	ap.mu.Lock()
+	picked := pool.pickOldestIdleConnWithoutHandshakeCompatibilityOrRoutingAffinityLocked(
+		ap,
+		openAIWSHandshakeCompatibilityKey{},
+		"",
+		"http://new-proxy.example:8080",
+		"wss://new-upstream.example/v1",
+	)
+	ap.mu.Unlock()
+	require.Same(t, conn, picked, "a stale pinned target must be evictable for the replacement proxy")
+}
+
+func TestOpenAI429GuardPinIsPermanentUntilConnectionEviction(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.StickyResponseIDTTLSeconds = 30
+	cfg.Gateway.OpenAIWS.StickySessionTTLSeconds = 90
+	pool := newOpenAIWSConnPool(cfg)
+	defer pool.Close()
+
+	account := &Account{
+		ID:       12,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	conn := newOpenAIWSConn("guard_ttl", account.ID, nil, nil)
+	ap.conns[conn.id] = conn
+	svc := &OpenAIGatewayService{cfg: cfg, openaiWSPool: pool}
+
+	shortBlockUntil := time.Now().Add(15 * time.Second)
+	svc.BlockAccountScheduling(account, shortBlockUntil, "429")
+	shortGeneration := svc.openAIAccountRuntimeBlockSnapshot(account.ID).Generation
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, conn.id, shortGeneration))
+	require.True(t, svc.pinOpenAI429GuardConnection(account, conn.id))
+
+	ap.mu.Lock()
+	shortPinnedUntil := ap.guardPinnedUntil[conn.id]
+	ap.mu.Unlock()
+	require.True(t, shortPinnedUntil.IsZero(), "a confirmed 429 guard pin must not expire with the runtime cooldown")
+
+	longBlockUntil := time.Now().Add(3 * time.Minute)
+	svc.BlockAccountScheduling(account, longBlockUntil, "429")
+	longGeneration := svc.openAIAccountRuntimeBlockSnapshot(account.ID).Generation
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, conn.id, longGeneration))
+	require.True(t, svc.pinOpenAI429GuardConnection(account, conn.id))
+
+	ap.mu.Lock()
+	longPinnedUntil := ap.guardPinnedUntil[conn.id]
+	ap.mu.Unlock()
+	require.True(t, longPinnedUntil.IsZero(), "a later runtime block must not downgrade a permanent guard pin")
+	require.True(t, pool.IsGuardConnPinned(account.ID, conn.id))
+	pool.evictConn(account.ID, conn.id)
+	require.False(t, pool.IsGuardConnPinned(account.ID, conn.id), "evicting the socket must release its guard pin")
+}
+
+func TestOpenAI429GuardPinKeepsOneLiveConnectionPerAccount(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	defer pool.Close()
+	accountID := int64(14)
+	ap := pool.getOrCreateAccountPool(accountID)
+	first := newOpenAIWSConn("guard_singleton_first", accountID, nil, nil)
+	second := newOpenAIWSConn("guard_singleton_second", accountID, nil, nil)
+	ap.conns[first.id] = first
+	ap.conns[second.id] = second
+
+	require.True(t, pool.PinGuardConn(accountID, first.id))
+	require.False(t, pool.PinGuardConn(accountID, second.id), "a second live socket must not acquire the account guard pin")
+	require.True(t, pool.IsGuardConnPinned(accountID, first.id))
+	require.False(t, pool.IsGuardConnPinned(accountID, second.id))
+}
+
 func TestOpenAIWSConnPool_NextConnIDFormat(t *testing.T) {
 	pool := newOpenAIWSConnPool(&config.Config{})
 	id1 := pool.nextConnID(42)

@@ -42,9 +42,9 @@
 
 ### 3.3 "卡429"合成工具注入（对齐 DeanZFC/sub2api-overdraft `766daa0`）
 - 非工具结尾的请求历史尾部注入成对 `custom_tool_call` + `custom_tool_call_output`，工具名 `exec`，随机 `call_sub2api_overdraft_*` call_id，不写入 tools 列表。
-- 注入条件：账号开关 `extra.openai_codex_429_guard_enabled`（默认开）+ 尾部为 message/user（含 Chat Completions 转换与文本输入形态）。
+- 注入条件：账号开关 `extra.openai_codex_429_guard_enabled`（默认关闭，显式 `true` 才启用）+ 尾部为 message/user（含 Chat Completions 转换与文本输入形态）。
 - 排除：CC/Claude 桥接、compact、真实工具续链、Shadow/Spark、历史已有注入（幂等）、body 超 32 MiB、无效 JSON 原样放行。
-- UI 开关"卡429开关"覆盖创建/编辑/批量编辑/数据导入；后端校验仅 OpenAI OAuth 可写。
+- UI 开关统一显示为“奸商模式”，覆盖创建/编辑/批量编辑/数据导入；后端校验仅 OpenAI OAuth 可写。
 
 ### 3.4 Codex 指纹（会话身份模拟）
 - 模式 `off/device/session/full`，**默认 off（显式 opt-in）**——对齐上游 #5668/#5610 结论：默认收敛曾导致额度缩水与风控。

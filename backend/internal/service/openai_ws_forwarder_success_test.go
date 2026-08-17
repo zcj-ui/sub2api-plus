@@ -555,6 +555,184 @@ func TestOpenAIGatewayService_Forward_WSv2_ResponseFailedIsNotSchedulingSuccess(
 	require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-5.5"))
 }
 
+func TestOpenAIGatewayService_Forward_WSv2_GuardResponseFailedNon429FailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = false
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_forbidden_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		// A malformed relay can label a response.failed frame with a 2xx status.
+		// The frame type still means the retained guard socket is unusable.
+		[]byte(`{"type":"response.failed","response":{"id":"resp_guard_malformed","status":"failed","error":{"status_code":200,"code":"upstream_error","message":"upstream rejected"}}}`),
+	}}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: captureConn})
+	defer pool.Close()
+	account := &Account{
+		ID:          1303,
+		Name:        "openai-guard-forbidden",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	seedRec := httptest.NewRecorder()
+	seedCtx, _ := gin.CreateTestContext(seedRec)
+	seedCtx.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	seedCtx.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	seedResult, seedErr := svc.Forward(context.Background(), seedCtx, account, []byte(`{"model":"gpt-5.1","stream":false,"input":"seed"}`))
+	require.NoError(t, seedErr)
+	require.NotNil(t, seedResult)
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	oldConnID := ""
+	for id := range ap.conns {
+		oldConnID = id
+		break
+	}
+	ap.mu.Unlock()
+	require.NotEmpty(t, oldConnID)
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.True(t, pool.PinGuardConn(account.ID, oldConnID))
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_guard_forbidden_seed","input":"hello"}`))
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Equal(t, http.StatusOK, rec.Code, "service failover is committed by the outer handler")
+	ap.mu.Lock()
+	_, stillPooled := ap.conns[oldConnID]
+	ap.mu.Unlock()
+	require.False(t, stillPooled, "a guard socket with a non-429 response.failed must be evicted")
+}
+
+func TestOpenAIWS429GuardErrorEventFailureStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		status     int
+		code       string
+		errType    string
+		message    string
+		wantStatus int
+		wantFail   bool
+	}{
+		{name: "rate_limit_is_retained", status: http.StatusTooManyRequests, code: "rate_limit_exceeded", wantFail: false},
+		{name: "forbidden_switches", status: http.StatusForbidden, code: "forbidden", wantStatus: http.StatusForbidden, wantFail: true},
+		{name: "statusless_gateway_error_switches", code: "upstream_error", wantStatus: http.StatusBadGateway, wantFail: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, failed := openAIWS429GuardErrorEventFailureStatus(tt.status, tt.code, tt.errType, tt.message)
+			require.Equal(t, tt.wantFail, failed)
+			require.Equal(t, tt.wantStatus, status)
+		})
+	}
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GuardErrorEventNon429FailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = false
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_error_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		[]byte(`{"type":"error","error":{"status_code":403,"code":"forbidden","message":"upstream rejected"}}`),
+	}}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: captureConn})
+	defer pool.Close()
+	account := &Account{
+		ID:          1304,
+		Name:        "openai-guard-error-event",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	seedRec := httptest.NewRecorder()
+	seedCtx, _ := gin.CreateTestContext(seedRec)
+	seedCtx.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	seedCtx.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	seedResult, seedErr := svc.Forward(context.Background(), seedCtx, account, []byte(`{"model":"gpt-5.1","stream":false,"input":"seed"}`))
+	require.NoError(t, seedErr)
+	require.NotNil(t, seedResult)
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	oldConnID := ""
+	for id := range ap.conns {
+		oldConnID = id
+		break
+	}
+	ap.mu.Unlock()
+	require.NotEmpty(t, oldConnID)
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.True(t, pool.PinGuardConn(account.ID, oldConnID))
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_guard_error_seed","input":"hello"}`))
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+	ap.mu.Lock()
+	_, stillPooled := ap.conns[oldConnID]
+	ap.mu.Unlock()
+	require.False(t, stillPooled, "a guard socket with a non-429 error event must be evicted")
+}
+
 func TestOpenAIWSPayloadString_OnlyAcceptsStringValues(t *testing.T) {
 	payload := map[string]any{
 		"type":                 nil,
@@ -1298,6 +1476,405 @@ func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarm(t *testing.T) {
 	require.True(t, gjson.Get(firstWrite, "generate").Exists())
 	require.False(t, gjson.Get(firstWrite, "generate").Bool())
 	require.False(t, gjson.Get(secondWrite, "generate").Exists())
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmConfirmed429KeepsConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = false
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_seed_old_socket","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		[]byte(`{"type":"response.failed","response":{"id":"resp_prewarm_429","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_main_after_prewarm","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          60,
+		Name:        "openai-prewarm-confirmed-429",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	forward := func() (*OpenAIForwardResult, *httptest.ResponseRecorder, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		body := []byte(`{"model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)
+		result, err := svc.Forward(context.Background(), c, account, body)
+		return result, rec, err
+	}
+
+	// Establish a pooled socket before the account enters the confirmed 429
+	// state. Only this old socket may be retained by the guard.
+	seedResult, seedRec, seedErr := forward()
+	require.NoError(t, seedErr)
+	require.NotNil(t, seedResult)
+	require.Equal(t, "resp_seed_old_socket", seedResult.RequestID)
+	require.Equal(t, http.StatusOK, seedRec.Code)
+	require.Equal(t, 1, captureDialer.DialCount())
+
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	oldConnID := ""
+	for connID := range ap.conns {
+		oldConnID = connID
+		break
+	}
+	ap.mu.Unlock()
+	require.NotEmpty(t, oldConnID)
+	guardGeneration := svc.openAIAccountRuntimeBlockSnapshot(account.ID).Generation
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, oldConnID, guardGeneration))
+	require.True(t, svc.pinOpenAI429GuardConnection(account, oldConnID))
+	require.True(t, svc.isOpenAIWS429GuardConnectionPinned(account, oldConnID))
+
+	firstResult, firstRec, firstErr := forward()
+	require.NoError(t, firstErr)
+	require.NotNil(t, firstResult)
+	require.Equal(t, "resp_prewarm_429", firstResult.RequestID)
+	require.Equal(t, http.StatusOK, firstRec.Code)
+
+	secondResult, secondRec, secondErr := forward()
+	require.NoError(t, secondErr)
+	require.NotNil(t, secondResult)
+	require.Equal(t, "resp_main_after_prewarm", secondResult.RequestID)
+	require.Equal(t, http.StatusOK, secondRec.Code)
+	require.Equal(t, 1, captureDialer.DialCount(), "confirmed guard must retain the healthy pooled websocket")
+	require.Len(t, captureConn.writes, 3, "confirmed guard must not add a hidden prewarm turn")
+	for _, write := range captureConn.writes {
+		require.False(t, gjson.Get(requestToJSONString(write), "generate").Exists(), "guarded reuse must not emit a prewarm marker")
+	}
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmConfirmed429FreshConnectionFailsOver(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.failed","response":{"id":"resp_fresh_prewarm_429","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          63,
+		Name:        "openai-prewarm-confirmed-429-fresh",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	body := []byte(`{"model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
+	// Service-level failover leaves response writing to the handler, which can
+	// select another account before committing a client response.
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, 1, captureDialer.DialCount())
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	connCount := len(ap.conns)
+	ap.mu.Unlock()
+	require.Equal(t, 0, connCount, "a fresh socket after confirmed 429 must not become the retained old connection")
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmSecond429PinsOldConnection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = false
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		[]byte(`{"type":"response.failed","response":{"id":"resp_second429_prewarm","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_main","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          64,
+		Name:        "openai-prewarm-second-429",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	forward := func() (*OpenAIForwardResult, *httptest.ResponseRecorder, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		body := []byte(`{"model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)
+		result, err := svc.Forward(context.Background(), c, account, body)
+		return result, rec, err
+	}
+
+	seedResult, _, seedErr := forward()
+	require.NoError(t, seedErr)
+	require.NotNil(t, seedResult)
+	require.Equal(t, "resp_second429_seed", seedResult.RequestID)
+	// Simulate the first explicit 429 signal while the old socket is still
+	// alive; the prewarm turn supplies the second signal that confirms it.
+	require.False(t, svc.confirmOpenAIOAuth429(account.ID, time.Now()))
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+
+	firstResult, firstRec, firstErr := forward()
+	require.Error(t, firstErr)
+	require.Nil(t, firstResult)
+	require.Equal(t, http.StatusTooManyRequests, firstRec.Code)
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	oldConnID := ""
+	for connID := range ap.conns {
+		oldConnID = connID
+		break
+	}
+	ap.mu.Unlock()
+	require.NotEmpty(t, oldConnID)
+	require.True(t, pool.IsGuardConnPinned(account.ID, oldConnID), "the old socket must be pinned by the confirming 429")
+
+	secondResult, secondRec, secondErr := forward()
+	require.NoError(t, secondErr)
+	require.NotNil(t, secondResult)
+	require.Equal(t, "resp_second429_main", secondResult.RequestID)
+	require.Equal(t, http.StatusOK, secondRec.Code)
+	require.Equal(t, 1, captureDialer.DialCount())
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmFirst429ReturnsFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.failed","response":{"id":"resp_first_429","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          61,
+		Name:        "openai-prewarm-first-429",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	body := []byte(`{"model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)
+	_, err := svc.Forward(context.Background(), c, account, body)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
+	require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account), "one prewarm 429 must not activate the guard")
+	require.Equal(t, 1, captureDialer.DialCount())
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	connCount := len(ap.conns)
+	ap.mu.Unlock()
+	require.Equal(t, 0, connCount, "unconfirmed prewarm 429 must evict the failed connection")
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmFiveHundredReturnsFailover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.OAuthEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.failed","response":{"id":"resp_prewarm_502","status":"failed","error":{"status_code":502,"code":"server_error","message":"upstream unavailable"}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          62,
+		Name:        "openai-prewarm-502",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	// A confirmed 429 must not make a later transport/server failure sticky.
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	body := []byte(`{"model":"gpt-5.1","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)
+	_, err := svc.Forward(context.Background(), c, account, body)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+	require.Equal(t, 1, captureDialer.DialCount())
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	connCount := len(ap.conns)
+	ap.mu.Unlock()
+	require.Equal(t, 0, connCount, "prewarm 5xx must evict the unhealthy guarded connection")
 }
 
 func TestOpenAIGatewayService_PrewarmReadHonorsParentContext(t *testing.T) {
