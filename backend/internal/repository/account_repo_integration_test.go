@@ -839,6 +839,33 @@ func (s *AccountRepoSuite) TestBulkUpdate_SyncSchedulerSnapshotOnDisabled() {
 	s.Require().Contains(ids, account2.ID)
 }
 
+func (s *AccountRepoSuite) TestBulkUpdate_IdentityChangesSyncSchedulerSnapshot() {
+	oldProxy := mustCreateProxy(s.T(), s.client, &service.Proxy{Name: "bulk-old-proxy"})
+	newProxy := mustCreateProxy(s.T(), s.client, &service.Proxy{Name: "bulk-new-proxy", Port: 8081})
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:     "bulk-identity",
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		ProxyID:  &oldProxy.ID,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{"a": "old"},
+		},
+	})
+	recorder := &schedulerCacheRecorder{}
+	s.repo.schedulerCache = recorder
+
+	rows, err := s.repo.BulkUpdate(s.ctx, []int64{account.ID}, service.AccountBulkUpdate{
+		ProxyID:     &newProxy.ID,
+		Credentials: map[string]any{"model_mapping": map[string]any{"a": "new"}},
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), rows)
+	s.Require().Len(recorder.setAccounts, 1, "identity edits must refresh the full scheduler account immediately")
+	s.Require().NotNil(recorder.setAccounts[0].ProxyID)
+	s.Require().Equal(newProxy.ID, *recorder.setAccounts[0].ProxyID)
+	s.Require().Equal("new", recorder.setAccounts[0].Credentials["model_mapping"].(map[string]any)["a"])
+}
+
 // --- SetOverloaded / SetRateLimited / ClearRateLimit ---
 
 func (s *AccountRepoSuite) TestSetOverloaded() {

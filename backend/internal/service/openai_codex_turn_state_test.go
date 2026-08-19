@@ -38,6 +38,24 @@ func TestOpenAICodexTurnStateSeed(t *testing.T) {
 	cNoSession, _ := newTurnStateTestContext(t, 7, "")
 	require.Empty(t, openAICodexTurnStateSeed(cNoSession))
 
+	// A proxy can remove the session headers but leave the canonical official
+	// Codex metadata in the request body. Provenance must keep using that same
+	// session rather than treating the returned state as unbound.
+	stageOpenAICodexTurnStateSession(cNoSession, []byte(`{"client_metadata":{"session_id":"body-session"}}`))
+	require.Equal(t, "7\x00body-session", openAICodexTurnStateSeed(cNoSession))
+
+	// The direct CLI header remains authoritative when both projections exist.
+	c.Request.Header.Set("session-id", "header-session")
+	stageOpenAICodexTurnStateSession(c, []byte(`{"client_metadata":{"session_id":"other-body-session"}}`))
+	require.Equal(t, "7\x00header-session", openAICodexTurnStateSeed(c))
+
+	// Continuation frames need not repeat client_metadata. Keep the initial
+	// body session for the lifetime of this websocket request context.
+	c.Request.Header.Del("session-id")
+	c.Request.Header.Del("session_id")
+	stageOpenAICodexTurnStateSession(c, []byte(`{"type":"response.create"}`))
+	require.Equal(t, "7\x00header-session", openAICodexTurnStateSeed(c))
+
 	require.Empty(t, openAICodexTurnStateSeed(nil))
 }
 
@@ -215,6 +233,57 @@ func TestGuardOpenAICodexTurnStateEcho(t *testing.T) {
 	})
 }
 
+func TestScrubForeignOpenAICodexTurnStateFromBody(t *testing.T) {
+	t.Run("body_only_session_strips_foreign_state", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-codex","client_metadata":{"session_id":"sess-body-only","x-codex-turn-state":"blob-A"}}`)
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "")
+
+		// The successful first request stages the body session before its state
+		// is relayed to the client. A later request may have no session header.
+		_, changed := svc.scrubForeignOpenAICodexTurnStateFromBody(c, &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, body)
+		require.False(t, changed)
+		svc.relayOpenAICodexTurnState(c, &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, http.Header{"X-Codex-Turn-State": {"blob-A"}})
+
+		scrubbed, changed := svc.scrubForeignOpenAICodexTurnStateFromBody(c, &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, body)
+		require.True(t, changed)
+		require.JSONEq(t,
+			`{"model":"gpt-5.6-codex","client_metadata":{"session_id":"sess-body-only"}}`,
+			string(scrubbed),
+		)
+	})
+
+	t.Run("foreign_account_strips_canonical_body_state", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-codex","client_metadata":{"session_id":"sess-body","x-codex-turn-state":"blob-A","x-codex-turn-metadata":"{}"}}`)
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "sess-body")
+		svc.relayOpenAICodexTurnState(c, &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, http.Header{"X-Codex-Turn-State": {"blob-A"}})
+
+		scrubbed, changed := svc.scrubForeignOpenAICodexTurnStateFromBody(c, &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, body)
+		require.True(t, changed)
+		require.JSONEq(t,
+			`{"model":"gpt-5.6-codex","client_metadata":{"session_id":"sess-body","x-codex-turn-metadata":"{}"}}`,
+			string(scrubbed),
+		)
+	})
+
+	t.Run("same_account_and_unknown_state_stay_intact", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-codex","client_metadata":{"session_id":"sess-body","x-codex-turn-state":"blob-A","x-codex-turn-metadata":"{}"}}`)
+		svc := &OpenAIGatewayService{}
+		c, _ := newTurnStateTestContext(t, 7, "sess-body")
+		svc.relayOpenAICodexTurnState(c, &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, http.Header{"X-Codex-Turn-State": {"blob-A"}})
+
+		same, changed := svc.scrubForeignOpenAICodexTurnStateFromBody(c, &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, body)
+		require.False(t, changed, "same-account body state should remain")
+		require.Equal(t, body, same)
+
+		unknown := []byte(`{"client_metadata":{"session_id":"sess-body","x-codex-turn-state":"unknown"}}`)
+		unchanged, changed := svc.scrubForeignOpenAICodexTurnStateFromBody(c, &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeOAuth}, unknown)
+		require.False(t, changed, "unknown body state should remain")
+		require.Equal(t, unknown, unchanged)
+	})
+}
+
 func TestSweepOpenAICodexTurnStateOrigins_PrunesExpiredEntries(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	svc.openaiCodexTurnStateOrigins.Store("expired", openAICodexTurnStateOrigin{
@@ -285,12 +354,12 @@ func TestApplyOpenAICodexBetaFeatures(t *testing.T) {
 	oauthAccount := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	apiKeyAccount := &Account{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 
-	t.Run("oauth_plain_request_gets_default_codex_shape", func(t *testing.T) {
+	t.Run("oauth_plain_request_does_not_invent_beta_capabilities", func(t *testing.T) {
 		c, _ := newTurnStateTestContext(t, 7, "sess-beta")
 		h := http.Header{}
 		applyOpenAICodexBetaFeatures(c, oauthAccount, h)
-		require.Equal(t, "remote_compaction_v2", h.Get("x-codex-beta-features"),
-			"OAuth 的普通请求也必须带会话级 beta 头")
+		require.Empty(t, h.Get("x-codex-beta-features"),
+			"官方普通 Responses 请求没有启用该能力时不得凭空声明")
 	})
 
 	t.Run("client_declared_header_preserved", func(t *testing.T) {
@@ -368,8 +437,8 @@ func TestBuildOpenAIWSHeaders_CarriesSessionBetaFeatures(t *testing.T) {
 	}
 
 	headers := build(t, oauthAccount, "")
-	require.Equal(t, "remote_compaction_v2", headers.Get("x-codex-beta-features"),
-		"WS 握手也必须带会话级 beta 头")
+	require.Empty(t, headers.Get("x-codex-beta-features"),
+		"没有客户端声明时不得凭空补 beta 能力")
 
 	declared := build(t, oauthAccount, "some_other_feature")
 	require.Equal(t, []string{"some_other_feature"}, declared.Values("x-codex-beta-features"),

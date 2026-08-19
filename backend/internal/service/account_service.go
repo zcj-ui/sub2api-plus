@@ -189,17 +189,20 @@ type CreateAccountRequest struct {
 
 // UpdateAccountRequest 更新账号请求
 type UpdateAccountRequest struct {
-	Name               *string         `json:"name"`
-	Notes              *string         `json:"notes"`
-	Credentials        *map[string]any `json:"credentials"`
-	Extra              *map[string]any `json:"extra"`
-	ProxyID            *int64          `json:"proxy_id"`
-	Concurrency        *int            `json:"concurrency"`
-	Priority           *int            `json:"priority"`
-	Status             *string         `json:"status"`
-	GroupIDs           *[]int64        `json:"group_ids"`
-	ExpiresAt          *time.Time      `json:"expires_at"`
-	AutoPauseOnExpired *bool           `json:"auto_pause_on_expired"`
+	Name        *string         `json:"name"`
+	Notes       *string         `json:"notes"`
+	Credentials *map[string]any `json:"credentials"`
+	Extra       *map[string]any `json:"extra"`
+	// Set only when the fingerprint mode selector was deliberately changed.
+	// A full extra snapshot may include the current mode during unrelated edits.
+	CodexFingerprintModeTouched *bool      `json:"codex_fingerprint_mode_touched"`
+	ProxyID                     *int64     `json:"proxy_id"`
+	Concurrency                 *int       `json:"concurrency"`
+	Priority                    *int       `json:"priority"`
+	Status                      *string    `json:"status"`
+	GroupIDs                    *[]int64   `json:"group_ids"`
+	ExpiresAt                   *time.Time `json:"expires_at"`
+	AutoPauseOnExpired          *bool      `json:"auto_pause_on_expired"`
 }
 
 // AccountService 账号管理服务
@@ -239,15 +242,13 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 		Platform:    req.Platform,
 		Type:        req.Type,
 		Credentials: SanitizeStoredCredentials(req.Platform, req.Credentials),
-		Extra:       req.Extra,
+		Extra:       NormalizeCodexFingerprintExtraForAccount(req.Platform, req.Type, req.Extra),
 		ProxyID:     req.ProxyID,
 		Concurrency: req.Concurrency,
 		Priority:    req.Priority,
 		Status:      StatusActive,
 		ExpiresAt:   req.ExpiresAt,
 	}
-	account.Extra = normalizeCodexFingerprintModeForStorage(account.Extra)
-	account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
 	if req.AutoPauseOnExpired != nil {
 		account.AutoPauseOnExpired = *req.AutoPauseOnExpired
 	} else {
@@ -336,6 +337,12 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		account.Credentials = SanitizeStoredCredentials(account.Platform, *req.Credentials)
 	}
 
+	explicitCodexFingerprintModeEdit := req.CodexFingerprintModeTouched != nil && *req.CodexFingerprintModeTouched
+	if !explicitCodexFingerprintModeEdit && req.CodexFingerprintModeTouched == nil && req.Extra != nil {
+		if value, present := (*req.Extra)[codexFingerprintModeExtraKey]; present && value == nil {
+			explicitCodexFingerprintModeEdit = true
+		}
+	}
 	if req.Extra != nil {
 		if err := ValidateCodexFingerprintExtra(account.Platform, account.Type, *req.Extra); err != nil {
 			return nil, err
@@ -347,23 +354,12 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		delete(extra, OllamaCloudUsageSessionExtraKey)
 		delete(extra, OllamaCloudUsageAutoRefreshExtraKey)
 		delete(extra, OllamaCloudUsageSnapshotExtraKey)
-		// The Codex seed is system-owned. Preserve the existing seed for a
-		// normal edit, and never accept a caller-supplied replacement here.
-		delete(extra, codexFingerprintSeedExtraKey)
-		extra = normalizeCodexFingerprintModeForStorage(extra)
-		if !account.IsCredentialShadow() {
-			if seed := account.getCodexFingerprintSeed(); seed != "" {
-				extra[codexFingerprintSeedExtraKey] = seed
-			}
-			extra = ensureCodexFingerprintSeed(account.Platform, account.Type, extra)
+		account.Extra = NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
+		if explicitCodexFingerprintModeEdit {
+			account.Extra = AcknowledgeCodexFingerprintModeEdit(account.Extra)
 		}
-		account.Extra = extra
-	}
-	// Keep legacy rows converged even when the update did not include Extra.
-	// This also prevents a full account edit from silently dropping the seed.
-	account.Extra = normalizeCodexFingerprintModeForStorage(account.Extra)
-	if !account.IsCredentialShadow() {
-		account.Extra = ensureCodexFingerprintSeed(account.Platform, account.Type, account.Extra)
+	} else {
+		account.Extra = NormalizeCodexFingerprintExtraForExistingAccount(account, account.Extra)
 	}
 
 	if req.ProxyID != nil {

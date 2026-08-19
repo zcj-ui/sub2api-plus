@@ -715,11 +715,14 @@ export default {
         codexCLIOnlyAppServer: '允许 Codex app-server 客户端',
         codexCLIOnlyAppServerDesc: '仅在上方开关开启时生效。开启后本账号额外放行内嵌 Codex 引擎、经 app-server 协议接入的第三方客户端（如 Claude Code 的 codex 插件），仍需通过全局引擎指纹门；与全局 app-server 开关取 OR（任一开即放行）。',
         codexFingerprintMode: 'Codex 指纹收敛',
-        codexFingerprintModeDesc: '默认关闭并原样透传客户端标识。开启“仅设备”后，仅为 OpenAI/Codex OAuth 账号稳定设备指纹；会话和线程仍按官方 Codex CLI 的每个会话生命周期透传。旧的 session/full 值仅为兼容历史数据，读取时会迁移为“仅设备”。',
+        codexFingerprintModeDesc:
+          '仅对 OpenAI OAuth 账号生效的官方 Codex 标识收敛。关闭时原样透传入站标识；仅设备稳定 installation 指纹；设备+会话同时稳定账号会话；完全收敛进一步统一 thread 和 turn 标识。',
         codexFingerprintOff: '关闭（透传，默认）',
         codexFingerprintDevice: '仅设备',
-        codexFingerprintSession: '旧值：会话收敛（自动迁移）',
-        codexFingerprintFull: '旧值：完全收敛（自动迁移）',
+        codexFingerprintSession: '设备+会话',
+        codexFingerprintFull: '完全收敛',
+        codexFingerprintRecoveryRequired:
+          '此账号可能受旧版迁移影响，历史指纹档位无法确定。请明确选择目标档位后再保存。',
         codexImageTool: 'Codex 图片桥接策略',
         codexImageToolDesc:
           '统一控制 Codex /responses 文本请求的 hosted image_generation 桥接和客户端图片工具声明。hosted 工具自动注入仅适用于非 Responses Lite 请求；账号级策略优先于渠道和全局配置，不影响独立图片生成接口。',

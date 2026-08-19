@@ -375,9 +375,6 @@ type CreateAccountInput struct {
 	ProbeEnabled       *bool
 	// SkipDefaultGroupBind prevents auto-binding to platform default group when GroupIDs is empty.
 	SkipDefaultGroupBind bool
-	// PreserveCodexFingerprintSeed is reserved for trusted backup/data restore
-	// flows. Ordinary creates and duplicates always receive a fresh seed.
-	PreserveCodexFingerprintSeed bool
 	// SkipMixedChannelCheck skips the mixed channel risk check when binding groups.
 	// This should only be set when the caller has explicitly confirmed the risk.
 	SkipMixedChannelCheck bool
@@ -396,24 +393,26 @@ type ShadowOptions struct {
 }
 
 type UpdateAccountInput struct {
-	Name                  string
-	Notes                 *string
-	Type                  string // Account type: oauth, setup-token, apikey
-	Credentials           map[string]any
-	Extra                 map[string]any
-	ProxyID               *int64
-	Concurrency           *int     // 使用指针区分"未提供"和"设置为0"
-	Priority              *int     // 使用指针区分"未提供"和"设置为0"
-	RateMultiplier        *float64 // 账号计费倍率（>=0，允许 0）
-	LoadFactor            *int
-	Status                string
-	GroupIDs              *[]int64
-	ExpiresAt             *int64
-	AutoPauseOnExpired    *bool
-	ProbeEnabled          *bool
-	RateSyncEnabled       *bool
-	SkipMixedChannelCheck bool // 跳过混合渠道检查（用户已确认风险）
-	ConfirmOveragesRisk   bool // 已明确确认开启付费 AI Credits 超额风险
+	Name        string
+	Notes       *string
+	Type        string // Account type: oauth, setup-token, apikey
+	Credentials map[string]any
+	Extra       map[string]any
+	// Set only when the fingerprint mode selector was deliberately changed.
+	CodexFingerprintModeTouched *bool
+	ProxyID                     *int64
+	Concurrency                 *int     // 使用指针区分"未提供"和"设置为0"
+	Priority                    *int     // 使用指针区分"未提供"和"设置为0"
+	RateMultiplier              *float64 // 账号计费倍率（>=0，允许 0）
+	LoadFactor                  *int
+	Status                      string
+	GroupIDs                    *[]int64
+	ExpiresAt                   *int64
+	AutoPauseOnExpired          *bool
+	ProbeEnabled                *bool
+	RateSyncEnabled             *bool
+	SkipMixedChannelCheck       bool // 跳过混合渠道检查（用户已确认风险）
+	ConfirmOveragesRisk         bool // 已明确确认开启付费 AI Credits 超额风险
 }
 
 // BulkUpdateAccountsInput describes the payload for bulk updating accounts.

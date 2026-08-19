@@ -643,11 +643,14 @@ export default {
         codexCLIOnlyAppServerDesc:
           "Effective only when the switch above is on. When enabled, this account also allows third-party clients that embed the Codex engine over the app-server protocol (e.g. Claude Code's codex plugin); they still pass the global engine-fingerprint gate. OR-combined with the global app-server toggle.",
         codexFingerprintMode: 'Codex fingerprint convergence',
-        codexFingerprintModeDesc: 'Off by default and passes client identifiers through unchanged. “Device only” stabilizes the device fingerprint for OpenAI/Codex OAuth accounts while session and thread IDs retain the official Codex CLI per-session lifecycle. Legacy session/full values are accepted only for compatibility and are migrated to “Device only” when read.',
+        codexFingerprintModeDesc:
+          'Opt-in convergence of the official Codex client identifiers for OpenAI OAuth accounts. Off passes inbound identifiers through unchanged; Device stabilizes the installation identity; Session also stabilizes the account session; Full additionally converges thread and turn identifiers.',
         codexFingerprintOff: 'Off (passthrough, default)',
         codexFingerprintDevice: 'Device only',
-        codexFingerprintSession: 'Legacy: session convergence (migrated)',
-        codexFingerprintFull: 'Legacy: full convergence (migrated)',
+        codexFingerprintSession: 'Device + Session',
+        codexFingerprintFull: 'Full convergence',
+        codexFingerprintRecoveryRequired:
+          'This account was affected by an older migration that may have collapsed its previous fingerprint mode. Select the intended mode explicitly before saving.',
         codexImageTool: 'Codex image bridge policy',
         codexImageToolDesc:
           'Controls the hosted image_generation bridge and client-declared image tools on Codex /responses text requests. Hosted auto-injection applies only to non-Responses Lite requests. Account policy takes precedence over channel and global settings; standalone image-generation endpoints are unaffected.',

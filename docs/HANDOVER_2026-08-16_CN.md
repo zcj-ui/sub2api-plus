@@ -47,10 +47,10 @@
 - UI 开关统一显示为“奸商模式”，覆盖创建/编辑/批量编辑/数据导入；后端校验仅 OpenAI OAuth 可写。
 
 ### 3.4 Codex 指纹（会话身份模拟）
-- 模式 `off/device/session/full`，**默认 off（显式 opt-in）**——对齐上游 #5668/#5610 结论：默认收敛曾导致额度缩水与风控。
-- session 模式：一账号一稳定设备（`openai_device_id` 或派生）+ 每对话稳定 session/thread + 每请求新 turn；header、body `client_metadata`、原始 JSON 透传三载体共用同一套 ID；failover 清除上一账号暂存身份。
-- 会话种子：header `session-id` → `client_metadata.session_id/thread_id` → `prompt_cache_key` → 内容锚，全部按 API Key 隔离。
-- 未派生 `prompt_cache_key`/`conversation_id`（刻意保守，cockpit 式增强可后续做）。
+- 账户级 `off/device/session/full` 四态均保留，默认 `off`；只有管理员显式选择 `device`、`session` 或 `full` 才启用收敛，历史数据库中的大小写/空白值会被规范化。全局 Codex UA/版本设置仍可用于构造自洽的 canonical 出站身份。
+- `device` 只稳定 `installation_id`；`session` 额外稳定 session 并按客户端会话派生 thread；`full` 再把 session/thread/turn/window 收敛到账号生命周期。请求头、正文 `client_metadata`、原始 JSON 透传和 WS 共用同一份账号归属快照。
+- 未启用收敛时，完整官方 Codex CLI 的 installation/session/thread/window/turn 生命周期按客户端原样保留；正文 `client_metadata` 是权威载体，兼容 header 只做官方缺失投影，不凭空生成第二套身份。
+- 普通 Responses、Responses Lite 和 WS 首帧使用上述语义；历史 `responses/compact` 与 `count_tokens` 不生成收敛身份投影，保持各自官方协议。跨账号 failover 会清除上一账号的快照和已确认属于旧账号的 turn state，避免身份泄漏。非官方或不完整请求仍走租户隔离兼容路径。
 
 ### 3.5 代理强制（用户硬性要求）
 - 账户设置了 `proxy_id`：所有出站（请求转发、WS、额度、测活、盘点、OAuth 刷新、能力探测）固定走该代理；代理关系缺失/ID 错配/URL 无效 → **失败关闭，绝不静默直连**。
@@ -121,7 +121,7 @@
 
 ## 7. 重要设计决策（勿轻易反转）
 
-1. **指纹收敛默认 off**：上游 #5610/#5668 实测默认收敛引发额度缩水；用户在官方仓验证 opt-in 后额度恢复。需要时按账号显式开。
+1. **账户级指纹收敛默认关闭**：上游 #5610/#5668 说明默认静默收敛可能引发额度缩水；当前仅在管理员明确 opt-in 时生成/使用账号种子，未配置账号保持官方客户端身份原样透传。
 2. **粘性逃逸默认关 + 并发满等待**：会话拆号的直接根因；TTFT 抖动是高并发常态不是故障信号。
 3. **代理语义**：设了代理→强制并 fail-closed；没设→直连。不是"所有 OpenAI 都必须绑代理"。
 4. **两次 429 才冻结**：首次 429 是上游常态反馈，立即冻结会误杀；积分只绕过本地阈值，不绕过真实 429。

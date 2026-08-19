@@ -172,6 +172,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 import type { Account } from '@/types'
 import { formatCountdown, formatDateTime, formatDateTimeToMinute, formatCountdownWithSuffix, formatTime } from '@/utils/format'
+import { normalizeAccountStatusTranslationKey } from '@/utils/accountStatus'
 
 const { t } = useI18n()
 
@@ -358,13 +359,9 @@ const statusClass = computed(() => {
 
 // 已知后端账号状态；其余（含缺失/未知）统一显示 unknown，避免渲染出原始 i18n 键名。
 // active/inactive 由面板写入；disabled/expired 为 domain 常量与历史数据；error 由 SetError 写入。
-const knownAccountStatuses = new Set(['active', 'inactive', 'disabled', 'error', 'expired'])
-
 // Computed: status text
 const resolveStatusTextByKey = (status: string) => {
-  return knownAccountStatuses.has(status)
-    ? t(`admin.accounts.status.${status}`)
-    : t('admin.accounts.status.unknown')
+  return t(`admin.accounts.status.${normalizeAccountStatusTranslationKey(status)}`)
 }
 
 const statusText = computed(() => {

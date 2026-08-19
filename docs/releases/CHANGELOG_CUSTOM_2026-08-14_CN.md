@@ -10,6 +10,8 @@
 
 - 修复正式 CI 在 `golangci-lint v2.9` 下发现的未使用函数、无效赋值、未检查类型断言和静态检查问题，保持 WebSocket 429 守护、会话租约和错误切换语义不变。
 - 清理不再使用的状态容量兼容 helper，并为状态存储测试补齐类型断言检查，避免测试 panic 被误判为运行时成功。
+- 恢复账户级 Codex 指纹四态生命周期：`off` 默认透传，`device/session/full` 仅在显式 opt-in 时生效，并在导入、编辑、批量编辑和调度快照中保持 seed 与账号归属一致。
+- 修复完整官方 CLI 请求在正文规范化、HTTP/WS 重试和 `count_tokens` 路径中被误判为兼容请求的问题；探针、额度和独立搜索改用动态 canonical 身份，避免旧版本 UA 漂移。
 - 重新验证 OpenAI WebSocket ingress/v2、HTTP bridge、额度/调度状态存储和安全审计路径；本地 Go 测试与同版本 golangci-lint 均通过。
 
 验证结果：`internal/service`、`internal/securityaudit` 测试通过，`golangci-lint v2.9` 全仓 `0 issues`，`gofmt` 与 `git diff --check` 通过。`v0.2.3` 标签曾因 CI 外部 schema 超时及随后暴露的 lint 问题未生成 Release；本版本使用新标签发布，不重写历史标签。

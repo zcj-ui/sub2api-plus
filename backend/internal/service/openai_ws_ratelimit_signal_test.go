@@ -101,9 +101,10 @@ func TestOpenAIGatewayService_Forward_WSv2ErrorEventUsageLimitPersistsRateLimit(
 			t.Errorf("read ws request failed: %v", err)
 			return
 		}
-		_ = conn.WriteJSON(map[string]any{
-			"type": "error",
-			"error": map[string]any{
+			_ = conn.WriteJSON(map[string]any{
+				"type": "error",
+				"status_code": http.StatusTooManyRequests,
+				"error": map[string]any{
 				"code":      "rate_limit_exceeded",
 				"type":      "usage_limit_reached",
 				"message":   "The usage limit has been reached",
@@ -522,7 +523,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ErrorEventUsageL
 	resetAt := time.Now().Add(90 * time.Minute).Unix()
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"error","error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":PLACEHOLDER}}`),
+			[]byte(`{"type":"error","status_code":429,"error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":PLACEHOLDER}}`),
 		},
 	}
 	captureConn.events[0] = []byte(strings.ReplaceAll(string(captureConn.events[0]), "PLACEHOLDER", strconv.FormatInt(resetAt, 10)))
@@ -807,8 +808,27 @@ func TestPersistOpenAIWSRateLimitSignalWithoutRateLimitServiceConfirmsOAuth429(t
 	svc := &OpenAIGatewayService{}
 
 	for range 2 {
-		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, nil, "rate_limit_exceeded", "", "quota reached")
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, []byte(`{"status":429}`), "rate_limit_exceeded", "", "quota reached")
 	}
 
 	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
+
+func TestPersistOpenAIWSRateLimitSignalIgnoresSemanticCodeWithoutExplicit429(t *testing.T) {
+	account := &Account{ID: 9912, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{}
+
+	for range 3 {
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, nil, "rate_limit_exceeded", "rate_limit_error", "quota reached")
+	}
+
+	require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
+
+func TestIsOpenAIWSExplicit429SignalRequiresStatusEvidence(t *testing.T) {
+	require.True(t, isOpenAIWSExplicit429Signal(http.StatusTooManyRequests, "usage_limit_reached", "", "", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "", "", "last status: 429 Too Many Requests", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "", []byte(`{"error":{"status":429}}`)))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "usage_limit_reached", "", "quota reached", nil))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "retry attempt 429 exhausted", nil))
 }

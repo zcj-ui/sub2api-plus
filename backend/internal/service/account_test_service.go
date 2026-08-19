@@ -745,16 +745,8 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		req.Host = "chatgpt.com"
 		req.Header.Set("accept", "text/event-stream")
 		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		req.Header.Set("Originator", openai.CodexDefaultOriginator)
-		if customUA := strings.TrimSpace(credentialAccount.GetOpenAIUserAgent()); customUA != "" {
-			req.Header.Set("User-Agent", customUA)
-		} else {
-			req.Header.Set("User-Agent", codexCLIUserAgent)
-		}
+		applyOpenAICodexProbeHeaders(req.Header)
 		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-		// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入，否则测试用的身份
-		// 与该账号真实出站的身份不是同一个（issue #3901 的配对不变式由收口保证）。
-		enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
 	}
 
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
@@ -2073,9 +2065,6 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 			codexFingerprintDeploymentSeed(s.cfg),
 		)
 		if fingerprintIDs != nil {
-			// Native remote compaction v2 is a regular Responses request. Give
-			// enabled OAuth probes the same client_metadata carrier as a real
-			// Codex request, then project the shared installation snapshot into it.
 			probePayload["client_metadata"] = map[string]any{"session_id": probeSessionID}
 			_ = applyCodexFingerprintClientMetadata(probePayload, fingerprintIDs)
 		}
@@ -2121,9 +2110,6 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 	if isOAuth {
 		req.Host = "chatgpt.com"
 		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-		// 指纹收敛：探测与真实转发走同一个 /responses 端点，身份也必须同构，
-		// 否则探测流量会以「缺 x-codex-installation-id + 非收敛 session」的
-		// 形态暴露在上游眼里。账号关闭收敛（off）时返回 nil，探测保持原样。
 		if fingerprintIDs == nil {
 			fingerprintIDs = resolveCodexFingerprintIDsFromRequest(credentialAccount, req.Header, codexFingerprintDeploymentSeed(s.cfg))
 		}
@@ -3046,16 +3032,8 @@ func (s *AccountTestService) testOpenAIImageOAuth(c *gin.Context, ctx context.Co
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	req.Header.Set("originator", openai.CodexDefaultOriginator)
-	if customUA := strings.TrimSpace(credentialAccount.GetOpenAIUserAgent()); customUA != "" {
-		req.Header.Set("User-Agent", customUA)
-	} else {
-		req.Header.Set("User-Agent", codexCLIUserAgent)
-	}
+	applyOpenAICodexProbeHeaders(req.Header)
 	setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-	// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入，否则测试用的身份
-	// 与该账号真实出站的身份不是同一个（issue #3901 的配对不变式由收口保证）。
-	enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
 
 	proxyURL, proxyErr := accountTestProxyURL(account)
 	if proxyErr != nil {

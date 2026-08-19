@@ -2065,9 +2065,21 @@
             </p>
           </div>
           <div class="w-52 flex-shrink-0">
-            <Select v-model="codexFingerprintMode" data-testid="edit-codex-fingerprint-mode-select" :options="codexFingerprintModeOptions" />
+            <Select
+              v-model="codexFingerprintMode"
+              data-testid="edit-codex-fingerprint-mode-select"
+              :options="codexFingerprintModeOptions"
+              @update:model-value="codexFingerprintModeTouched = true"
+            />
           </div>
         </div>
+        <p
+          v-if="account?.extra?.codex_fingerprint_recovery_required === true"
+          data-testid="edit-codex-fingerprint-recovery-warning"
+          class="mt-3 rounded-md bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
+        >
+          {{ t('admin.accounts.openai.codexFingerprintRecoveryRequired') }}
+        </p>
       </div>
 
       <!-- 奸商模式（仅 OpenAI OAuth） -->
@@ -3148,11 +3160,9 @@ const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
-// Session/full were legacy stateless modes. The gateway now exposes only the
-// protocol-compatible device projection; old persisted values are normalized
-// to device when this form loads.
-type CodexFingerprintMode = 'off' | 'device'
+type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+const codexFingerprintModeTouched = ref(false)
 const codex429GuardEnabled = ref(false)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
@@ -3187,9 +3197,10 @@ const editWeeklyResetHour = ref<number | null>(null)
 const editResetTimezone = ref<string | null>(null)
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
-  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') }
+  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
+  { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
+  { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
-
 const openAIWSModeOptions = computed(() => [
   { value: OPENAI_WS_MODE_OFF, label: t('admin.accounts.openai.wsModeOff') },
   { value: OPENAI_WS_MODE_CTX_POOL, label: t('admin.accounts.openai.wsModeCtxPool') },
@@ -3626,6 +3637,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  codexFingerprintModeTouched.value = false
   codex429GuardEnabled.value = false
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
@@ -3680,10 +3692,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
     if (newAccount.type === 'oauth') {
       const fpMode = extra?.codex_fingerprint_mode as string | undefined
-      // Legacy session/full values are migrated to the supported device mode.
-      codexFingerprintMode.value = fpMode === 'device' || fpMode === 'session' || fpMode === 'full'
-        ? 'device'
-        : 'off'
+      const normalizedFPMode = fpMode?.trim().toLowerCase()
+      codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(normalizedFPMode || '')
+        ? normalizedFPMode as CodexFingerprintMode
+        : 'off')
       codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled === true
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
@@ -5059,16 +5071,26 @@ const handleSubmit = async () => {
         }
       }
 
-      // 指纹收敛模式：默认 off（不写入）；仅 device 是受支持的显式 opt-in。
       if (props.account.type === 'oauth' && !isSparkShadow.value) {
-        if (codexFingerprintMode.value !== 'off') {
+        // Keep the historical recovery marker until the administrator has
+        // actually touched this selector. Explicit off is represented by null
+        // so the backend can distinguish it from an unrelated full-form save.
+        if (!codexFingerprintModeTouched.value) {
+          // Preserve the current account override exactly as loaded.
+        } else if (codexFingerprintMode.value !== 'off') {
           newExtra.codex_fingerprint_mode = codexFingerprintMode.value
         } else {
-          delete newExtra.codex_fingerprint_mode
+          newExtra.codex_fingerprint_mode = null
+        }
+        if (codexFingerprintModeTouched.value) {
+          updatePayload.codex_fingerprint_mode_touched = true
         }
         newExtra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
       } else {
         delete newExtra.codex_fingerprint_mode
+        delete newExtra.codex_fingerprint_seed
+        delete newExtra.openai_device_id
+        delete newExtra.openai_session_id
         delete newExtra.openai_codex_429_guard_enabled
       }
 

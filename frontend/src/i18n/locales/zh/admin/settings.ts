@@ -497,12 +497,15 @@ export default {
         antigravityUserAgentVersionHint: '留空时使用 ANTIGRAVITY_USER_AGENT_VERSION 或内置默认值 1.23.2；填写后后台设置优先。',
         openaiCodexUserAgent: 'OpenAI Codex UA',
         openaiCodexUserAgentPlaceholder: 'codex-tui/0.146.1 (Ubuntu 22.4.0; x86_64) WindowsTerminal (codex-tui; 0.146.1)',
-        openaiCodexUserAgentHint: '出站统一使用的完整 Codex User-Agent，用于自定义 OS / 架构 / 终端指纹。留空则按下方版本号拼出标准 codex-tui 形态（推荐）。填写后首段和尾部的版本号仍会被下方版本号同步覆盖，避免这条 UA 停在填写时的旧版本——上游在容量紧张时按客户端身份分优先级降载，陈旧或非官方形态的身份会被优先丢弃并回 server_is_overloaded。',
+        openaiCodexUserAgentHint:
+          '出站使用的 canonical Codex User-Agent 形态。留空则按下方版本号拼出标准 codex-tui 身份；客户端名、系统、架构和终端形态会保留，版本段会与生效版本同步。',
         openaiCodexClientVersion: 'Codex 客户端版本号',
         openaiCodexClientVersionPlaceholder: '留空则跟随自动同步',
-        openaiCodexClientVersionHint: '网关对上游声明的 Codex 客户端版本号，User-Agent 与 version 头同源使用。留空表示使用自动同步到的官方最新稳定版；填写后固定为该版本，不再跟随同步。',
+        openaiCodexClientVersionHint:
+          '网关向上游声明的 Codex 客户端版本号，User-Agent 与 version 头同源使用。留空则跟随自动同步到的最新稳定版；填写后固定为该版本。',
         openaiCodexVersionAutoSync: '自动同步 Codex 版本号',
-        openaiCodexVersionAutoSyncHint: '每 6 小时从官方仓库获取最新稳定版客户端版本号，无需为了跟版本而升级本服务。关闭后仅使用上方手填版本或内置版本。',
+        openaiCodexVersionAutoSyncHint:
+          '每 6 小时从官方仓库获取最新稳定版客户端版本号。需要固定版本时关闭此项并填写上方版本号。',
         openaiCodexVersionSyncedValue: '当前同步到：{version}',
         codexHardeningTitle: 'Codex 设置',
         codexClientRestrictionTitle: 'Codex 客户端限制',

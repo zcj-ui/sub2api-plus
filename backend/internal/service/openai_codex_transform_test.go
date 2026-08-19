@@ -85,6 +85,24 @@ func TestAppendCodexSyntheticAgentContextPair_UsesRandomIDsAndIsIdempotent(t *te
 	require.Len(t, requireCodexTestSlice(t, first["input"]), 3)
 }
 
+func TestSyntheticAgentContextPairRecognizesNormalizedFCID(t *testing.T) {
+	callID := "fc_sub2api_overdraft_normalized"
+	call := map[string]any{
+		"type": "custom_tool_call", "call_id": callID,
+		"name": codexSyntheticAgentContextToolName, "input": codexSyntheticAgentContextInput,
+	}
+	output := map[string]any{
+		"type": "custom_tool_call_output", "call_id": callID,
+		"output": []map[string]string{{"type": "input_text", "text": codexSyntheticAgentContextOutputText}},
+	}
+	require.True(t, isCodexSyntheticAgentContextCall(call))
+	require.True(t, isCodexSyntheticAgentContextOutput(output))
+	require.True(t, isCodexSyntheticAgentContextCallID(callID))
+	require.False(t, appendCodexSyntheticAgentContextPair(map[string]any{
+		"input": []any{map[string]any{"type": "message", "role": "user"}, call, output},
+	}))
+}
+
 func TestAppendCodexSyntheticAgentContextPair_DoesNotReinjectEarlierHistoryPair(t *testing.T) {
 	reqBody := map[string]any{
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "first"}},
@@ -110,8 +128,9 @@ func TestAppendCodexSyntheticAgentContextPairToBodyMatchesReferenceGuards(t *tes
 	assistantTail := []byte(`{"input":[{"type":"message","role":"assistant","content":"answer"}]}`)
 	unchanged, changed, err := appendCodexSyntheticAgentContextPairToBody(assistantTail)
 	require.NoError(t, err)
-	require.False(t, changed)
-	require.Equal(t, string(assistantTail), string(unchanged))
+	require.True(t, changed)
+	require.NotEqual(t, string(assistantTail), string(unchanged))
+	require.Contains(t, string(unchanged), `"type":"custom_tool_call"`)
 
 	invalid := []byte(`{"input":[}`)
 	unchanged, changed, err = appendCodexSyntheticAgentContextPairToBody(invalid)
@@ -217,7 +236,7 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSupportsStringAndObje
 	}
 }
 
-func TestApplyCodexOAuthTransform_SyntheticAgentContextPairRequiresUserTail(t *testing.T) {
+func TestApplyCodexOAuthTransform_SyntheticAgentContextPairAllowsOrdinaryMessageTails(t *testing.T) {
 	reqBody := map[string]any{
 		"model": "gpt-5.4",
 		"input": []any{
@@ -227,7 +246,10 @@ func TestApplyCodexOAuthTransform_SyntheticAgentContextPairRequiresUserTail(t *t
 	}
 
 	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
-	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 2)
+	items := requireCodexTestSlice(t, reqBody["input"])
+	require.Len(t, items, 4)
+	require.Equal(t, "custom_tool_call", requireCodexTestMap(t, items[2])["type"])
+	require.Equal(t, "custom_tool_call_output", requireCodexTestMap(t, items[3])["type"])
 }
 
 func TestApplyCodexOAuthTransform_SyntheticAgentContextPairSkipsClaudeCodeBridge(t *testing.T) {

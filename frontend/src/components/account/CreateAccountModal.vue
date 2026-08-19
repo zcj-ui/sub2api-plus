@@ -4125,14 +4125,14 @@ const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
-// The gateway can faithfully project only installation/device convergence.
-// Keep the persisted setting opt-in and avoid offering legacy stateless modes.
-type CodexFingerprintMode = 'off' | 'device'
+type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codex429GuardEnabled = ref(false)
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
-  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') }
+  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
+  { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
+  { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
 const anthropicPassthroughEnabled = ref(false)
@@ -5159,12 +5159,15 @@ const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknow
   } else {
     delete extra.codex_cli_only_allow_app_server
   }
-  // The selector is OAuth-only. Do not leak a previously selected device mode
-  // into an API-key/setup-token payload after the creation type changes.
+  // Fingerprint convergence is opt-in. Keep off implicit, and persist all
+  // explicit modes so the backend can project the selected lifecycle.
   if (form.type === 'oauth' && codexFingerprintMode.value !== 'off') {
     extra.codex_fingerprint_mode = codexFingerprintMode.value
   } else {
     delete extra.codex_fingerprint_mode
+    delete extra.codex_fingerprint_seed
+    delete extra.openai_device_id
+    delete extra.openai_session_id
   }
   if (form.type === 'oauth') {
     extra.openai_codex_429_guard_enabled = codex429GuardEnabled.value

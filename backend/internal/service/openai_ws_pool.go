@@ -66,6 +66,11 @@ type openAIWSAcquireRequest struct {
 	Account *Account
 	WSURL   string
 	Headers http.Header
+	// IdentityCompatibility is populated for genuine Codex CLI requests. It
+	// keeps installation/session/thread continuation state isolated inside the
+	// account's pooled sockets while remaining empty for generic compatibility
+	// traffic (which retains the historical beta-only compatibility key).
+	IdentityCompatibility string
 	// HeadersFactory is evaluated inside dialConn. It exists so credentials
 	// whose authorization is per-dial (Agent Identity) are never cached in
 	// lastAcquire or delayed prewarm state.
@@ -80,6 +85,7 @@ type openAIWSAcquireRequest struct {
 
 type openAIWSHandshakeCompatibilityKey struct {
 	betaFeatures string
+	identity     string
 }
 
 type openAIWSConnLease struct {
@@ -574,6 +580,14 @@ func (c *openAIWSConn) matchesHandshakeCompatibility(compatibility openAIWSHands
 	return c != nil && c.handshakeCompatibility == compatibility
 }
 
+// matchesHandshakeIdentity keeps genuine Codex CLI sessions isolated even
+// when a permanent 429 guard deliberately reuses a socket across a later beta
+// feature-set change. The upstream connection carries continuation state, so
+// an installation/session/thread mismatch is never safe to relax.
+func (c *openAIWSConn) matchesHandshakeIdentity(compatibility openAIWSHandshakeCompatibilityKey) bool {
+	return c != nil && c.handshakeCompatibility.identity == compatibility.identity
+}
+
 func (c *openAIWSConn) matchesProxyURL(proxyURL string) bool {
 	if c == nil {
 		return false
@@ -937,7 +951,7 @@ func (p *openAIWSConnPool) acquire(ctx context.Context, req openAIWSAcquireReque
 
 retryAcquire:
 	accountID := req.Account.ID
-	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Headers)
+	compatibility := normalizeOpenAIWSHandshakeCompatibilityForRequest(req)
 	routingAffinity := normalizeOpenAIWSRoutingAffinity(req.Headers)
 	effectiveMaxConns := p.effectiveMaxConnsByAccount(req.Account)
 	if effectiveMaxConns <= 0 {
@@ -966,7 +980,18 @@ retryAcquire:
 				return nil, errOpenAIWSPreferredConnUnavailable
 			}
 			preferredConn, ok := ap.conns[preferredConnID]
-			if !ok || !preferredConn.matchesHandshakeCompatibility(compatibility) || !preferredConn.matchesProxyURL(req.ProxyURL) || !preferredConn.matchesWSURL(req.WSURL) {
+			guardPinned := ok && p.isPermanentGuardConnLocked(ap, preferredConnID)
+			// A confirmed 429 guard keeps one already-negotiated socket alive.
+			// Its handshake capability snapshot belongs to that socket, so a later
+			// turn must not lose the exact continuation merely because the current
+			// client no longer advertises an optional beta feature. Proxy and target
+			// URL remain strict: the retained connection can never bypass the
+			// account's configured network route or endpoint boundary.
+			if !ok ||
+				!preferredConn.matchesHandshakeIdentity(compatibility) ||
+				(!guardPinned && !preferredConn.matchesHandshakeCompatibility(compatibility)) ||
+				!preferredConn.matchesProxyURL(req.ProxyURL) ||
+				!preferredConn.matchesWSURL(req.WSURL) {
 				p.recordConnPickDuration(time.Since(pickStartedAt))
 				ap.mu.Unlock()
 				closeOpenAIWSConns(evicted)
@@ -2454,7 +2479,7 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	id := p.nextConnID(req.Account.ID)
 	pooledConn := newOpenAIWSConn(id, req.Account.ID, conn, handshakeHeaders)
 	pooledConn.onClose = p.notifyGuardBindingInvalidated
-	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Headers)
+	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibilityForRequest(req)
 	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)
 	pooledConn.proxyURL = normalizeOpenAIWSProxyURL(req.ProxyURL)
 	pooledConn.wsURL = normalizeOpenAIWSURL(req.WSURL)
@@ -2641,7 +2666,7 @@ func cloneOpenAIWSAcquireRequestPtr(req *openAIWSAcquireRequest) *openAIWSAcquir
 func sameOpenAIWSPrewarmTarget(a, b openAIWSAcquireRequest) bool {
 	return normalizeOpenAIWSURL(a.WSURL) == normalizeOpenAIWSURL(b.WSURL) &&
 		normalizeOpenAIWSProxyURL(a.ProxyURL) == normalizeOpenAIWSProxyURL(b.ProxyURL) &&
-		normalizeOpenAIWSHandshakeCompatibility(a.Headers) == normalizeOpenAIWSHandshakeCompatibility(b.Headers)
+		normalizeOpenAIWSHandshakeCompatibilityForRequest(a) == normalizeOpenAIWSHandshakeCompatibilityForRequest(b)
 }
 
 func normalizeOpenAIWSBetaFeatures(headers http.Header) string {
@@ -2673,6 +2698,12 @@ func normalizeOpenAIWSHandshakeCompatibility(headers http.Header) openAIWSHandsh
 	return openAIWSHandshakeCompatibilityKey{
 		betaFeatures: normalizeOpenAIWSBetaFeatures(headers),
 	}
+}
+
+func normalizeOpenAIWSHandshakeCompatibilityForRequest(req openAIWSAcquireRequest) openAIWSHandshakeCompatibilityKey {
+	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Headers)
+	compatibility.identity = strings.TrimSpace(req.IdentityCompatibility)
+	return compatibility
 }
 
 // normalizeOpenAIWSProxyURL gives pooled connections the same proxy identity

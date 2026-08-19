@@ -474,8 +474,8 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
 	updates[SettingKeyOpenAICodexUserAgent] = strings.TrimSpace(settings.OpenAICodexUserAgent)
 	updates[SettingKeyOpenAICodexClientVersion] = NormalizeCodexClientVersion(settings.OpenAICodexClientVersion)
 	updates[SettingKeyOpenAICodexVersionAutoSyncEnabled] = strconv.FormatBool(settings.OpenAICodexVersionAutoSyncEnabled)
-	// SettingKeyOpenAICodexClientVersionSynced 由自动同步任务独占写入，此处不得覆盖，
-	// 否则面板保存会把同步结果清空。
+	// SettingKeyOpenAICodexClientVersionSynced is written only by the automatic
+	// version sync service, so saving the settings form must not overwrite it.
 	// codex_cli_only 加固
 	updates[SettingKeyMinCodexVersion] = strings.TrimSpace(settings.MinCodexVersion)
 	updates[SettingKeyMaxCodexVersion] = strings.TrimSpace(settings.MaxCodexVersion)
@@ -715,6 +715,8 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		version:   antigravityUserAgentVersion,
 		expiresAt: time.Now().Add(antigravityUserAgentVersionCacheTTL).UnixNano(),
 	})
+	// The outgoing identity resolver reads these cached settings on the gateway
+	// hot path; clear the cache after every administrative update.
 	s.openAICodexUASF.Forget("openai_codex_user_agent")
 	codexUA := strings.TrimSpace(settings.OpenAICodexUserAgent)
 	if codexUA == "" {
@@ -724,8 +726,8 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
 		value:     codexUA,
 		expiresAt: time.Now().Add(openAICodexUserAgentCacheTTL).UnixNano(),
 	})
-	// 版本号缓存只做失效，不在此重算：生效值还取决于自动同步写入的 synced 键，
-	// 这里没有它的最新值，重算会把同步结果覆盖成陈旧值。
+	// Do not recompute the version cache here because the synced value may be
+	// newer than this settings payload.
 	s.InvalidateOpenAICodexClientVersionCache()
 	openAIAdvancedSchedulerSettingSF.Forget(openAIAdvancedSchedulerSettingKey)
 	openAIAdvancedSchedulerSettingCache.Store(&cachedOpenAIAdvancedSchedulerSetting{

@@ -119,6 +119,19 @@ describe('AccountTestModal', () => {
     vi.restoreAllMocks()
   })
 
+  it('uses the unknown translation for a missing account status', () => {
+    const wrapper = mountModal({
+      id: 99,
+      name: 'Missing Status',
+      platform: 'openai',
+      type: 'oauth',
+      status: undefined
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.unknown')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.undefined')
+  })
+
   it('gemini 图片模型测试会携带提示词并渲染图片预览', async () => {
     const wrapper = mountModal()
     await wrapper.setProps({ show: true })

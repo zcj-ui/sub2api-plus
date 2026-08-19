@@ -879,6 +879,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			nil,
 		)
 	}
+	if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, firstClientMessage); changed {
+		firstClientMessage = scrubbed
+	}
 	if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(firstClientMessage) {
 		withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(firstClientMessage)
 		if appendErr != nil {
@@ -966,22 +969,30 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
 	}
 	firstClientMessage = updatedFirst
+	var inboundHeaders http.Header
+	if c != nil && c.Request != nil {
+		inboundHeaders = c.Request.Header
+	}
+	stageCodexFingerprintClientClassification(c,
+		(c != nil && openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator"))) ||
+			(s.cfg != nil && s.cfg.Gateway.ForceCodexCLI),
+	)
 	var codexFPIDs *codexFingerprintIDs
-	if account.IsOpenAIOAuth() {
-		var clientHeaders http.Header
-		if c != nil && c.Request != nil {
-			clientHeaders = c.Request.Header
-		}
-		if !codexFingerprintProjectionMalformed(clientHeaders, firstClientMessage) {
-			codexFPIDs = resolveCodexFingerprintIDsForRequest(account, clientHeaders, firstClientMessage, getAPIKeyIDFromContext(c), codexFingerprintDeploymentSeed(s.cfg))
-		}
+	if account.IsOpenAIOAuth() && shouldApplyCodexFingerprintForRequest(c, account, firstClientMessage) {
+		codexFPIDs = resolveCodexFingerprintIDsForRequest(
+			account,
+			inboundHeaders,
+			firstClientMessage,
+			getAPIKeyIDFromContext(c),
+			codexFingerprintDeploymentSeed(s.cfg),
+		)
 		if nextMessage, changed := applyCodexFingerprintToBodyBytes(firstClientMessage, codexFPIDs); changed {
 			firstClientMessage = nextMessage
 		}
-		// Always replace the request-scoped snapshot, including nil, so a
-		// failover to an off-mode account cannot inherit the prior account's IDs.
-		stageCodexFingerprintIDs(c, codexFPIDs)
 	}
+	// Replace the request-scoped snapshot even when it is nil; retry paths can
+	// switch accounts and must never reuse the preceding account's IDs.
+	stageCodexFingerprintIDs(c, codexFPIDs)
 
 	// 在 policy filter 之后再提取 service_tier / reasoning_effort 用于
 	// usage 上报：filter
@@ -1034,7 +1045,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
-	headers, _, buildHdrErr := s.buildOpenAIWSHeaders(
+	protocolOptions := openAIWSResponseCreateProtocolOptionsFromHeaders(inboundHeaders, turnState)
+	headers, _, buildHdrErr := s.buildOpenAIWSHeadersWithBody(
 		ctx,
 		c,
 		account,
@@ -1046,6 +1058,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		promptCacheKey,
 		gjson.GetBytes(firstClientMessage, "model").String(),
 		gjson.GetBytes(firstClientMessage, "service_tier").String(),
+		firstClientMessage,
 	)
 	if buildHdrErr != nil {
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
@@ -1090,10 +1103,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
 		)
 		s.handleOpenAIWSDialTransientFailure(ctx, account, capturedSessionModel, dialErr)
-		if statusCode == http.StatusTooManyRequests {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
+		if dialStatus, rateLimited := openAIWSDialRateLimitStatus(dialErr); rateLimited {
+			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, responseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), dialStatus)
 			return &UpstreamFailoverError{
-				StatusCode:      http.StatusTooManyRequests,
+				StatusCode:      dialStatus,
 				ResponseHeaders: cloneHeader(handshakeHeaders),
 			}
 		}
@@ -1108,6 +1121,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		statusCode,
 		openAIWSHeaderValueForLog(handshakeHeaders, "x-request-id"),
 	)
+	if handshakeTurnState := strings.TrimSpace(handshakeHeaders.Get(openAIWSTurnStateHeader)); handshakeTurnState != "" {
+		protocolOptions.TurnState = handshakeTurnState
+	}
 
 	upstreamFrameConn, ok := upstreamConn.(openaiwsv2.FrameConn)
 	if !ok {
@@ -1171,7 +1187,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
 			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, handshakeHeaders, payload)
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, payload, codeRaw, errTypeRaw, errMsgRaw)
+			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, payload, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
 		}
 		return true
 	}
@@ -1203,6 +1219,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		filter: func(msgType coderws.MessageType, payload []byte) (out []byte, blocked *OpenAIFastBlockedError, filterErr error) {
 			if !isOpenAIWSPassthroughJSONFrame(msgType) {
 				return payload, nil, nil
+			}
+			if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, payload); changed {
+				payload = scrubbed
 			}
 			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
 			isResponseCreate := eventType == "response.create"
@@ -1302,7 +1321,21 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				payload = s.ReplaceModelInBody(payload, model)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
+			if policyErr == nil && blocked == nil && isResponseCreate {
+				normalizedPayload, _, normalizeErr := normalizeOpenAIWSResponseCreatePayloadBytes(out, protocolOptions)
+				if normalizeErr != nil {
+					return out, nil, NewOpenAIWSClientCloseError(
+						coderws.StatusPolicyViolation,
+						"invalid websocket request payload",
+						normalizeErr,
+					)
+				}
+				out = normalizedPayload
+			}
 			if policyErr == nil && blocked == nil && isResponseCreate && codexFPIDs != nil {
+				// A shared WS connection carries several Codex turns. Retain its
+				// stable installation/session/thread tuple while refreshing the
+				// turn-scoped UUIDv7 and timestamp for every later frame.
 				if nextPayload, changed := applyCodexFingerprintToBodyBytes(out, nextCodexFingerprintTurn(codexFPIDs)); changed {
 					out = nextPayload
 				}
@@ -1373,6 +1406,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		}
 	}
 	firstWriteCtx, cancelFirstWrite := context.WithTimeout(ctx, s.openAIWSWriteTimeout())
+	normalizedFirstMessage, _, normalizeFirstErr := normalizeOpenAIWSResponseCreatePayloadBytes(firstClientMessage, protocolOptions)
+	if normalizeFirstErr != nil {
+		cancelFirstWrite()
+		return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeFirstErr)
+	}
+	firstClientMessage = normalizedFirstMessage
 	firstWriteErr := relayUpstreamFrameConn.WriteFrame(firstWriteCtx, firstMessageType, firstClientMessage)
 	cancelFirstWrite()
 	if firstWriteErr != nil {
@@ -1723,6 +1762,9 @@ func (s *OpenAIGatewayService) mapOpenAIWSPassthroughDialError(
 			"upstream websocket connect timeout",
 			wrappedErr,
 		)
+	}
+	if dialStatus, rateLimited := openAIWSDialRateLimitStatus(wrappedErr); rateLimited {
+		statusCode = dialStatus
 	}
 	if statusCode == http.StatusTooManyRequests {
 		return NewOpenAIWSClientCloseError(

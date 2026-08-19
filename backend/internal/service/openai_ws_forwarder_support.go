@@ -84,6 +84,9 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 		prewarmPayload[k] = v
 	}
 	prewarmPayload["generate"] = false
+	// Prewarm is a real response.create write. Refresh its transport timestamp
+	// independently so the later business request receives its own stamp.
+	normalizeOpenAIWSResponseCreatePayload(prewarmPayload, openAIWSResponseCreateProtocolOptions{})
 	prewarmPayloadJSON := payloadAsJSONBytes(prewarmPayload)
 
 	if err := lease.WriteJSONWithContextTimeout(ctx, prewarmPayload, s.openAIWSWriteTimeout()); err != nil {
@@ -104,20 +107,21 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	rateLimitSignalHandled := false
 	recordPrewarmRateLimit := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
 		if !isRateLimit || rateLimitSignalHandled {
 			return isRateLimit
 		}
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
 			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw)
+			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
 		}
 		rateLimitSignalHandled = true
 		// A prewarm 429 can be the second explicit signal that confirms the
 		// already-acquired socket. A lease observed during the transition is
 		// eligible only when the exact socket was already pooled before it;
 		// fresh post-block sockets remain failover-only.
-		if !lease.openAI429GuardActiveAtAcquire || s.isOpenAIWS429GuardConnectionCandidate(account, lease.ConnID(), lease.openAIRuntimeBlockGeneration) {
+		if explicit429 && (!lease.openAI429GuardActiveAtAcquire || s.isOpenAIWS429GuardConnectionCandidate(account, lease.ConnID(), lease.openAIRuntimeBlockGeneration)) {
 			s.markOpenAI429GuardConnectionProof(account, lease)
 			if s.isOpenAIWS429GuardConnectionPinned(account, lease.ConnID()) {
 				lease.openAI429GuardProven.Store(true)
@@ -844,6 +848,9 @@ func classifyOpenAIWSAcquireError(err error) string {
 	}
 	var dialErr *openAIWSDialError
 	if errors.As(err, &dialErr) {
+		if _, rateLimited := openAIWSDialRateLimitStatus(err); rateLimited {
+			return "upstream_rate_limited"
+		}
 		switch dialErr.StatusCode {
 		case 426:
 			return "upgrade_required"
@@ -900,6 +907,34 @@ func isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw string) bool {
 	return false
 }
 
+// isOpenAIWSExplicit429Signal reports evidence that the upstream actually
+// returned HTTP 429. Semantic codes such as usage_limit_reached or
+// insufficient_quota are useful for request failover, but by themselves they
+// must not advance the account-level two-confirmation 429 guard.
+func isOpenAIWSExplicit429Signal(upstreamStatus int, codeRaw, errTypeRaw, msgRaw string, responseBody []byte) bool {
+	if upstreamStatus != 0 {
+		return upstreamStatus == http.StatusTooManyRequests
+	}
+	if bodyStatus := openAIWSPayloadUpstreamStatus(responseBody); bodyStatus != 0 {
+		return bodyStatus == http.StatusTooManyRequests
+	}
+	for _, raw := range []string{codeRaw, errTypeRaw, msgRaw} {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		switch value {
+		case "429", "http 429", "http status 429", "status 429", "status: 429":
+			return true
+		}
+		if strings.Contains(value, "too many requests") ||
+			strings.Contains(value, "last status: 429") ||
+			strings.Contains(value, "last status=429") ||
+			strings.Contains(value, "http status 429") ||
+			strings.Contains(value, "http 429") {
+			return true
+		}
+	}
+	return false
+}
+
 // isOpenAIWSRateLimitSignal classifies an upstream rate-limit signal without
 // letting a contradictory explicit status be overridden by a stale error code.
 // Some upstream relays preserve an old rate_limit_* code while reporting a
@@ -909,6 +944,44 @@ func isOpenAIWSRateLimitSignal(upstreamStatus int, codeRaw, errTypeRaw, msgRaw s
 		return upstreamStatus == http.StatusTooManyRequests
 	}
 	return isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw)
+}
+
+// openAIWSDialRateLimitStatus extracts an explicit 429 from a failed
+// WebSocket handshake. A few reverse proxies lose the HTTP status while
+// retaining the status in the response body or transport error text. An
+// explicit non-zero status always wins so a stale rate-limit code cannot turn a
+// 5xx handshake into an account-level 429 signal.
+func openAIWSDialRateLimitStatus(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var dialErr *openAIWSDialError
+	if !errors.As(err, &dialErr) || dialErr == nil {
+		return 0, false
+	}
+	if dialErr.StatusCode != 0 {
+		return dialErr.StatusCode, dialErr.StatusCode == http.StatusTooManyRequests
+	}
+
+	if bodyStatus := openAIWSPayloadUpstreamStatus(dialErr.ResponseBody); bodyStatus != 0 {
+		return bodyStatus, bodyStatus == http.StatusTooManyRequests
+	}
+	codeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(dialErr.ResponseBody)
+	if errMsgRaw == "" && len(dialErr.ResponseBody) > 0 {
+		errMsgRaw = strings.TrimSpace(extractUpstreamErrorMessage(dialErr.ResponseBody))
+	}
+	if dialErr.Err != nil {
+		transportMessage := strings.TrimSpace(dialErr.Err.Error())
+		if errMsgRaw == "" {
+			errMsgRaw = transportMessage
+		} else if transportMessage != "" {
+			errMsgRaw += " " + transportMessage
+		}
+	}
+	if isOpenAIWSExplicit429Signal(0, codeRaw, errTypeRaw, errMsgRaw, dialErr.ResponseBody) {
+		return http.StatusTooManyRequests, true
+	}
+	return 0, false
 }
 
 // openAIWS429GuardErrorEventFailureStatus classifies an `error` event emitted
@@ -933,11 +1006,15 @@ func openAIWS429GuardErrorEventFailureStatus(upstreamStatus int, codeRaw, errTyp
 	return status, true
 }
 
-func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw string) {
+func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw string, upstreamStatus ...int) {
 	if s == nil || account == nil || account.Platform != PlatformOpenAI {
 		return
 	}
-	if !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw) {
+	status := 0
+	if len(upstreamStatus) > 0 {
+		status = upstreamStatus[0]
+	}
+	if !isOpenAIWSExplicit429Signal(status, codeRaw, errTypeRaw, msgRaw, responseBody) {
 		return
 	}
 	s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, headers, responseBody)

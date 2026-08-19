@@ -64,6 +64,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
+	var inboundHeaders http.Header
+	if c != nil && c.Request != nil {
+		inboundHeaders = c.Request.Header
+	}
+	captureCodexClientIdentityPassthrough(c, account, inboundHeaders, firstClientMessage)
 
 	// 预取一次 OpenAI Fast Policy settings，绑定到 ctx，让该 WS session
 	// 内所有帧的 evaluateOpenAIFastPolicy 调用复用同一份快照，避免每帧
@@ -152,7 +157,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 	}
 	debugEnabled := isOpenAIWSModeDebugEnabled()
-	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
+	isCodexCLI := openai.IsCodexOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("originator")) ||
+		(s.cfg != nil && s.cfg.Gateway.ForceCodexCLI)
+	stageCodexFingerprintClientClassification(c, isCodexCLI)
 
 	type openAIWSClientPayload struct {
 		payloadRaw         []byte
@@ -166,6 +173,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		payloadBytes       int
 	}
 	ingressSessionOriginalModel := ""
+	// The non-v2 ingress parser handles every response.create frame in one
+	// downstream WebSocket session. Keep the account/client seed from the first
+	// frame and rotate only turn-scoped fields thereafter; resolving from the
+	// already-converged body on each frame would feed the account projection back
+	// as a new client seed and can drift session-mode thread IDs.
+	var ingressCodexFingerprintIDs *codexFingerprintIDs
+	ingressCodexFingerprintInitialized := false
+	ingressCodexFingerprintEligibilityInitialized := false
+	ingressCodexFingerprintEligible := false
 
 	applyPayloadMutation := func(current []byte, path string, value any) ([]byte, error) {
 		next, err := sjson.SetBytes(current, path, value)
@@ -200,6 +216,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		if !gjson.ValidBytes(trimmed) {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", errors.New("invalid json"))
+		}
+		if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, trimmed); changed {
+			trimmed = scrubbed
 		}
 
 		values := gjson.GetManyBytes(trimmed, "type", "model", "prompt_cache_key", "previous_response_id")
@@ -259,13 +278,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				"previous_response_id must be a response.id (resp_*), not a message id",
 				nil,
 			)
-		}
-		if turnMetadata := strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader)); turnMetadata != "" {
-			next, setErr := applyPayloadMutation(normalized, "client_metadata."+openAIWSTurnMetadataHeader, turnMetadata)
-			if setErr != nil {
-				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", setErr)
-			}
-			normalized = next
 		}
 		if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(normalized) {
 			withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(normalized)
@@ -414,30 +426,51 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		normalized = policyApplied
-		if account.IsOpenAIOAuth() {
-			var clientHeaders http.Header
-			if c != nil && c.Request != nil {
-				clientHeaders = c.Request.Header
-			}
-			var codexFPIDs *codexFingerprintIDs
-			if !codexFingerprintProjectionMalformed(clientHeaders, normalized) {
-				codexFPIDs = resolveCodexFingerprintIDsForRequest(
+		var inboundHeaders http.Header
+		if c != nil && c.Request != nil {
+			inboundHeaders = c.Request.Header
+		}
+		var codexFPIDs *codexFingerprintIDs
+		if !ingressCodexFingerprintEligibilityInitialized {
+			ingressCodexFingerprintEligible = shouldApplyCodexFingerprintForRequest(c, account, normalized)
+			ingressCodexFingerprintEligibilityInitialized = true
+		}
+		if account.IsOpenAIOAuth() && ingressCodexFingerprintEligible {
+			if !ingressCodexFingerprintInitialized {
+				ingressCodexFingerprintIDs = resolveCodexFingerprintIDsForRequest(
 					account,
-					clientHeaders,
+					inboundHeaders,
 					normalized,
 					getAPIKeyIDFromContext(c),
 					codexFingerprintDeploymentSeed(s.cfg),
 				)
-				if next, changed := applyCodexFingerprintToBodyBytes(normalized, codexFPIDs); changed {
-					normalized = next
-				}
+				ingressCodexFingerprintInitialized = true
+			} else if ingressCodexFingerprintIDs != nil {
+				ingressCodexFingerprintIDs = nextCodexFingerprintTurn(ingressCodexFingerprintIDs)
 			}
-			// Replace the snapshot on every frame, including nil, to prevent a
-			// failover/off-mode account from inheriting the previous frame's IDs.
-			stageCodexFingerprintIDs(c, codexFPIDs)
-		} else {
-			stageCodexFingerprintIDs(c, nil)
+			codexFPIDs = ingressCodexFingerprintIDs
+			if next, changed := applyCodexFingerprintToBodyBytes(normalized, codexFPIDs); changed {
+				normalized = next
+			}
 		}
+		// Replace the snapshot on every parsed frame, including nil. A retry or
+		// account switch must not reuse an earlier account's lifecycle IDs.
+		stageCodexFingerprintIDs(c, codexFPIDs)
+		normalizedPayload, _, normalizeErr := normalizeOpenAIWSResponseCreatePayloadBytes(
+			normalized,
+			openAIWSResponseCreateProtocolOptionsFromHeaders(
+				inboundHeaders,
+				strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader)),
+			),
+		)
+		if normalizeErr != nil {
+			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
+				coderws.StatusPolicyViolation,
+				"invalid websocket request payload",
+				normalizeErr,
+			)
+		}
+		normalized = normalizedPayload
 		ingressSessionOriginalModel = originalModel
 
 		return openAIWSClientPayload{
@@ -675,7 +708,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	firstRoutingFields := gjson.GetManyBytes(firstPayload.payloadRaw, "model", "service_tier")
-	wsHeaders, _, buildHdrErr := s.buildOpenAIWSHeaders(
+	wsHeaders, _, buildHdrErr := s.buildOpenAIWSHeadersWithBody(
 		ctx,
 		c,
 		account,
@@ -687,23 +720,31 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		firstPayload.promptCacheKey,
 		firstRoutingFields[0].String(),
 		firstRoutingFields[1].String(),
+		firstPayload.payloadRaw,
 	)
 	if buildHdrErr != nil {
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
+	identityCompatibility, identityNeedsFreshConn := codexWSIdentityCompatibilityKey(
+		account,
+		c,
+		wsHeaders,
+		firstPayload.payloadRaw,
+	)
 	proxyURL, proxyErr := resolveRequiredOpenAIProxyURL(account)
 	if proxyErr != nil {
 		return fmt.Errorf("resolve upstream proxy: %w", proxyErr)
 	}
 	baseAcquireReq := openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   wsURL,
-		Headers: wsHeaders,
+		Account:               account,
+		WSURL:                 wsURL,
+		Headers:               wsHeaders,
+		IdentityCompatibility: identityCompatibility,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
 		ProxyURL:     proxyURL,
-		ForceNewConn: false,
+		ForceNewConn: identityNeedsFreshConn && strings.TrimSpace(preferredConnID) == "",
 	}
 	pool := s.getOpenAIWSConnPool()
 	if pool == nil {
@@ -767,8 +808,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		req.PreferredConnID = strings.TrimSpace(preferred)
 		req.ForcePreferredConn = forcePreferredConn
 		blockBeforeAcquire := s.openAIAccountRuntimeBlockSnapshot(account.ID)
+		identityForceNew, identityForcePreferred := openAIWSIdentityAcquirePolicy(
+			identityNeedsFreshConn,
+			req.PreferredConnID,
+			forcePreferredConn,
+			dedicatedMode,
+		)
+		req.ForcePreferredConn = identityForcePreferred
+		req.ForceNewConn = identityForceNew
 		// dedicated 模式下每次获取均新建连接，避免跨会话复用残留上下文。
-		req.ForceNewConn = dedicatedMode
 		acquireCtx, acquireCancel := context.WithTimeout(ctx, acquireTimeout)
 		lease, acquireErr := pool.Acquire(acquireCtx, req)
 		acquireCancel()
@@ -805,11 +853,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				proxyURL != "",
 			)
 			var dialErr *openAIWSDialError
-			if errors.As(acquireErr, &dialErr) && dialErr != nil && dialErr.StatusCode == http.StatusTooManyRequests {
-				s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()))
-				return nil, &UpstreamFailoverError{
-					StatusCode:      http.StatusTooManyRequests,
-					ResponseHeaders: cloneHeader(dialErr.ResponseHeaders),
+			if errors.As(acquireErr, &dialErr) && dialErr != nil {
+				if dialStatus, rateLimited := openAIWSDialRateLimitStatus(acquireErr); rateLimited {
+					s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()), dialStatus)
+					return nil, &UpstreamFailoverError{
+						StatusCode:      dialStatus,
+						ResponseHeaders: cloneHeader(dialErr.ResponseHeaders),
+					}
 				}
 			}
 			if errors.Is(acquireErr, errOpenAIWSPreferredConnUnavailable) {
@@ -871,6 +921,23 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		turnStart := time.Now()
 		wroteDownstream := false
 		wroteSemanticDownstream := false
+		var inboundHeaders http.Header
+		if c != nil && c.Request != nil {
+			inboundHeaders = c.Request.Header
+		}
+		normalizedPayload, _, normalizeErr := normalizeOpenAIWSResponseCreatePayloadBytes(
+			payload,
+			openAIWSResponseCreateProtocolOptionsFromHeaders(inboundHeaders, turnState),
+		)
+		if normalizeErr != nil {
+			return nil, wrapOpenAIWSIngressTurnError(
+				"write_upstream",
+				fmt.Errorf("normalize upstream websocket request: %w", normalizeErr),
+				false,
+			)
+		}
+		payload = normalizedPayload
+		payloadBytes = len(payload)
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
@@ -932,16 +999,17 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 			isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+			explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
 			if !isRateLimit || rateLimitSignalHandled {
 				return isRateLimit
 			}
 			if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
 				s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
 			} else {
-				s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw)
+				s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
 			}
 			rateLimitSignalHandled = true
-			if isRateLimit && guardLeaseMayRetain() {
+			if explicit429 && guardLeaseMayRetain() {
 				s.markOpenAI429GuardConnectionProof(account, lease)
 				// A confirmed Codex 429 is a scheduling state, not a transport
 				// failure. Keep the healthy socket available for the next turn;
@@ -2202,7 +2270,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		if nextPayload.promptCacheKey != "" {
 			// ingress 会话在整个客户端 WS 生命周期内复用同一上游连接；
 			// prompt_cache_key 对握手头的更新仅在未来需要重新建连时生效。
-			updatedHeaders, _, updHdrErr := s.buildOpenAIWSHeaders(
+			updatedHeaders, _, updHdrErr := s.buildOpenAIWSHeadersWithBody(
 				ctx,
 				c,
 				account,
@@ -2214,6 +2282,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nextPayload.promptCacheKey,
 				nextRoutingFields[0].String(),
 				nextRoutingFields[1].String(),
+				nextPayload.payloadRaw,
 			)
 			if updHdrErr != nil {
 				logOpenAIWSModeInfo("ingress_ws_update_headers_failed account_id=%d err=%v", account.ID, updHdrErr)

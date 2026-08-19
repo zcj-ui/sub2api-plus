@@ -504,12 +504,15 @@ export default {
         antigravityUserAgentVersionHint: 'Leave empty to use ANTIGRAVITY_USER_AGENT_VERSION or the built-in default 1.23.2; when set, the admin setting takes precedence.',
         openaiCodexUserAgent: 'OpenAI Codex UA',
         openaiCodexUserAgentPlaceholder: 'codex-tui/0.146.1 (Ubuntu 22.4.0; x86_64) WindowsTerminal (codex-tui; 0.146.1)',
-        openaiCodexUserAgentHint: 'The full Codex User-Agent used for all outbound requests, for customizing the OS / arch / terminal fingerprint. Leave empty to build the standard codex-tui identity from the version below (recommended). If set, both the leading and trailing version declarations are synchronized to the version below, so the UA never stays pinned to the release entered here — under capacity pressure the upstream sheds load by client identity and drops stale or non-official identities first with server_is_overloaded.',
+        openaiCodexUserAgentHint:
+          'The canonical Codex User-Agent shape used upstream. Leave empty to build the standard codex-tui identity from the version below. The client name, OS, architecture, and terminal shape are preserved while the version is synchronized.',
         openaiCodexClientVersion: 'Codex client version',
         openaiCodexClientVersionPlaceholder: 'Leave empty to follow auto-sync',
-        openaiCodexClientVersionHint: 'The Codex client version this gateway declares upstream, shared by the User-Agent and the version header. Leave empty to use the auto-synced latest stable release; setting a value pins it and stops following auto-sync.',
+        openaiCodexClientVersionHint:
+          'The version declared by the gateway upstream and shared by the User-Agent and version header. Leave empty to follow the latest synchronized stable release; setting a value pins it.',
         openaiCodexVersionAutoSync: 'Auto-sync Codex version',
-        openaiCodexVersionAutoSyncHint: 'Fetches the latest stable client version from the official repository every 6 hours, so you never need to upgrade this service just to keep the version current. When disabled, only the version above or the built-in default is used.',
+        openaiCodexVersionAutoSyncHint:
+          'Fetches the latest stable client version from the official repository every 6 hours. Disable it when you intentionally pin a version above.',
         openaiCodexVersionSyncedValue: 'Currently synced: {version}',
         codexHardeningTitle: "Codex Settings",
         codexClientRestrictionTitle: "Codex client restriction",

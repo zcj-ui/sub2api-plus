@@ -1151,11 +1151,12 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 }
 
 // normalizeCRSOpenAICodexFingerprintExtra keeps CRS synchronization aligned
-// with the normal account lifecycle. A CRS payload is not a trusted backup:
-// caller-provided seeds are discarded, an existing local seed is preserved,
-// and a missing seed is generated only for a real OAuth credential owner.
+// with the normal account lifecycle. CRS payloads never own the official
+// Codex client's installation/session lifecycle: an incoming seed is always
+// discarded, while an existing local seed is preserved and a new seed is
+// generated only for an explicit convergence mode.
 func normalizeCRSOpenAICodexFingerprintExtra(existing *Account, extra map[string]any) map[string]any {
-	extra = normalizeCodexFingerprintModeForStorage(extra)
+	extra = RetireCodexFingerprintExtra(extra)
 	if extra == nil {
 		extra = make(map[string]any)
 	} else {
@@ -1165,6 +1166,8 @@ func normalizeCRSOpenAICodexFingerprintExtra(existing *Account, extra map[string
 		}
 		extra = cloned
 	}
+	// CRS is a synchronization source, not a backup of account-owned identity.
+	// Never allow a remote payload to rotate or choose the persisted seed.
 	delete(extra, codexFingerprintSeedExtraKey)
 	if existing != nil && existing.IsCredentialShadow() {
 		// Shadows do not own an OAuth installation. CRS can still carry legacy
@@ -1174,11 +1177,9 @@ func normalizeCRSOpenAICodexFingerprintExtra(existing *Account, extra map[string
 		return extra
 	}
 	if existing != nil {
-		if seed := existing.getCodexFingerprintSeed(); seed != "" {
-			extra[codexFingerprintSeedExtraKey] = seed
-		}
+		return NormalizeCodexFingerprintExtraForExistingAccount(existing, extra)
 	}
-	return ensureCodexFingerprintSeed(PlatformOpenAI, AccountTypeOAuth, extra)
+	return NormalizeCodexFingerprintExtraForAccount(PlatformOpenAI, AccountTypeOAuth, extra)
 }
 
 // scrubCRSOpenAIOAuthOnlyExtra mirrors the admin account type-transition

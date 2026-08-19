@@ -3,14 +3,16 @@ import { flushPromises, mount } from '@vue/test-utils'
 import AccountUsageCell from '../AccountUsageCell.vue'
 import type { Account } from '@/types'
 
-const { getUsage } = vi.hoisted(() => ({
-  getUsage: vi.fn()
+const { getUsage, getById } = vi.hoisted(() => ({
+  getUsage: vi.fn(),
+  getById: vi.fn()
 }))
 
 vi.mock('@/api/admin', () => ({
   adminAPI: {
     accounts: {
-      getUsage
+      getUsage,
+      getById
     }
   }
 }))
@@ -57,6 +59,7 @@ function makeAccount(overrides: Partial<Account>): Account {
 describe('AccountUsageCell', () => {
   beforeEach(() => {
     getUsage.mockReset()
+    getById.mockReset()
     Object.defineProperty(window, 'matchMedia', {
       writable: true,
       value: vi.fn().mockImplementation(() => ({
@@ -312,6 +315,69 @@ describe('AccountUsageCell', () => {
     // 单一数据源：始终使用 /usage API 返回值，忽略 codex 快照
     expect(wrapper.text()).toContain('5h|18|900')
     expect(wrapper.text()).toContain('7d|36|900')
+  })
+
+  it('OpenAI 主动查询后同步回读账户积分快照', async () => {
+    const account = makeAccount({
+      id: 2001,
+      platform: 'openai',
+      type: 'oauth',
+      extra: {}
+    })
+    const refreshedAccount = {
+      ...account,
+      updated_at: '2026-03-07T10:01:00Z',
+      extra: {
+        codex_credit_snapshot: {
+          balance: '125.0000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+          updated_at: '2026-03-07T10:01:00Z'
+        }
+      }
+    }
+    getUsage.mockResolvedValue({
+      five_hour: {
+        utilization: 12,
+        resets_at: '2099-03-07T12:00:00Z',
+        remaining_seconds: 3600
+      },
+      seven_day: null
+    })
+    getById.mockResolvedValue(refreshedAccount)
+
+    const wrapper = mount(AccountUsageCell, {
+      props: { account },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          OpenAIQuotaResetCell: {
+            props: ['account'],
+            template: '<div><slot name="pre-actions" /></div>'
+          }
+        }
+      }
+    })
+
+    await flushPromises()
+    getUsage.mockClear()
+
+    await wrapper.get('[data-testid="openai-active-usage-query"]').trigger('click')
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenCalledWith(2001, 'active', true)
+    expect(getById).toHaveBeenCalledWith(2001)
+    expect(wrapper.emitted('account-updated')).toEqual([[refreshedAccount]])
+
+    // Simulate the parent table applying the emitted row patch. The active
+    // query already supplied the usage payload, so this patch must not trigger
+    // a second automatic /usage request.
+    await wrapper.setProps({ account: refreshedAccount })
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
   })
 
   it('OpenAI OAuth 有现成快照时，手动刷新信号会触发 usage 重拉', async () => {

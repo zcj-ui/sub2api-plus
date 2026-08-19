@@ -69,7 +69,12 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 	c, _ := gin.CreateTestContext(rec)
 	body := []byte(`{"model":"gpt-5.3-codex","prompt_cache_key":"conversation-1","input":[{"type":"input_text","text":"hello"}]}`)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("User-Agent", "codex-tui/0.146.0 (Mac OS X 14.0; arm64) iTerm")
+	c.Request.Header.Set("Originator", "codex-tui")
 	c.Request.Header.Set("session-id", "client-session-1")
+	c.Request.Header.Set("thread-id", "client-thread-1")
+	c.Request.Header.Set("x-client-request-id", "client-thread-1")
+	c.Request.Header.Set("x-codex-turn-metadata", `{"installation_id":"client-install","session_id":"client-session-1","thread_id":"client-thread-1","turn_id":"019956a2-a4a1-7000-8000-000000000001","window_id":"client-thread-1:0"}`)
 	c.Request.Header.Set("x-codex-parent-thread-id", "parent-passthrough")
 	c.Request.Header.Set("x-openai-subagent", "review")
 
@@ -89,11 +94,14 @@ func TestBuildUpstreamRequestOpenAIPassthrough_AppliesCodexIdentityHierarchy(t *
 	svc := &OpenAIGatewayService{}
 	req, err := svc.buildUpstreamRequestOpenAIPassthrough(context.Background(), c, account, body, "token")
 	require.NoError(t, err)
-	require.Empty(t, req.Header.Get("x-codex-installation-id"), "regular passthrough must not emit the direct installation header")
+	require.Equal(t, ids.installationID, req.Header.Get("x-codex-installation-id"))
+	// Keep canonical and legacy aliases aligned for downstream compatibility;
+	// the complete client snapshot also owns the per-turn request id.
+	require.Equal(t, "client-session-1", req.Header.Get("session-id"))
 	require.Equal(t, "client-session-1", req.Header.Get("session_id"))
 	require.Equal(t, "parent-passthrough", req.Header.Get("x-codex-parent-thread-id"))
 	require.Equal(t, "review", req.Header.Get("x-openai-subagent"))
-	require.Empty(t, req.Header.Get("x-client-request-id"))
+	require.Equal(t, "client-thread-1", req.Header.Get("x-client-request-id"))
 }
 
 func (u *httpUpstreamRecorder) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {

@@ -10,9 +10,19 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const openAICodexTurnStateHeader = "x-codex-turn-state"
+
+// openAICodexTurnStateSessionContextKey caches the canonical client session
+// only for the lifetime of one gateway request. A few reverse proxies retain
+// the official Codex client_metadata envelope while removing session-id from
+// the HTTP/WS headers. Turn-state provenance must use that same session in
+// both directions, otherwise a failed-over state can be replayed to the next
+// OAuth account.
+const openAICodexTurnStateSessionContextKey = "openai_codex_turn_state_session_id"
 
 const (
 	openAICodexTurnStateBindingPrefix = "openai:codex:turn-state:v2:"
@@ -31,11 +41,50 @@ func openAICodexTurnStateSeed(c *gin.Context) string {
 		return ""
 	}
 	sessionID := extractClientSessionID(c.Request.Header)
+	if sessionID == "" {
+		if value, ok := c.Get(openAICodexTurnStateSessionContextKey); ok {
+			sessionID, _ = value.(string)
+			sessionID = strings.TrimSpace(sessionID)
+		}
+	}
 	apiKeyID := getAPIKeyIDFromContext(c)
 	if sessionID == "" || apiKeyID <= 0 {
 		return ""
 	}
 	return strconv.FormatInt(apiKeyID, 10) + "\x00" + sessionID
+}
+
+// stageOpenAICodexTurnStateSession records the body-carried official Codex
+// session before a response can mint or validate x-codex-turn-state. Header
+// values remain authoritative when present. A frame without client_metadata
+// keeps a previously staged value, because an official WS client can send its
+// identity on the first response.create frame and omit it on continuation
+// frames. An explicit malformed or session-less metadata object clears it.
+func stageOpenAICodexTurnStateSession(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+
+	if c.Request != nil {
+		if sessionID := extractClientSessionID(c.Request.Header); sessionID != "" {
+			c.Set(openAICodexTurnStateSessionContextKey, sessionID)
+			return
+		}
+	}
+
+	if !gjson.ValidBytes(body) {
+		return
+	}
+	metadata := gjson.GetBytes(body, "client_metadata")
+	if !metadata.Exists() {
+		return
+	}
+	projection := codexIdentityFromBody(body)
+	if !projection.valid {
+		c.Set(openAICodexTurnStateSessionContextKey, "")
+		return
+	}
+	c.Set(openAICodexTurnStateSessionContextKey, strings.TrimSpace(projection.tuple.sessionID))
 }
 
 func openAICodexTurnStateBindingKey(c *gin.Context, state string) string {
@@ -143,16 +192,49 @@ func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, acc
 	if s == nil || h == nil || account == nil {
 		return
 	}
-	if (account.Platform != "" || account.Type != "") && !account.IsOpenAIOAuth() {
-		return
-	}
 	state := extractOpenAICodexTurnState(h)
+	if s.isForeignOpenAICodexTurnState(c, account, state) {
+		h.Del(openAICodexTurnStateHeader)
+	}
+}
+
+// scrubForeignOpenAICodexTurnStateFromBody applies the same provenance check
+// to the canonical Responses/WS client_metadata carrier. The official CLI
+// sends x-codex-turn-state in this body map for websocket turns, so guarding
+// only the direct compatibility header would allow a state from a failed-over
+// account to reach the next upstream request. Unknown states deliberately
+// remain intact: cache availability must not destroy a valid client turn.
+func (s *OpenAIGatewayService) scrubForeignOpenAICodexTurnStateFromBody(c *gin.Context, account *Account, body []byte) ([]byte, bool) {
+	stageOpenAICodexTurnStateSession(c, body)
+	if s == nil || account == nil || !gjson.ValidBytes(body) {
+		return body, false
+	}
+	const turnStatePath = "client_metadata.x-codex-turn-state"
+	state := strings.TrimSpace(gjson.GetBytes(body, turnStatePath).String())
+	if !s.isForeignOpenAICodexTurnState(c, account, state) {
+		return body, false
+	}
+	scrubbed, err := sjson.DeleteBytes(body, turnStatePath)
+	if err != nil {
+		return body, false
+	}
+	return scrubbed, true
+}
+
+func (s *OpenAIGatewayService) isForeignOpenAICodexTurnState(c *gin.Context, account *Account, state string) bool {
+	if s == nil || account == nil {
+		return false
+	}
+	if (account.Platform != "" || account.Type != "") && !account.IsOpenAIOAuth() {
+		return false
+	}
+	state = strings.TrimSpace(state)
 	if state == "" {
-		return
+		return false
 	}
 	bindingKey := openAICodexTurnStateBindingKey(c, state)
 	if bindingKey == "" {
-		return
+		return false
 	}
 	origin, known := s.loadOpenAICodexTurnStateOrigin(c, bindingKey)
 	if !known && account.Platform == "" && account.Type == "" {
@@ -160,9 +242,7 @@ func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, acc
 			origin, known = s.loadOpenAICodexTurnStateOrigin(c, legacy)
 		}
 	}
-	if known && origin.accountID != account.ID {
-		h.Del(openAICodexTurnStateHeader)
-	}
+	return known && origin.accountID != account.ID
 }
 
 func (s *OpenAIGatewayService) loadOpenAICodexTurnStateOrigin(c *gin.Context, bindingKey string) (openAICodexTurnStateOrigin, bool) {

@@ -238,6 +238,27 @@ func TestForwardAsChatCompletions_APIKeyPropagatesPromptCacheKeyInResponsesBody(
 	require.Equal(t, generateSessionUUID(isolateOpenAISessionID(99, "cache-key-123")), upstream.lastReq.Header.Get("session_id"))
 }
 
+func TestForwardAsChatCompletions_OfficialCodexResponsesShapeIsTenantIsolated(t *testing.T) {
+	c, account, body := newCompleteOfficialCodexIdentityContext(t)
+	c.Request.URL.Path = "/v1/chat/completions"
+	c.Set("api_key", &APIKey{ID: 99})
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_chat_official_identity"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"invalid_request_error","message":"stop before response parsing"}}`)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+
+	_, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "server-cache-key", "")
+	require.Error(t, err)
+	require.NotNil(t, upstream.lastReq)
+	expectedSession := isolateOpenAISessionID(99, "session-1")
+	require.Equal(t, expectedSession, upstream.lastReq.Header.Get("session-id"))
+	require.Equal(t, expectedSession, upstream.lastReq.Header.Get("session_id"))
+	require.NotEqual(t, generateSessionUUID(isolateOpenAISessionID(99, "server-cache-key")), upstream.lastReq.Header.Get("session-id"))
+}
+
 func TestForwardAsChatCompletions_OAuthDoesNotInjectDefaultInstructions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

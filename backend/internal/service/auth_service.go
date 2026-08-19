@@ -1316,6 +1316,7 @@ func (s *AuthService) createUserAndClaimInvitation(ctx context.Context, user *Us
 		logger.LegacyPrintf("service.auth", "[Auth] Failed to start registration transaction: %v", err)
 		return ErrServiceUnavailable
 	}
+	defer func() { _ = tx.Rollback() }()
 	execCtx := dbent.NewTxContext(ctx, tx)
 	if err := commitUser(execCtx); err != nil {
 		_ = tx.Rollback()

@@ -72,49 +72,114 @@ const (
 
 // OpenAI allowed headers whitelist (for non-passthrough).
 var openaiAllowedHeaders = map[string]bool{
-	"accept-language":          true,
-	"content-type":             true,
-	"conversation_id":          true,
-	"user-agent":               true,
-	"originator":               true,
-	"session-id":               true,
-	"session_id":               true,
-	"thread-id":                true,
-	"thread_id":                true,
-	"x-client-request-id":      true,
-	"x-codex-beta-features":    true,
-	"x-codex-installation-id":  true,
-	"x-codex-turn-state":       true,
-	"x-codex-turn-metadata":    true,
-	"x-codex-window-id":        true,
-	"x-codex-parent-thread-id": true,
-	"x-openai-subagent":        true,
-	responsesLiteHeaderKey:     true,
+	"accept":                                true,
+	"accept-language":                       true,
+	"content-type":                          true,
+	"conversation_id":                       true,
+	"openai-beta":                           true,
+	"user-agent":                            true,
+	"originator":                            true,
+	"version":                               true,
+	"session-id":                            true,
+	"session_id":                            true,
+	"thread-id":                             true,
+	"thread_id":                             true,
+	"x-client-request-id":                   true,
+	"x-codex-beta-features":                 true,
+	"x-codex-installation-id":               true,
+	"x-codex-inference-call-id":             true,
+	"x-codex-routing-hint":                  true,
+	"x-codex-turn-state":                    true,
+	"x-codex-turn-metadata":                 true,
+	"x-codex-window-id":                     true,
+	"x-codex-parent-thread-id":              true,
+	"x-oai-attestation":                     true,
+	"x-openai-internal-codex-residency":     true,
+	"x-openai-memgen-request":               true,
+	"x-openai-subagent":                     true,
+	"x-responsesapi-include-timing-metrics": true,
+	responsesLiteHeaderKey:                  true,
 }
 
 // OpenAI passthrough allowed headers whitelist.
 // 透传模式下仅放行这些低风险请求头，避免将非标准/环境噪声头传给上游触发风控。
 var openaiPassthroughAllowedHeaders = map[string]bool{
-	"accept":                   true,
-	"accept-language":          true,
-	"content-type":             true,
-	"conversation_id":          true,
-	"openai-beta":              true,
-	"user-agent":               true,
-	"originator":               true,
-	"session-id":               true,
-	"session_id":               true,
-	"thread-id":                true,
-	"thread_id":                true,
-	"x-client-request-id":      true,
-	"x-codex-beta-features":    true,
-	"x-codex-installation-id":  true,
-	"x-codex-turn-state":       true,
-	"x-codex-turn-metadata":    true,
-	"x-codex-window-id":        true,
-	"x-codex-parent-thread-id": true,
-	"x-openai-subagent":        true,
-	responsesLiteHeaderKey:     true,
+	"accept":                                true,
+	"accept-language":                       true,
+	"content-type":                          true,
+	"conversation_id":                       true,
+	"openai-beta":                           true,
+	"user-agent":                            true,
+	"originator":                            true,
+	"version":                               true,
+	"session-id":                            true,
+	"session_id":                            true,
+	"thread-id":                             true,
+	"thread_id":                             true,
+	"x-client-request-id":                   true,
+	"x-codex-beta-features":                 true,
+	"x-codex-installation-id":               true,
+	"x-codex-inference-call-id":             true,
+	"x-codex-routing-hint":                  true,
+	"x-codex-turn-state":                    true,
+	"x-codex-turn-metadata":                 true,
+	"x-codex-window-id":                     true,
+	"x-codex-parent-thread-id":              true,
+	"x-oai-attestation":                     true,
+	"x-openai-internal-codex-residency":     true,
+	"x-openai-memgen-request":               true,
+	"x-openai-subagent":                     true,
+	"x-responsesapi-include-timing-metrics": true,
+	responsesLiteHeaderKey:                  true,
+}
+
+// openaiOfficialCodexIdentityHeaders is the subset of Codex client headers
+// that may be carried through unchanged when a request contains a genuine
+// official-client identity.  Authentication and account-routing headers are
+// intentionally excluded; those are owned by the selected upstream account.
+var openaiOfficialCodexIdentityHeaders = map[string]bool{
+	"accept-language":                        true,
+	"openai-beta":                            true,
+	"user-agent":                             true,
+	"originator":                             true,
+	"version":                                true,
+	"session-id":                             true,
+	"session_id":                             true,
+	"thread-id":                              true,
+	"thread_id":                              true,
+	"x-client-request-id":                    true,
+	"x-codex-beta-features":                  true,
+	"x-codex-installation-id":                true,
+	"x-codex-inference-call-id":              true,
+	"x-codex-parent-thread-id":               true,
+	"x-codex-routing-hint":                   true,
+	"x-codex-turn-metadata":                  true,
+	"x-codex-turn-state":                     true,
+	"x-codex-window-id":                      true,
+	"x-oai-attestation":                      true,
+	"x-openai-internal-codex-residency":      true,
+	"x-openai-internal-codex-responses-lite": true,
+	"x-openai-memgen-request":                true,
+	"x-openai-subagent":                      true,
+	"x-responsesapi-include-timing-metrics":  true,
+}
+
+// copyOpenAIOfficialCodexIdentityHeaders copies only the identity/transport
+// headers that the official Codex client itself may emit. It deliberately
+// excludes credentials and proxy metadata, which must be rebuilt for the
+// selected account and network route.
+func copyOpenAIOfficialCodexIdentityHeaders(dst, src http.Header) {
+	if dst == nil || src == nil {
+		return
+	}
+	for key, values := range src {
+		if !openaiOfficialCodexIdentityHeaders[strings.ToLower(strings.TrimSpace(key))] {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
 }
 
 // codex_cli_only 拒绝时记录的请求头白名单（仅用于诊断日志，不参与上游透传）

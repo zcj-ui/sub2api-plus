@@ -199,6 +199,57 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
     wrapper.unmount()
   })
 
+  it('同一账户 ID 的额度盘点快照更新后会刷新本地显示', async () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_reset_credit_snapshot: {
+          available_count: 1,
+          credits: [{ expires_at: FUTURE_EXPIRY_EARLY }],
+        },
+        codex_credit_snapshot: {
+          balance: '25.0000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+          updated_at: '2026-08-13T12:00:00Z',
+        },
+      },
+    })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    expect(wrapper.text()).toContain('admin.accounts.openaiQuotaReset.count1')
+    expect(wrapper.text()).toContain('25.0000000000 Credit')
+
+    await wrapper.setProps({
+      account: {
+        ...account,
+        extra: {
+          ...account.extra,
+          codex_reset_credit_snapshot: {
+            available_count: 2,
+            credits: [
+              { expires_at: FUTURE_EXPIRY_EARLY },
+              { expires_at: FUTURE_EXPIRY_LATE },
+            ],
+          },
+          codex_credit_snapshot: {
+            balance: '50.0000000000',
+            has_credits: true,
+            unlimited: false,
+            overage_limit_reached: false,
+            updated_at: '2026-08-13T13:00:00Z',
+          },
+        },
+      },
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.openaiQuotaReset.count2')
+    expect(wrapper.text()).toContain('50.0000000000 Credit')
+    expect(resetButton(wrapper).attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
   it('uses cached applicable count to gate reset while keeping the total count visible', () => {
     const account = makeAccount({
       parent_account_id: null,

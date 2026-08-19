@@ -32,7 +32,7 @@
               : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
           ]"
         >
-          {{ account.status }}
+          {{ t(`admin.accounts.status.${normalizeAccountStatusTranslationKey(account.status)}`) }}
         </span>
       </div>
 
@@ -469,6 +469,7 @@ import EndpointDistributionChart from '@/components/charts/EndpointDistributionC
 import Icon from '@/components/icons/Icon.vue'
 import { adminAPI } from '@/api/admin'
 import type { Account, AccountUsageStatsResponse } from '@/types'
+import { normalizeAccountStatusTranslationKey } from '@/utils/accountStatus'
 
 ChartJS.register(
   CategoryScale,

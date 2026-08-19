@@ -81,13 +81,20 @@ func (r *userRepository) create(ctx context.Context, userIn *service.User, guard
 		txClient = existingTx.Client()
 	} else {
 		tx, err := r.client.Tx(ctx)
-		if err != nil {
+		switch {
+		case errors.Is(err, dbent.ErrTxStarted):
+			// A transaction-bound Ent client is already owned by the caller
+			// (common in integration fixtures); reuse it instead of failing or
+			// opening a nested transaction.
+			txClient = r.client
+		case err != nil:
 			return err
+		default:
+			ownedTx = tx
+			defer func() { _ = ownedTx.Rollback() }()
+			txClient = tx.Client()
+			txCtx = dbent.NewTxContext(ctx, tx)
 		}
-		ownedTx = tx
-		defer func() { _ = ownedTx.Rollback() }()
-		txClient = tx.Client()
-		txCtx = dbent.NewTxContext(ctx, tx)
 	}
 
 	lockKeys := []string{normalizedEmailUniquenessLockKey(userIn.Email)}

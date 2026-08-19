@@ -271,7 +271,11 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
 
-	if promptCacheKey != "" {
+	// API-key Chat Completions requests do not carry the ChatGPT OAuth
+	// session graph. Preserve the established deterministic cache-affinity
+	// bridge for those callers, while leaving a genuine OAuth Codex snapshot
+	// untouched so its session/thread lifecycle remains authoritative.
+	if account.Type == AccountTypeAPIKey && promptCacheKey != "" {
 		apiKeyID := getAPIKeyIDFromContext(c)
 		upstreamReq.Header.Set("session_id", generateSessionUUID(isolateOpenAISessionID(apiKeyID, promptCacheKey)))
 	}

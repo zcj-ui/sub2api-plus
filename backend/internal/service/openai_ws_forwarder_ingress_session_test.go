@@ -99,7 +99,7 @@ func (c *openAIWSGuardRateLimitThenCompleteConn) ReadMessage(ctx context.Context
 	if !c.firstRead {
 		c.firstRead = true
 		c.mu.Unlock()
-		return []byte(`{"type":"error","error":{"code":"rate_limit_exceeded","message":"quota reached"}}`), nil
+		return []byte(`{"type":"error","status_code":429,"error":{"code":"rate_limit_exceeded","message":"quota reached"}}`), nil
 	}
 	if c.completedRead {
 		c.mu.Unlock()
@@ -1965,14 +1965,26 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_PassthroughHeade
 		t.Fatal("等待 passthrough websocket 结束超时")
 	}
 
-	require.Equal(t, "pcache_passthrough", captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, "pcache_passthrough", captureDialer.lastHeaders.Get("conversation_id"))
-	// The synthetic test turn metadata is intentionally malformed; the gateway
-	// skips the entire fingerprint projection instead of mixing partial fields.
-	require.Empty(t, captureDialer.lastHeaders.Get("x-codex-installation-id"))
-	require.Empty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
-	require.Equal(t, "turn-state-1", captureDialer.lastHeaders.Get(openAIWSTurnStateHeader))
-	require.Equal(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader))
+	// Session-mode OAuth ingress isolates the prompt-cache anchor before the
+	// handshake; raw downstream cache keys must not cross tenant boundaries.
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, "pcache_passthrough", captureDialer.lastHeaders.Get("session_id"))
+	// Passthrough does not invent a second conversation alias when the client
+	// only supplied a prompt-cache key.
+	require.Empty(t, captureDialer.lastHeaders.Get("conversation_id"))
+	// The synthetic test turn metadata is malformed; the gateway rebuilds a
+	// minimal legal projection instead of forwarding a partial identity.
+	require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
+	// Generic request isolation may still derive a request id from the session
+	// anchor; it must not be the raw downstream cache key.
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
+	require.NotEqual(t, "pcache_passthrough", captureDialer.lastHeaders.Get("x-client-request-id"))
+	// v2 carries turn state inside response.create metadata rather than the
+	// passthrough handshake header.
+	require.Empty(t, captureDialer.lastHeaders.Get(openAIWSTurnStateHeader))
+	require.NotEqual(t, "turn-meta-1", captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader))
+	require.True(t, gjson.Valid(captureDialer.lastHeaders.Get(openAIWSTurnMetadataHeader)),
+		"malformed turn metadata must be replaced with a legal identity object")
 	require.Len(t, upstreamConn.writes, 1)
 	forwarded := requestToJSONString(upstreamConn.writes[0])
 	require.True(t, gjson.Get(forwarded, `input.#(type=="custom_tool_call")`).Exists())

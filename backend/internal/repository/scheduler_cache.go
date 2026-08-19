@@ -1033,10 +1033,13 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		"openai_oauth_passthrough",
 		"openai_compact_mode",
 		"openai_compact_supported",
-		"openai_device_id",
-		"openai_session_id",
+		// Keep the explicit Codex lifecycle configuration in the pre-hydration
+		// projection. The full account payload already carries these values; doing
+		// the same here prevents selection and hydration from observing different
+		// fingerprint generations. Legacy device/session keys stay retired.
 		"codex_fingerprint_mode",
 		"codex_fingerprint_seed",
+		service.CodexFingerprintRecoveryRequiredExtraKey,
 		"privacy_mode",
 		"session_window_utilization",
 		"passive_usage_7d_utilization",

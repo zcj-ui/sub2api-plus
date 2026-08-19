@@ -95,17 +95,17 @@ const antigravityUserAgentVersionCacheTTL = 60 * time.Second
 const antigravityUserAgentVersionErrorTTL = 5 * time.Second
 const antigravityUserAgentVersionDBTimeout = 5 * time.Second
 
-// DefaultOpenAICodexUserAgent 是 OpenAI Codex 默认 User-Agent，用于规避浏览器 UA 的质询。
-// 默认采用 codex-tui 身份，版本段随 codexCLIVersion 一起更新。
+// DefaultOpenAICodexUserAgent is the default OpenAI Codex User-Agent. Its
+// version segment stays aligned with codexCLIVersion.
 const DefaultOpenAICodexUserAgent = codexCLIUserAgent
 
-// cachedOpenAICodexUserAgent 缓存 OpenAI Codex UA（进程内缓存，60s TTL）
+// cachedOpenAICodexUserAgent caches the configured OpenAI Codex User-Agent.
 type cachedOpenAICodexUserAgent struct {
 	value     string
 	expiresAt int64 // unix nano
 }
 
-// cachedOpenAICodexClientVersion 缓存出站 Codex 客户端版本号（进程内缓存，60s TTL）
+// cachedOpenAICodexClientVersion caches the effective outgoing Codex version.
 type cachedOpenAICodexClientVersion struct {
 	version   string
 	expiresAt int64 // unix nano
@@ -260,8 +260,8 @@ func (s *SettingService) GetAntigravityUserAgentVersion(ctx context.Context) str
 	return fallback
 }
 
-// GetOpenAICodexUserAgent 返回 OpenAI Codex 上游请求使用的 User-Agent。
-// 后台设置优先；为空时回退到内置默认值。
+// GetOpenAICodexUserAgent returns the configured OpenAI Codex User-Agent.
+// It is used as the source shape for the normalized outbound identity.
 func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 	fallback := DefaultOpenAICodexUserAgent
 	if s == nil || s.settingRepo == nil {
@@ -309,10 +309,8 @@ func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 	return fallback
 }
 
-// GetOpenAICodexClientVersion 返回出站声明的 Codex 客户端版本号。
-// 优先级：管理员在面板覆写的版本 → 自动同步到的官方最新稳定版 → 内置常量。
-// 上游在容量紧张时按客户端身份分优先级降载，陈旧版本会被优先丢弃，故该值需保持跟随官方发布；
-// 自动同步让运维不必为了跟版本而发新版本。
+// GetOpenAICodexClientVersion returns the effective outgoing Codex client
+// version: manual override, synced stable release, then built-in fallback.
 func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string {
 	fallback := codexCLIVersion
 	if s == nil || s.settingRepo == nil {
@@ -366,8 +364,7 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 	return fallback
 }
 
-// InvalidateOpenAICodexClientVersionCache 丢弃版本号缓存，下次读取回源。
-// 面板保存与自动同步写入后调用。
+// InvalidateOpenAICodexClientVersionCache drops the cached effective version.
 func (s *SettingService) InvalidateOpenAICodexClientVersionCache() {
 	if s == nil {
 		return
@@ -376,13 +373,8 @@ func (s *SettingService) InvalidateOpenAICodexClientVersionCache() {
 	s.openAICodexVersionCache.Store((*cachedOpenAICodexClientVersion)(nil))
 }
 
-// GetOpenAICodexCanonicalUserAgent 返回出站规范 Codex User-Agent。
-// 未填面板 UA 时按当前生效的客户端版本号拼出标准 Codex TUI UA。
-//
-// 面板 UA 只贡献客户端名与 OS / 架构 / 终端指纹，版本段一律用生效版本重建：该输入框是
-// 唯一能改 UA 后缀的地方，但它填写于某个历史版本，逐字沿用会把出站身份永久钉死在陈旧
-// 版本上并绕过自动同步——而陈旧身份正是上游优先降载的那一侧。
-// 需要固定版本请填「Codex 客户端版本号」并关闭自动同步。
+// GetOpenAICodexCanonicalUserAgent returns a canonical Codex User-Agent with
+// the configured client shape and the current effective version kept in sync.
 func (s *SettingService) GetOpenAICodexCanonicalUserAgent(ctx context.Context) string {
 	if s == nil {
 		return codexCLIUserAgent
@@ -395,8 +387,6 @@ func (s *SettingService) GetOpenAICodexCanonicalUserAgent(ctx context.Context) s
 	if rebuilt := openai.SetCodexUserAgentVersion(ua, version); rebuilt != "" {
 		return rebuilt
 	}
-	// 非 `{client}/{version}` 形态：交给 PairCodexClientIdentity 判定，
-	// 推导不出官方身份时由收口整体回退规范身份。
 	return ua
 }
 

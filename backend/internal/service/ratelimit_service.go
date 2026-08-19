@@ -20,21 +20,23 @@ import (
 
 // RateLimitService 处理限流和过载状态管理
 type RateLimitService struct {
-	accountRepo           AccountRepository
-	usageRepo             UsageLogRepository
-	cfg                   *config.Config
-	geminiQuotaService    *GeminiQuotaService
-	tempUnschedCache      TempUnschedCache
-	timeoutCounterCache   TimeoutCounterCache
-	openAI429CounterCache OpenAI429CounterCache
-	openAI403CounterCache OpenAI403CounterCache
-	settingService        *SettingService
-	tokenCacheInvalidator TokenCacheInvalidator
-	runtimeBlocker        AccountRuntimeBlocker
-	usageCacheMu          sync.RWMutex
-	usageCache            map[int64]*geminiUsageCacheEntry
-	openAI429Locks        sync.Map
-	openAI429Streak       sync.Map
+	accountRepo            AccountRepository
+	usageRepo              UsageLogRepository
+	cfg                    *config.Config
+	geminiQuotaService     *GeminiQuotaService
+	tempUnschedCache       TempUnschedCache
+	timeoutCounterCache    TimeoutCounterCache
+	openAI429CounterCache  OpenAI429CounterCache
+	openAI403CounterCache  OpenAI403CounterCache
+	settingService         *SettingService
+	tokenCacheInvalidator  TokenCacheInvalidator
+	runtimeBlocker         AccountRuntimeBlocker
+	usageCacheMu           sync.RWMutex
+	usageCache             map[int64]*geminiUsageCacheEntry
+	openAI429Locks         sync.Map
+	openAI429Streak        sync.Map
+	openaiTeamLinkedMu     sync.Mutex
+	openaiTeamLinkedRecent map[string]time.Time
 }
 
 type AccountRuntimeBlocker interface {
@@ -90,12 +92,13 @@ const (
 // NewRateLimitService 创建RateLimitService实例
 func NewRateLimitService(accountRepo AccountRepository, usageRepo UsageLogRepository, cfg *config.Config, geminiQuotaService *GeminiQuotaService, tempUnschedCache TempUnschedCache) *RateLimitService {
 	return &RateLimitService{
-		accountRepo:        accountRepo,
-		usageRepo:          usageRepo,
-		cfg:                cfg,
-		geminiQuotaService: geminiQuotaService,
-		tempUnschedCache:   tempUnschedCache,
-		usageCache:         make(map[int64]*geminiUsageCacheEntry),
+		accountRepo:            accountRepo,
+		usageRepo:              usageRepo,
+		cfg:                    cfg,
+		geminiQuotaService:     geminiQuotaService,
+		tempUnschedCache:       tempUnschedCache,
+		usageCache:             make(map[int64]*geminiUsageCacheEntry),
+		openaiTeamLinkedRecent: make(map[string]time.Time),
 	}
 }
 
@@ -368,6 +371,9 @@ func (s *RateLimitService) CheckErrorPolicy(ctx context.Context, account *Accoun
 // 返回是否应该停止该账号的调度
 func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, requestedModel ...string) (shouldDisable bool) {
 	ctx = withTempUnschedulableModel(ctx, requestedModel)
+	// Team-linked workspace failures must fan out before pool/custom policies
+	// return early; the helper is narrowly gated and short-window deduplicated.
+	s.maybeHandleOpenAITeamLinkedError(ctx, account, statusCode, responseBody)
 	if account.IsOpenAIOAuth() && !account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
 		if statusCode != http.StatusTooManyRequests {
 			s.clearOpenAIOAuth429StreakContext(ctx, account.ID)

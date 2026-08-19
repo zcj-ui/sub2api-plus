@@ -190,6 +190,57 @@ describe('ImportDataModal', () => {
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.dataImportSuccess')
   })
 
+  it('accepts all supported OpenAI-compatible providers and preserves account metadata', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
+      proxy_created: 0,
+      proxy_reused: 0,
+      proxy_failed: 0,
+      account_created: 3,
+      account_failed: 0
+    })
+
+    const metadata = {
+      chatgpt_account_id: 'team-workspace-1',
+      chatgpt_user_id: 'member-1',
+      plan_type: 'team',
+      k12: true,
+      subscription_profile: {
+        id: 'subscription-1',
+        tier: 'k12'
+      }
+    }
+    const accounts = ['kimi', 'zhipu', 'deepseek'].map((platform) => ({
+      ...makeAccount(platform),
+      platform,
+      credentials: {
+        access_token: `${platform}-token`,
+        ...metadata
+      },
+      extra: {
+        subscription_profile: metadata.subscription_profile,
+        custom_import_marker: platform
+      }
+    }))
+
+    const wrapper = mountModal()
+    const input = wrapper.find('input[type="file"]')
+    setInputFiles(input.element, [
+      makeJsonFile(
+        'providers.json',
+        JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts })
+      )
+    ])
+
+    await input.trigger('change')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    expect(adminAPI.accounts.importData).toHaveBeenCalledTimes(1)
+    const importedAccounts = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]?.data.accounts
+    expect(importedAccounts).toEqual(accounts)
+  })
+
   it('preserves the backup 429 setting unless an explicit import override is selected', async () => {
     const { adminAPI } = await import('@/api/admin')
     vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
@@ -210,6 +261,89 @@ describe('ImportDataModal', () => {
 
     const importPayload = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]
     expect(importPayload).not.toHaveProperty('codex_429_guard_enabled')
+  })
+
+  it('preserves an explicit Codex fingerprint lifecycle in the submitted import', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
+      proxy_created: 0,
+      proxy_reused: 0,
+      proxy_failed: 0,
+      account_created: 1,
+      account_failed: 0
+    })
+    const wrapper = mountModal()
+    const input = wrapper.find('input[type="file"]')
+    const legacyAccount = {
+      ...makeAccount('legacy-codex'),
+      extra: {
+        codex_fingerprint_mode: 'full',
+        codex_fingerprint_seed: '01234567-89ab-1cde-8fab-0123456789ab',
+        openai_device_id: 'legacy-device',
+        openai_session_id: 'legacy-session',
+        openai_codex_429_guard_enabled: true,
+        preserved_setting: 'keep-me'
+      }
+    }
+    setInputFiles(input.element, [
+      makeJsonFile(
+        'legacy-codex.json',
+        JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [legacyAccount] })
+      )
+    ])
+
+    await input.trigger('change')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    expect(adminAPI.accounts.importData).toHaveBeenCalledTimes(1)
+    const extra = vi.mocked(adminAPI.accounts.importData).mock.calls[0]?.[0]?.data.accounts[0]?.extra
+    expect(extra).toEqual({
+      codex_fingerprint_mode: 'full',
+      codex_fingerprint_seed: '01234567-89ab-1cde-8fab-0123456789ab',
+      openai_device_id: 'legacy-device',
+      openai_session_id: 'legacy-session',
+      openai_codex_429_guard_enabled: true,
+      preserved_setting: 'keep-me'
+    })
+  })
+
+  it('rejects malformed or misplaced fingerprint data', async () => {
+    const { adminAPI } = await import('@/api/admin')
+    vi.mocked(adminAPI.accounts.importData).mockResolvedValue({
+      proxy_created: 0,
+      proxy_reused: 0,
+      proxy_failed: 0,
+      account_created: 1,
+      account_failed: 0
+    })
+    const wrapper = mountModal()
+    const input = wrapper.find('input[type="file"]')
+    const legacyAccount = {
+      ...makeAccount('legacy-non-openai'),
+      platform: 'anthropic',
+      type: 'apikey',
+      extra: {
+        codex_fingerprint_mode: { stale: true },
+        codex_fingerprint_seed: false,
+        openai_device_id: ['legacy-device'],
+        openai_session_id: { stale: 'session' },
+        preserved_setting: 'keep-me'
+      }
+    }
+    setInputFiles(input.element, [
+      makeJsonFile(
+        'legacy-non-openai.json',
+        JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [legacyAccount] })
+      )
+    ])
+
+    await input.trigger('change')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    expect(adminAPI.accounts.importData).not.toHaveBeenCalled()
+    expect(showError).toHaveBeenCalledWith('admin.accounts.dataImportInvalidFile')
   })
 
   it('sends an explicit 429 override after the import switch is changed', async () => {

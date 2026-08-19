@@ -920,6 +920,7 @@
           <input
             v-model="enableCodexFingerprintMode"
             type="checkbox"
+            data-testid="bulk-codex-fingerprint-mode-enabled"
             class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
           />
         </div>
@@ -1564,6 +1565,7 @@ const enableOpenAIAPIKeyWSMode = ref(false)
 const enableUpstreamBillingAutoProbe = ref(false)
 const enableCodexCLIOnly = ref(false)
 const enableCodexCLIOnlyAppServer = ref(false)
+const enableCodexFingerprintMode = ref(false)
 const enableCodex429Guard = ref(false)
 const enableAllowOverages = ref(false)
 const enableOpenAICompactMode = ref(false)
@@ -1599,6 +1601,8 @@ const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OF
 const upstreamBillingAutoProbeMode = ref<'enabled' | 'disabled'>('enabled')
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
+type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
+const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codex429GuardEnabled = ref(false)
 const allowOveragesEnabled = ref(false)
 
@@ -1611,14 +1615,11 @@ const handleBulkAllowOveragesChange = (enabled: boolean) => {
   // because the lightweight selection metadata intentionally excludes secrets.
   allowOveragesEnabled.value = window.confirm(t('admin.accounts.allowOveragesProConfirm'))
 }
-// Only device convergence is protocol-compatible without a stateful session
-// graph; session/full remain backend legacy values and are not selectable.
-type CodexFingerprintMode = 'off' | 'device'
-const enableCodexFingerprintMode = ref(false)
-const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
-  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') }
+  { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
+  { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
+  { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
 const openAICompactMode = ref<OpenAICompactMode>('auto')
 const openAICompactModelMappings = ref<ModelMapping[]>([])
@@ -1907,9 +1908,8 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
 
   if (enableCodexFingerprintMode.value && allOpenAIOAuthOnly.value) {
     const extra = ensureExtra()
-    // Bulk updates use JSONB merge semantics. A null value is an explicit
-    // delete instruction handled by the repository; writing the string "off"
-    // would leave stale device state in older snapshots.
+    // Bulk updates use JSONB merge semantics; null explicitly clears a
+    // previous account-level override while off remains the default.
     extra.codex_fingerprint_mode = codexFingerprintMode.value === 'off'
       ? null
       : codexFingerprintMode.value
@@ -2038,9 +2038,9 @@ const handleSubmit = async () => {
     enableUpstreamBillingAutoProbe.value ||
     enableCodexCLIOnly.value ||
     enableCodexCLIOnlyAppServer.value ||
+    enableCodexFingerprintMode.value ||
     enableCodex429Guard.value ||
     enableAllowOverages.value ||
-    enableCodexFingerprintMode.value ||
     enableOpenAICompactMode.value ||
     enableOpenAICompactModelMapping.value ||
     enableRpmLimit.value ||
@@ -2175,12 +2175,12 @@ watch(
       enableUpstreamBillingAutoProbe.value = false
       enableCodexCLIOnly.value = false
       enableCodexCLIOnlyAppServer.value = false
+      enableCodexFingerprintMode.value = false
+      codexFingerprintMode.value = 'off'
       enableCodex429Guard.value = false
       codex429GuardEnabled.value = false
       enableAllowOverages.value = false
       allowOveragesEnabled.value = false
-      enableCodexFingerprintMode.value = false
-      codexFingerprintMode.value = 'off'
       enableOpenAICompactMode.value = false
       enableOpenAICompactModelMapping.value = false
       enableRpmLimit.value = false

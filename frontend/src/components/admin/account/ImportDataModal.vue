@@ -253,7 +253,20 @@ const readFileAsText = async (sourceFile: File): Promise<string> => {
 
 const SUPPORTED_DATA_TYPES = ['sub2api-data', 'sub2api-bundle']
 const SUPPORTED_DATA_VERSION = 1
-const SUPPORTED_ACCOUNT_PLATFORMS = new Set(['anthropic', 'openai', 'gemini', 'antigravity', 'grok'])
+// Keep this in sync with the account-data endpoint's quota platform list. The
+// three OpenAI-compatible CN providers are valid account exports too; rejecting
+// them here would prevent the backend from ever seeing an otherwise valid
+// backup.
+const SUPPORTED_ACCOUNT_PLATFORMS = new Set([
+  'anthropic',
+  'openai',
+  'gemini',
+  'antigravity',
+  'grok',
+  'kimi',
+  'zhipu',
+  'deepseek'
+])
 const SUPPORTED_ACCOUNT_TYPES = new Set(['oauth', 'setup-token', 'apikey', 'upstream', 'bedrock', 'service_account'])
 
 // 与后端 validateDataHeader 对齐:合并前逐文件校验,避免坏文件混入合并 payload 后
@@ -295,7 +308,7 @@ const isValidDataPayload = (payload: unknown): payload is AdminDataPayload => {
     }
     const fingerprintSeed = (extra as Record<string, unknown>).codex_fingerprint_seed
     if (fingerprintSeed !== undefined && fingerprintSeed !== null) {
-      if (typeof fingerprintSeed !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(fingerprintSeed.trim())) return false
+      if (typeof fingerprintSeed !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(fingerprintSeed.trim()) || fingerprintSeed.trim().toLowerCase() === '00000000-0000-0000-0000-000000000000') return false
       if (account.platform !== 'openai' || account.type !== 'oauth') return false
     }
     const codex429Guard = (extra as Record<string, unknown>).openai_codex_429_guard_enabled
@@ -306,6 +319,32 @@ const isValidDataPayload = (payload: unknown): payload is AdminDataPayload => {
     return true
   })
 }
+
+// Keep the persisted Codex lifecycle spelling canonical before the payload
+// reaches the backend. Validation accepts legacy case/whitespace for backward
+// compatibility, while account editors and runtime lookups use lowercase
+// values only. UUID seeds are normalized to lowercase as well so a restored
+// export is not needlessly re-minted by the server.
+const normalizeCodexFingerprintModes = (payload: AdminDataPayload): AdminDataPayload => ({
+  ...payload,
+  accounts: payload.accounts.map((account) => {
+    const rawExtra = account.extra
+    if (!rawExtra || typeof rawExtra !== 'object') return account
+
+    const mode = rawExtra.codex_fingerprint_mode
+    const seed = rawExtra.codex_fingerprint_seed
+    if (typeof mode !== 'string' && typeof seed !== 'string') return account
+
+    const extra = { ...rawExtra }
+    if (typeof mode === 'string') {
+      extra.codex_fingerprint_mode = mode.trim().toLowerCase()
+    }
+    if (typeof seed === 'string') {
+      extra.codex_fingerprint_seed = seed.trim().toLowerCase()
+    }
+    return { ...account, extra }
+  })
+})
 
 const importAccountUsesProOverages = (account: AdminDataPayload['accounts'][number]) => {
   if (account.platform !== 'antigravity' || account.extra?.allow_overages !== true) return false
@@ -354,7 +393,7 @@ const handleImport = async () => {
       }
       dataPayloads.push(parsed)
     }
-    const dataPayload = mergeDataPayloads(dataPayloads)
+    const dataPayload = normalizeCodexFingerprintModes(mergeDataPayloads(dataPayloads))
     const importsOverages = dataPayload.accounts.some(
       (account) => account.platform === 'antigravity' && account.extra?.allow_overages === true
     )

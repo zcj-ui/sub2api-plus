@@ -2548,7 +2548,9 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待第二个上游收到重放首帧超时")
 	}
-	require.Equal(t, []int64{int64(9902)}, accountRepo.rateLimitedIDs)
+	// API-key accounts and semantic-only WebSocket rate-limit events must still
+	// fail over, but they must not enter the OAuth-only account 429 state.
+	require.Empty(t, accountRepo.rateLimitedIDs)
 }
 
 func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClientForOneFailover(t *testing.T) {

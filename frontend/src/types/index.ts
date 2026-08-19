@@ -1449,6 +1449,7 @@ export interface UpdateAccountRequest {
   type?: AccountType
   credentials?: Record<string, unknown>
   extra?: Record<string, unknown>
+  codex_fingerprint_mode_touched?: boolean
   proxy_id?: number | null
   concurrency?: number
   load_factor?: number | null

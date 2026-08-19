@@ -321,12 +321,12 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 	// changes only the persisted installation identity.
 	require.NotEmpty(t, upstream.lastReq.Header.Get("session-id"))
 	require.Equal(t, upstream.lastReq.Header.Get("session-id"), upstream.lastReq.Header.Get("session_id"))
-	require.Empty(t, upstream.lastReq.Header.Get("x-codex-installation-id"),
-		"native remote compaction v2 uses body client_metadata, not the compact-only direct header")
+	require.Equal(t, resolveConvergedInstallationID(&account), upstream.lastReq.Header.Get("x-codex-installation-id"),
+		"compact probe must keep the direct installation projection aligned with client_metadata")
 	require.Equal(t, resolveConvergedInstallationID(&account),
 		gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
 	require.NotContains(t, upstream.lastReq.Header.Get("session-id"), "probe_compact",
-		"探测标识不得是可被上游一眼识别的字面量")
+		"probe identity must not be a recognizable literal")
 	<-updateCalls
 }
 

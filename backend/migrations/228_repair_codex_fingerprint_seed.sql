@@ -1,4 +1,7 @@
 -- Repair non-empty but malformed seeds left by early opt-in implementations.
+-- The seed is opaque account state, so every canonical non-nil UUID version is
+-- valid.  Restricting this to UUIDv4 would silently rotate valid imported v1/v5
+-- identities before migration 229 can canonicalize their casing.
 -- Keep this as a new forward migration so deployments that already recorded
 -- migration 225 do not encounter a checksum mismatch.
 UPDATE accounts
@@ -13,5 +16,6 @@ WHERE platform = 'openai'
   AND extra->>'codex_fingerprint_mode' IN ('device', 'session', 'full')
   AND (
     NULLIF(BTRIM(extra->>'codex_fingerprint_seed'), '') IS NULL
-    OR BTRIM(extra->>'codex_fingerprint_seed') !~* '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    OR BTRIM(extra->>'codex_fingerprint_seed') !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    OR LOWER(BTRIM(extra->>'codex_fingerprint_seed')) = '00000000-0000-0000-0000-000000000000'
   );

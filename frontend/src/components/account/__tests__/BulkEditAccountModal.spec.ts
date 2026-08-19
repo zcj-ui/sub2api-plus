@@ -303,6 +303,30 @@ describe('BulkEditAccountModal', () => {
     })
   })
 
+  it('supports selecting and applying the full fingerprint lifecycle in bulk edits', async () => {
+    const wrapper = mountModal({
+      selectedPlatforms: ['openai'],
+      selectedTypes: ['oauth']
+    })
+
+    const enable = wrapper.get('[data-testid="bulk-codex-fingerprint-mode-enabled"]')
+    await enable.setValue(true)
+    const select = wrapper.get('[data-testid="bulk-codex-fingerprint-mode-select"]')
+    expect(select.findAll('option').map((option) => option.attributes('value'))).toEqual([
+      'off',
+      'device',
+      'session',
+      'full'
+    ])
+    await select.setValue('full')
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).toHaveBeenCalledWith([1, 2], {
+      extra: { codex_fingerprint_mode: 'full' }
+    })
+  })
+
   it.each([
     [['openai'], ['apikey']],
     [['openai'], ['setup-token']],
@@ -326,7 +350,6 @@ describe('BulkEditAccountModal', () => {
     })
 
     expect(wrapper.find('#bulk-edit-openai-flatten-namespaces-enabled').exists()).toBe(false)
-    expect(wrapper.find('[data-testid="bulk-codex-fingerprint-mode-select"]').exists()).toBe(false)
     expect(wrapper.find('#bulk-edit-codex-429-guard-enabled').exists()).toBe(false)
   })
 

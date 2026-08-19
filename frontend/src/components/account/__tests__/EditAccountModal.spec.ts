@@ -502,6 +502,73 @@ describe('EditAccountModal', () => {
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra?.openai_codex_429_guard_enabled).toBe(false)
   })
 
+  it('loads and saves the selected full fingerprint lifecycle while preserving the 429 guard', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      codex_fingerprint_mode: 'full',
+      codex_fingerprint_seed: '01234567-89ab-4cde-8fab-0123456789ab',
+      openai_device_id: 'legacy-device',
+      openai_session_id: 'legacy-session',
+      openai_codex_429_guard_enabled: true,
+      preserved_setting: 'keep-me'
+    }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const fingerprintSelect = wrapper.get('[data-testid="edit-codex-fingerprint-mode-select"]')
+    expect((fingerprintSelect.element as HTMLSelectElement).value).toBe('full')
+    expect(wrapper.get('[data-testid="edit-codex-429-guard-toggle"]').attributes('aria-checked')).toBe('true')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const extra = updateAccountMock.mock.calls[0]?.[1]?.extra
+    expect(extra).toMatchObject({
+      openai_codex_429_guard_enabled: true,
+      codex_fingerprint_mode: 'full',
+      codex_fingerprint_seed: '01234567-89ab-4cde-8fab-0123456789ab',
+      openai_device_id: 'legacy-device',
+      openai_session_id: 'legacy-session',
+      preserved_setting: 'keep-me'
+    })
+  })
+
+  it('sends an explicit null when the administrator selects off', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = {
+      codex_fingerprint_mode: 'device',
+      codex_fingerprint_seed: '01234567-89ab-4cde-8fab-0123456789ab',
+      codex_fingerprint_recovery_required: true
+    }
+    updateAccountMock.mockReset()
+    checkMixedChannelRiskMock.mockReset()
+    checkMixedChannelRiskMock.mockResolvedValue({ has_risk: false })
+    updateAccountMock.mockResolvedValue(account)
+
+    const wrapper = mountModal(account)
+    const fingerprintSelect = wrapper.get('[data-testid="edit-codex-fingerprint-mode-select"]')
+    await fingerprintSelect.setValue('off')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).toHaveProperty(
+      'codex_fingerprint_mode',
+      null
+    )
+    expect(updateAccountMock.mock.calls[0]?.[1]?.codex_fingerprint_mode_touched).toBe(true)
+  })
+
+  it('shows the recovery warning for historically ambiguous fingerprint modes', async () => {
+    const account = buildAccount()
+    account.type = 'oauth'
+    account.extra = { codex_fingerprint_recovery_required: true }
+    const wrapper = mountModal(account)
+    expect(wrapper.get('[data-testid="edit-codex-fingerprint-recovery-warning"]').exists()).toBe(true)
+  })
+
   it('hides and omits the 429 guard for OpenAI API key accounts', async () => {
     const account = buildAccount()
     account.extra = { openai_codex_429_guard_enabled: true }
@@ -520,10 +587,11 @@ describe('EditAccountModal', () => {
     )
   })
 
-  it('does not render or submit fingerprint and 429 guard settings for Spark shadows', async () => {
+  it('does not render or submit the 429 guard for Spark shadows', async () => {
     const account = buildOpenAISparkShadowAccount()
     account.extra = {
       codex_fingerprint_mode: 'device',
+      codex_fingerprint_seed: '01234567-89ab-4cde-8fab-0123456789ab',
       openai_codex_429_guard_enabled: true
     }
     updateAccountMock.mockReset()
@@ -532,13 +600,13 @@ describe('EditAccountModal', () => {
     updateAccountMock.mockResolvedValue(account)
 
     const wrapper = mountModal(account)
-    expect(wrapper.find('[data-testid="edit-codex-fingerprint-mode-select"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="edit-codex-429-guard-toggle"]').exists()).toBe(false)
 
     await wrapper.get('form#edit-account-form').trigger('submit.prevent')
 
     expect(updateAccountMock).toHaveBeenCalledTimes(1)
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('codex_fingerprint_mode')
+    expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty('codex_fingerprint_seed')
     expect(updateAccountMock.mock.calls[0]?.[1]?.extra).not.toHaveProperty(
       'openai_codex_429_guard_enabled'
     )

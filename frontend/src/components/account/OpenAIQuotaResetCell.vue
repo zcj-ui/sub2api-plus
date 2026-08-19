@@ -459,6 +459,26 @@ watch(
   }
 )
 
+// The accounts table can patch an existing row in place after a quota
+// inventory/refresh. In that case the component instance is reused and the
+// account id does not change, so the id watcher above is not enough to
+// rehydrate the persisted reset-credit snapshot. Keep the live response
+// untouched while a request is in flight; once it settles, a changed snapshot
+// becomes the authoritative cached state for the row.
+watch(
+  () => [
+    props.account.extra?.codex_reset_credit_snapshot,
+    props.account.extra?.codex_credit_snapshot
+  ],
+  () => {
+    cachedData.value = readCachedResetCredits(props.account)
+    if (!loading.value && !resetting.value) {
+      data.value = cachedData.value
+    }
+  },
+  { deep: true }
+)
+
 watch(
   resetCreditExpirations,
   () => {

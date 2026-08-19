@@ -26,11 +26,9 @@ const (
 	openAICodexVersionTagPrefix = "rust-v"
 )
 
-// OpenAICodexVersionSyncService 周期性把官方 Codex 客户端的最新稳定版版本号同步到设置，
-// 供出站规范身份使用，避免为了跟上游版本而发新版本。
-//
-// 同步值写入 SettingKeyOpenAICodexClientVersionSynced（本服务独占写入）；管理员在面板填写的
-// SettingKeyOpenAICodexClientVersion 优先级更高，因此手工固定版本不会被同步覆盖。
+// OpenAICodexVersionSyncService is retained to read or migrate legacy version
+// settings. Production wiring does not start it because stored versions must not
+// influence OpenAI/Codex outbound identity.
 type OpenAICodexVersionSyncService struct {
 	settingRepo    SettingRepository
 	settingService *SettingService

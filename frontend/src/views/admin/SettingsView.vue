@@ -5672,10 +5672,10 @@
                     )
                   }}
                 </label>
-                <input
-                  v-model="form.openai_codex_user_agent"
-                  type="text"
-                  class="input w-full font-mono text-sm"
+                  <input
+                    v-model="form.openai_codex_user_agent"
+                    type="text"
+                    class="input w-full font-mono text-sm"
                   :placeholder="
                     t(
                       'admin.settings.gatewayForwarding.openaiCodexUserAgentPlaceholder',
@@ -5702,10 +5702,10 @@
                     )
                   }}
                 </label>
-                <input
-                  v-model="form.openai_codex_client_version"
-                  type="text"
-                  class="input w-full font-mono text-sm"
+                  <input
+                    v-model="form.openai_codex_client_version"
+                    type="text"
+                    class="input w-full font-mono text-sm"
                   :placeholder="
                     t(
                       'admin.settings.gatewayForwarding.openaiCodexClientVersionPlaceholder',

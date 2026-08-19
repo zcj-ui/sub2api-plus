@@ -88,8 +88,9 @@ func hasOpenAICodexBetaFeaturesHeader(h http.Header) bool {
 	return false
 }
 
-// applyOpenAICodexBetaFeatures 按真实 Codex 的会话级行为补注
-// x-codex-beta-features。
+// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
+// Native remote compaction v2 is the only wire shape that requires the
+// gateway to add its explicit capability token.
 //
 // codex 侧规则（codex-rs：session/mod.rs build_model_client_beta_features_header
 // 组装、client.rs build_responses_headers 附加）：该头是**会话级常量**，挂在
@@ -117,15 +118,7 @@ func applyOpenAICodexBetaFeatures(c *gin.Context, account *Account, h http.Heade
 	}
 	if isOpenAINativeCompactionV2(c) {
 		ensureOpenAIRemoteCompactionV2BetaFeature(h)
-		return
 	}
-	if account == nil || !account.IsOpenAIOAuth() {
-		return
-	}
-	if hasOpenAICodexBetaFeaturesHeader(h) {
-		return
-	}
-	h.Set("x-codex-beta-features", openAIRemoteCompactionV2Feature)
 }
 
 // HasCompactionTriggerInInput detects an input item with

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -330,15 +329,4 @@ func TestSanitizeOpenAICapacityShedErrorCodeMissingCode(t *testing.T) {
 	out, changed = sanitizeOpenAICapacityShedErrorCodeForClient(capacity)
 	require.True(t, changed)
 	require.Equal(t, "server_error", gjson.GetBytes(out, "response.error.code").String())
-}
-
-func TestCodexOutboundVersionHasSingleSource(t *testing.T) {
-	require.True(t,
-		strings.HasPrefix(codexCLIUserAgent, openai.CodexDefaultOriginator+"/"+codexCLIVersion+" "),
-		"codexCLIUserAgent=%q 必须以 codexCLIVersion=%q 作为版本段", codexCLIUserAgent, codexCLIVersion,
-	)
-	require.Equal(t, codexCLIVersion, openAICodexProbeVersion)
-	require.GreaterOrEqual(t, CompareVersions(codexCLIVersion, codexUpstreamMinVersion), 0,
-		"codexCLIVersion=%q 不得低于上游最低门槛 %q", codexCLIVersion, codexUpstreamMinVersion,
-	)
 }

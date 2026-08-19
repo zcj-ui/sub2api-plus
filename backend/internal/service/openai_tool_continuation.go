@@ -397,7 +397,7 @@ func isCodexSyntheticAgentContextJSONItem(item gjson.Result) bool {
 	}
 	itemType := strings.TrimSpace(item.Get("type").String())
 	callID := strings.TrimSpace(item.Get("call_id").String())
-	if !strings.HasPrefix(callID, codexSyntheticAgentContextCallPrefix) {
+	if !isCodexSyntheticAgentContextCallID(callID) {
 		return false
 	}
 	switch itemType {

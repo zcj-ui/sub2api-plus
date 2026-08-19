@@ -89,7 +89,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
-	setOpenAIWSTurnMetadata(payload, turnMetadata)
+	var inboundHeaders http.Header
+	if c != nil && c.Request != nil {
+		inboundHeaders = c.Request.Header
+	}
+	protocolOptions := openAIWSResponseCreateProtocolOptionsFromHeaders(inboundHeaders, turnState)
+	normalizeOpenAIWSResponseCreatePayload(payload, protocolOptions)
 	payloadEventType := openAIWSPayloadString(payload, "type")
 	if payloadEventType == "" {
 		payloadEventType = "response.create"
@@ -126,6 +131,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			turnState = savedTurnState
 		}
 	}
+	protocolOptions.TurnState = turnState
+	normalizeOpenAIWSResponseCreatePayload(payload, protocolOptions)
 	preferredConnID := ""
 	if stateStore != nil && previousResponseID != "" {
 		if connID, ok := stateStore.GetResponseConn(previousResponseID); ok {
@@ -157,7 +164,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	storeDisabledConnMode := s.openAIWSStoreDisabledConnMode()
 	forceNewConnByPolicy := shouldForceNewConnOnStoreDisabled(storeDisabledConnMode, lastFailureReason)
 	forceNewConn := forceNewConnByPolicy && storeDisabled && previousResponseID == "" && sessionHash != "" && preferredConnID == ""
-	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
+	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeadersWithBody(
 		ctx,
 		c,
 		account,
@@ -169,10 +176,17 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		promptCacheKey,
 		openAIWSPayloadString(payload, "model"),
 		openAIWSPayloadString(payload, "service_tier"),
+		payloadAsJSONBytes(payload),
 	)
 	if buildHdrErr != nil {
 		return nil, fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
+	identityCompatibility, identityNeedsFreshConn := codexWSIdentityCompatibilityKey(
+		account,
+		c,
+		wsHeaders,
+		payloadAsJSONBytes(payload),
+	)
 	logOpenAIWSModeDebug(
 		"acquire_start account_id=%d account_type=%s transport=%s preferred_conn_id=%s has_previous_response_id=%v session_hash=%s has_turn_state=%v turn_state_len=%d has_turn_metadata=%v turn_metadata_len=%d store_disabled=%v store_disabled_conn_mode=%s retry_last_reason=%s force_new_conn=%v header_user_agent=%s header_openai_beta=%s header_originator=%s header_accept_language=%s header_session_id=%s header_conversation_id=%s session_id_source=%s conversation_id_source=%s has_prompt_cache_key=%v has_chatgpt_account_id=%v has_authorization=%v has_session_id=%v has_conversation_id=%v proxy_enabled=%v",
 		account.ID,
@@ -209,6 +223,12 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	defer acquireCancel()
 	blockBeforeAcquire := s.openAIAccountRuntimeBlockSnapshot(account.ID)
 
+	identityForceNew, identityForcePreferred := openAIWSIdentityAcquirePolicy(
+		identityNeedsFreshConn,
+		preferredConnID,
+		forcePreferredConn,
+		false,
+	)
 	lease, err := s.getOpenAIWSConnPool().Acquire(acquireCtx, openAIWSAcquireRequest{
 		Account: account,
 		WSURL:   wsURL,
@@ -216,10 +236,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
-		PreferredConnID:    preferredConnID,
-		ForcePreferredConn: forcePreferredConn,
-		ForceNewConn:       forceNewConn,
-		ProxyURL:           proxyURL,
+		PreferredConnID:       preferredConnID,
+		ForcePreferredConn:    identityForcePreferred,
+		ForceNewConn:          forceNewConn || identityForceNew,
+		IdentityCompatibility: identityCompatibility,
+		ProxyURL:              proxyURL,
 	})
 	if err != nil {
 		var agentDialErr *openAIWSDialError
@@ -254,8 +275,10 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			proxyURL != "",
 		)
 		var dialErr *openAIWSDialError
-		if errors.As(err, &dialErr) && dialErr != nil && dialErr.StatusCode == http.StatusTooManyRequests {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, nil, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()))
+		if errors.As(err, &dialErr) && dialErr != nil {
+			if dialStatus, rateLimited := openAIWSDialRateLimitStatus(err); rateLimited {
+				s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), dialStatus)
+			}
 		}
 		// A confirmed 429 guard deliberately keeps a healthy old socket alive.
 		// Once that exact pinned socket cannot be acquired, however, it is no
@@ -342,6 +365,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		len(handshakeTurnState),
 	)
 	if handshakeTurnState != "" {
+		protocolOptions.TurnState = handshakeTurnState
 		if stateStore != nil && sessionHash != "" {
 			stateStore.BindSessionTurnState(groupID, sessionHash, handshakeTurnState, s.openAIWSSessionStickyTTL())
 		}
@@ -371,6 +395,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		return nil, prewarmErr
 	}
 
+	// Match the CLI's per-send timing stamp. This follows optional prewarm so
+	// the business request never reuses the prewarm timestamp.
+	normalizeOpenAIWSResponseCreatePayload(payload, protocolOptions)
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
@@ -449,16 +476,17 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 	recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
 		if !isRateLimit || rateLimitSignalHandled {
 			return isRateLimit
 		}
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
 			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw)
+			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
 		}
 		rateLimitSignalHandled = true
-		if isRateLimit && guardLeaseMayRetain() {
+		if explicit429 && guardLeaseMayRetain() {
 			s.markOpenAI429GuardConnectionProof(account, lease)
 			if s.pinOpenAI429GuardConnection(account, lease.ConnID()) {
 				lease.openAI429GuardProven.Store(true)

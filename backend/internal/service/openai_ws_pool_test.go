@@ -151,6 +151,38 @@ func TestOpenAI429GuardPinKeepsOneLiveConnectionPerAccount(t *testing.T) {
 	require.False(t, pool.IsGuardConnPinned(accountID, second.id))
 }
 
+func TestOpenAIWSConnPool_PermanentGuardKeepsCodexIdentityIsolation(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	defer pool.Close()
+
+	account := &Account{ID: 15, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Concurrency: 1}
+	conn := newOpenAIWSConn("guard_identity", account.ID, nil, nil)
+	conn.handshakeCompatibility = openAIWSHandshakeCompatibilityKey{
+		betaFeatures: "remote_compaction_v2",
+		identity:     "codex:session-a",
+	}
+	ap := pool.getOrCreateAccountPool(account.ID)
+	ap.conns[conn.id] = conn
+	require.True(t, pool.PinGuardConn(account.ID, conn.id))
+
+	request := openAIWSAcquireRequest{
+		Account:               account,
+		WSURL:                 "wss://chatgpt.com/backend-api/codex/responses",
+		Headers:               http.Header{"X-Codex-Beta-Features": {"different-feature"}},
+		PreferredConnID:       conn.id,
+		ForcePreferredConn:    true,
+		IdentityCompatibility: "codex:session-b",
+	}
+	_, err := pool.Acquire(context.Background(), request)
+	require.ErrorIs(t, err, errOpenAIWSPreferredConnUnavailable)
+
+	// A permanent guard may keep the same identity across a beta feature change.
+	request.IdentityCompatibility = "codex:session-a"
+	lease, err := pool.Acquire(context.Background(), request)
+	require.NoError(t, err)
+	lease.Release()
+}
+
 func TestOpenAIWSConnPool_NextConnIDFormat(t *testing.T) {
 	pool := newOpenAIWSConnPool(&config.Config{})
 	id1 := pool.nextConnID(42)

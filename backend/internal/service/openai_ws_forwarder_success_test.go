@@ -935,12 +935,14 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthStoreFalseByDefault(t *testing.T
 	require.Equal(t, "native-wsv2", gjson.Get(requestJSON, "input.0.namespace").String(), "OAuth WSv2 应保留原生 namespace")
 	require.Equal(t, openAIWSBetaV2Value, captureDialer.lastHeaders.Get("OpenAI-Beta"))
 	require.Equal(t, "remote_compaction_v2", captureDialer.lastHeaders.Get("x-codex-beta-features"))
-	require.Equal(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, "conv-oauth-1", captureDialer.lastHeaders.Get("conversation_id"))
-	// Normal Responses-WebSocket identity carries device convergence through
-	// client_metadata; the direct installation header is reserved for compact.
-	require.Empty(t, captureDialer.lastHeaders.Get("x-codex-installation-id"))
-	require.Empty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
+	// Session mode derives a stable account-scoped session/thread graph from
+	// the supplied conversation aliases; it must not forward raw tenant IDs.
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("conversation_id"))
+	require.NotEqual(t, "conv-oauth-1", captureDialer.lastHeaders.Get("conversation_id"))
+	require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_OAuthOriginatorCompatibility(t *testing.T) {
@@ -1164,8 +1166,10 @@ func TestOpenAIGatewayService_Forward_WSv2_HeaderSessionFallbackFromPromptCacheK
 	require.NotNil(t, result)
 	require.Equal(t, "resp_prompt_cache_key", result.RequestID)
 
-	require.Equal(t, "pcache_123", captureDialer.lastHeaders.Get("session_id"))
-	require.Equal(t, "pcache_123", captureDialer.lastHeaders.Get("conversation_id"))
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
+	// A prompt_cache_key is a cache/session anchor, not an independent
+	// conversation identifier; session convergence must not invent this alias.
+	require.Empty(t, captureDialer.lastHeaders.Get("conversation_id"))
 	require.NotNil(t, captureConn.lastWrite)
 	require.True(t, gjson.Get(requestToJSONString(captureConn.lastWrite), "stream").Exists())
 }
@@ -1410,7 +1414,9 @@ func TestOpenAIGatewayService_Forward_WSv2_TurnStateAndMetadataReplayOnReconnect
 	secondHandshakeHeaders := <-headersCh
 	require.Equal(t, "turn_meta_1", firstHandshakeHeaders.Get("X-Codex-Turn-Metadata"))
 	require.Equal(t, "turn_meta_2", secondHandshakeHeaders.Get("X-Codex-Turn-Metadata"))
-	require.Equal(t, "turn_state_first", secondHandshakeHeaders.Get("X-Codex-Turn-State"))
+	// WS v2 carries the retained turn state in response.create metadata rather
+	// than replaying it as a handshake header on the next connection.
+	require.Empty(t, secondHandshakeHeaders.Get("X-Codex-Turn-State"))
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarm(t *testing.T) {
@@ -1671,7 +1677,7 @@ func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmSecond429PinsOldConnec
 
 	captureConn := &openAIWSCaptureConn{events: [][]byte{
 		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
-		[]byte(`{"type":"response.failed","response":{"id":"resp_second429_prewarm","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+			[]byte(`{"type":"response.failed","status_code":429,"response":{"id":"resp_second429_prewarm","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
 		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_main","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`),
 	}}
 	captureDialer := &openAIWSCaptureDialer{conn: captureConn}

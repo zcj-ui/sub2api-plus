@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -23,11 +24,75 @@ import (
 // turn_id 等随机字段一致。
 const codexFingerprintIDsContextKey = "codex_fingerprint_ids"
 
+// codexClientIdentityPassthroughContextKey records the identity decision made
+// at ingress, before any compatibility transform can rebuild the request body.
+// A complete official CLI snapshot must retain that decision for the lifetime
+// of the request: later model/tool normalization is allowed to change protocol
+// fields, but must never make the gateway start synthesizing a second client
+// identity.
+const codexClientIdentityPassthroughContextKey = "codex_client_identity_passthrough"
+
+// codexFingerprintClientClassificationContextKey freezes the client
+// classification made at ingress for downstream Codex-specific transforms.
+// Account-level fingerprint convergence itself is governed solely by the
+// explicit OAuth account mode, so a reverse proxy may safely remove the client
+// UA and lifecycle carriers without disabling the configured projection.
+const codexFingerprintClientClassificationContextKey = "codex_fingerprint_client_classification"
+
+func stageCodexFingerprintClientClassification(c *gin.Context, isCodexClient bool) {
+	if c == nil || !isCodexClient {
+		return
+	}
+	c.Set(codexFingerprintClientClassificationContextKey, true)
+}
+
+// shouldApplyCodexFingerprintForRequest follows the account-level opt-in
+// contract used by the official gateway: every OpenAI OAuth request uses the
+// selected non-off convergence mode, even when a reverse proxy has stripped
+// the Codex UA or lifecycle carriers. This is required for relays whose only
+// surviving signal is the selected OAuth account. Off remains a true pass-
+// through mode.
+func shouldApplyCodexFingerprintForRequest(c *gin.Context, account *Account, body []byte) bool {
+	_ = c
+	_ = body
+	return account != nil && account.IsOpenAIOAuth() && account.GetCodexFingerprintMode() != codexFingerprintOff
+}
+
+func hasCodexFingerprintIdentityCarrier(headers http.Header, body []byte) bool {
+	if headers != nil {
+		for _, name := range []string{
+			"x-codex-installation-id",
+			"session-id", "session_id",
+			"thread-id", "thread_id",
+			"x-codex-turn-metadata",
+			"x-codex-window-id",
+			"x-codex-parent-thread-id",
+		} {
+			if strings.TrimSpace(headers.Get(name)) != "" {
+				return true
+			}
+		}
+	}
+	projection := codexIdentityFromBody(body)
+	if !projection.valid {
+		return false
+	}
+	tuple := projection.tuple
+	return strings.TrimSpace(tuple.installationID) != "" ||
+		strings.TrimSpace(tuple.sessionID) != "" ||
+		strings.TrimSpace(tuple.threadID) != "" ||
+		strings.TrimSpace(tuple.turnID) != "" ||
+		strings.TrimSpace(tuple.windowID) != "" ||
+		strings.TrimSpace(tuple.parentThreadID) != ""
+}
+
 // stageCodexFingerprintIDs 将本 attempt 解析出的收敛 ID 暂存到 gin context。
 // 必须无条件覆写（含 nil）：failover 从收敛账号切到 off 账号时，上一账号的
 // IDs 不得残留并被误应用到新账号的出站头（typed-nil 由应用侧 nil 守卫吸收）。
 func stageCodexFingerprintIDs(c *gin.Context, ids *codexFingerprintIDs) {
 	if c != nil {
+		// Always replace the snapshot, including nil. A retry may switch accounts;
+		// retaining the previous account's IDs would leak its identity upstream.
 		c.Set(codexFingerprintIDsContextKey, ids)
 	}
 }
@@ -58,120 +123,14 @@ func applyStagedCodexFingerprintHeaders(c *gin.Context, account *Account, h http
 	applyCodexFingerprintHeaders(h, stagedCodexFingerprintIDs(c, account))
 }
 
-// applyStagedCodexCompactHeaders projects the request-scoped Codex identity
-// onto the legacy /responses/compact transport. Compact is not a Responses
-// turn: the official client sends installation/session/thread compatibility
-// headers and keeps prompt_cache_key in the body, but does not add
-// x-client-request-id or client_metadata to the compact payload.
-//
-// Canonical hyphenated headers are preferred. Legacy aliases are only used as
-// a fallback so existing tenant-isolation behavior remains intact for older
-// clients that do not send the Codex headers.
+// applyStagedCodexCompactHeaders is retained as a source-compatible hook for
+// older callers. The official compact protocol is outside fingerprint
+// convergence, so this function intentionally performs no projection.
 func applyStagedCodexCompactHeaders(c *gin.Context, account *Account, h http.Header, body []byte) {
-	if h == nil || account == nil || account.Type != AccountTypeOAuth {
-		return
-	}
-
-	var source http.Header
-	if c != nil && c.Request != nil {
-		source = c.Request.Header
-	}
-
-	var ids *codexFingerprintIDs
-	if c != nil {
-		if value, ok := c.Get(codexFingerprintIDsContextKey); ok {
-			ids, _ = value.(*codexFingerprintIDs)
-		}
-	}
-	// Compact projection is opt-in just like the normal fingerprint path. In
-	// off mode, leave the client's headers untouched rather than manufacturing
-	// canonical aliases on an otherwise generic request.
-	if ids == nil || !codexFingerprintIDsBelongToAccount(ids, account) {
-		return
-	}
-	if codexFingerprintProjectionMalformed(source, body) ||
-		codexTurnMetadataMalformed(h.Get("x-codex-turn-metadata")) {
-		return
-	}
-
-	// Standard Codex session/thread headers are authoritative. If a legacy
-	// client omitted them, retain the already-isolated alias emitted by the
-	// normal compact builder and establish the root relation when possible.
-	sessionID := firstHeaderValue(source, "session-id", "session_id", "conversation_id")
-	threadID := firstHeaderValue(source, "thread-id", "thread_id")
-	if sessionID == "" {
-		sessionID = firstBodyString(body, "client_metadata.session_id")
-	}
-	if threadID == "" {
-		threadID = firstBodyString(body, "client_metadata.thread_id")
-	}
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(h.Get("session_id"))
-	}
-	if threadID == "" {
-		threadID = strings.TrimSpace(h.Get("thread-id"))
-	}
-	if threadID == "" {
-		threadID = sessionID
-	}
-	// In device mode the client owns session/thread/window state. When a
-	// compact request has no explicit session header, Codex's default cache
-	// domain is the prompt_cache_key, so use that value before falling back to
-	// the already-built legacy alias. This keeps the two projections aligned.
-	if codexFingerprintRuntimeMode(ids.mode) == codexFingerprintDevice {
-		if explicitSession := firstHeaderValue(source, "session-id", "session_id", "conversation_id"); explicitSession == "" {
-			if cacheKey := firstBodyString(body, "prompt_cache_key"); cacheKey != "" {
-				sessionID = cacheKey
-				if firstHeaderValue(source, "thread-id", "thread_id") == "" {
-					threadID = cacheKey
-				}
-			}
-		}
-	}
-	if sessionID != "" {
-		h.Set("session-id", sessionID)
-		h.Set("session_id", sessionID)
-	}
-	if threadID != "" {
-		h.Set("thread-id", threadID)
-		h.Set("thread_id", threadID)
-	}
-
-	// Compact compatibility headers are projections of the same metadata
-	// snapshot. Do not overwrite a value already rewritten by the staged
-	// fingerprint helper; copy from the client only when the builder has none.
-	copyCompactHeaderIfEmpty(h, source, "x-codex-window-id")
-	copyCompactHeaderIfEmpty(h, source, "x-codex-turn-metadata")
-	copyCompactHeaderIfEmpty(h, source, "x-codex-parent-thread-id")
-	copyCompactHeaderIfEmpty(h, source, "x-openai-subagent")
-	copyCompactHeaderFromBodyIfEmpty(h, body, "x-codex-window-id", "client_metadata.x-codex-window-id")
-	copyCompactHeaderFromBodyIfEmpty(h, body, "x-codex-turn-metadata", "client_metadata.x-codex-turn-metadata")
-	copyCompactHeaderFromBodyIfEmpty(h, body, "x-codex-parent-thread-id", "client_metadata.x-codex-parent-thread-id")
-	copyCompactHeaderFromBodyIfEmpty(h, body, "x-openai-subagent", "client_metadata.x-openai-subagent")
-
-	if strings.TrimSpace(ids.installationID) != "" {
-		h.Set("x-codex-installation-id", ids.installationID)
-		// Device mode owns only installation_id. Keep the rest of the compact
-		// metadata untouched and, when present, align its installation field.
-		if codexFingerprintRuntimeMode(ids.mode) == codexFingerprintDevice {
-			rewriteCodexTurnMetadataFields(h, map[string]any{
-				"installation_id": ids.installationID,
-			})
-		}
-	}
-
-}
-
-// applyCodexFingerprintCountTokensHeaders keeps the native input_tokens
-// endpoint compatible with Codex's device projection. Unlike normal
-// Responses/WS requests, this endpoint has no client_metadata envelope on the
-// wire, so it still needs the explicit installation header. Session/thread
-// aliases remain intentionally absent in device mode.
-func applyCodexFingerprintCountTokensHeaders(h http.Header, ids *codexFingerprintIDs) {
-	if h == nil || ids == nil || strings.TrimSpace(ids.installationID) == "" {
-		return
-	}
-	h.Set("x-codex-installation-id", ids.installationID)
+	_ = c
+	_ = account
+	_ = h
+	_ = body
 }
 
 func firstHeaderValue(h http.Header, names ...string) string {
@@ -249,6 +208,207 @@ func firstBodyString(body []byte, paths ...string) string {
 	return ""
 }
 
+// restoreCodexIdentityHeadersFromBody reconstructs only the canonical
+// compatibility projections that the official CLI emits alongside
+// client_metadata. A reverse proxy may remove those headers while leaving the
+// JSON envelope intact; restoring the same values is passthrough, not account
+// fingerprint synthesis. Existing headers always win so a mixed snapshot can
+// never be silently repaired here (the strict identity gate rejects it).
+func restoreCodexIdentityHeadersFromBody(h http.Header, body []byte, includeInstallation, includeRequestID bool) {
+	if h == nil || len(bytes.TrimSpace(body)) == 0 || !gjson.ValidBytes(body) {
+		return
+	}
+	metadata := gjson.GetBytes(body, "client_metadata")
+	if !metadata.Exists() || !metadata.IsObject() {
+		return
+	}
+
+	// client_metadata.x-codex-turn-metadata is the canonical source in the
+	// official CLI. Some relays strip its flat compatibility fields while
+	// preserving that JSON string. Parse the whole snapshot first so nested
+	// identity can restore the same headers, and reject contradictory flat and
+	// nested values instead of producing a mixed fingerprint.
+	projection := codexIdentityFromBody(body)
+	if !projection.valid {
+		return
+	}
+	identity := projection.tuple
+	setHeaderIfEmpty := func(name, value string) {
+		if strings.TrimSpace(value) != "" && strings.TrimSpace(h.Get(name)) == "" {
+			h.Set(name, value)
+		}
+	}
+	// Canonical Codex uses hyphenated session/thread headers, while older
+	// ChatGPT compatibility paths still read underscore aliases. If either
+	// spelling already exists, copy that explicit value to the missing alias;
+	// never let a body projection create a contradictory pair.
+	setHeaderAliasesIfEmpty := func(names []string, value string) {
+		existing := firstHeaderValue(h, names...)
+		if existing == "" {
+			existing = strings.TrimSpace(value)
+		}
+		if existing == "" {
+			return
+		}
+		for _, name := range names {
+			if strings.TrimSpace(h.Get(name)) == "" {
+				h.Set(name, existing)
+			}
+		}
+	}
+
+	if includeInstallation {
+		setHeaderIfEmpty("x-codex-installation-id", identity.installationID)
+	}
+	setHeaderAliasesIfEmpty([]string{"session-id", "session_id"}, identity.sessionID)
+	setHeaderAliasesIfEmpty([]string{"thread-id", "thread_id"}, identity.threadID)
+	setHeaderIfEmpty("x-codex-window-id", identity.windowID)
+	setHeaderIfEmpty("x-codex-parent-thread-id", identity.parentThreadID)
+	if includeRequestID {
+		// codex-api's Responses endpoint derives this compatibility header from
+		// thread_id when the caller did not send one explicitly.
+		setHeaderIfEmpty("x-client-request-id", identity.threadID)
+	}
+	if raw := codexClientMetadataCompatibilityJSONValue(metadata.Get("x-codex-turn-metadata")); raw != "" {
+		setHeaderIfEmpty("x-codex-turn-metadata", raw)
+	}
+	setHeaderIfEmpty("x-codex-turn-state", strings.TrimSpace(metadata.Get("x-codex-turn-state").String()))
+	setHeaderIfEmpty("x-openai-subagent", strings.TrimSpace(metadata.Get("x-openai-subagent").String()))
+	setHeaderIfEmpty(
+		"x-openai-internal-codex-responses-lite",
+		firstNonEmptyGJSONString(
+			metadata.Get("x-openai-internal-codex-responses-lite"),
+			metadata.Get("ws_request_header_x_openai_internal_codex_responses_lite"),
+		),
+	)
+}
+
+// codexIdentityLifecycleTuplesAgree compares only the client-owned lifecycle
+// fields that are safe to project from a body to missing transport headers.
+// Installation is deliberately excluded: an enabled device convergence mode
+// rewrites it in client_metadata before request construction, while an inbound
+// header can still contain the pre-convergence value. That expected difference
+// must not prevent restoration of an otherwise coherent client session.
+func codexIdentityLifecycleTuplesAgree(left, right codexClientIdentityTuple) bool {
+	return (left.sessionID == "" || right.sessionID == "" || left.sessionID == right.sessionID) &&
+		(left.threadID == "" || right.threadID == "" || left.threadID == right.threadID) &&
+		(left.windowID == "" || right.windowID == "" || left.windowID == right.windowID) &&
+		(left.parentThreadID == "" || right.parentThreadID == "" || left.parentThreadID == right.parentThreadID)
+}
+
+// restoreStagedCodexIdentityHeadersFromBody fills only the session/thread,
+// window, and parent compatibility projections missing from a selected OAuth
+// account's outbound request. It is intentionally gated by the request-scoped
+// fingerprint snapshot: generic or opt-out clients keep normal tenant
+// isolation, while an explicitly converged body-only request can survive a
+// relay that stripped those headers. Flat and nested body metadata must agree,
+// and any explicit ingress/outbound lifecycle value must agree with the body;
+// no existing header is overwritten.
+func restoreStagedCodexIdentityHeadersFromBody(c *gin.Context, account *Account, h http.Header, body []byte) {
+	if h == nil || account == nil || !account.IsOpenAIOAuth() {
+		return
+	}
+	ids := stagedCodexFingerprintIDs(c, account)
+	if ids == nil {
+		return
+	}
+	if ids.projectionMalformed {
+		// A malformed projection cannot pass the strict agreement gate, but its
+		// surviving raw carriers are still useful for keeping device-mode body
+		// isolation aligned with the transport aliases. Never overwrite an
+		// explicit header here; the selected account's normal isolation step will
+		// decide the final value later.
+		if ids.fallbackIdentitySet {
+			restoreMissingCodexLifecycleHeaders(h, ids.fallbackIdentity)
+		}
+		return
+	}
+	bodyProjection := codexIdentityFromBody(body)
+	if !bodyProjection.valid {
+		return
+	}
+	var inbound http.Header
+	if c != nil && c.Request != nil {
+		inbound = c.Request.Header
+	}
+	inboundProjection := codexIdentityFromHeaders(inbound)
+	outboundProjection := codexIdentityFromHeaders(h)
+	if !inboundProjection.valid || !outboundProjection.valid ||
+		!codexIdentityLifecycleTuplesAgree(inboundProjection.tuple, bodyProjection.tuple) ||
+		!codexIdentityLifecycleTuplesAgree(outboundProjection.tuple, bodyProjection.tuple) {
+		return
+	}
+
+	restoreMissingCodexLifecycleHeaders(h, bodyProjection.tuple)
+}
+
+func restoreMissingCodexLifecycleHeaders(h http.Header, identity codexClientIdentityTuple) {
+	if h == nil {
+		return
+	}
+	setAliasesIfEmpty := func(names []string, value string) {
+		existing := firstHeaderValue(h, names...)
+		if existing == "" {
+			existing = strings.TrimSpace(value)
+		}
+		if existing == "" {
+			return
+		}
+		for _, name := range names {
+			if strings.TrimSpace(h.Get(name)) == "" {
+				h.Set(name, existing)
+			}
+		}
+	}
+	setIfEmpty := func(name, value string) {
+		if strings.TrimSpace(value) != "" && strings.TrimSpace(h.Get(name)) == "" {
+			h.Set(name, value)
+		}
+	}
+	setAliasesIfEmpty([]string{"session-id", "session_id"}, identity.sessionID)
+	setAliasesIfEmpty([]string{"thread-id", "thread_id"}, identity.threadID)
+	setIfEmpty("x-codex-window-id", identity.windowID)
+	setIfEmpty("x-codex-parent-thread-id", identity.parentThreadID)
+}
+
+func codexClientMetadataJSONValue(value gjson.Result) string {
+	if !value.Exists() {
+		return ""
+	}
+	if value.Type == gjson.JSON {
+		return strings.TrimSpace(value.Raw)
+	}
+	return strings.TrimSpace(value.String())
+}
+
+// codexClientMetadataCompatibilityJSONValue mirrors the official CLI's
+// compatibility_headers projection. The body carries the canonical metadata,
+// which may include the unbounded tool_namespaces_info inventory; the direct
+// header intentionally omits that field. Invalid or non-object values are not
+// promoted to a header, so a malformed body cannot be turned into a second,
+// contradictory identity projection.
+func codexClientMetadataCompatibilityJSONValue(value gjson.Result) string {
+	raw := codexClientMetadataJSONValue(value)
+	if raw == "" {
+		return ""
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil || metadata == nil {
+		return ""
+	}
+	if _, oversized := metadata["tool_namespaces_info"]; !oversized {
+		// Preserve the client's byte representation when no projection is needed;
+		// this keeps compatibility headers stable and avoids needless reordering.
+		return raw
+	}
+	delete(metadata, "tool_namespaces_info")
+	projected, err := json.Marshal(metadata)
+	if err != nil {
+		return ""
+	}
+	return string(projected)
+}
+
 func copyCompactHeaderIfEmpty(dst, src http.Header, name string) {
 	if strings.TrimSpace(dst.Get(name)) != "" {
 		return
@@ -288,11 +448,10 @@ const (
 	codexFingerprintFull codexFingerprintMode = "full"
 )
 
-// codexFingerprintRuntimeMode validates a mode supplied by an internal helper.
-// Account configuration is normalized by GetCodexFingerprintMode below, so
-// production requests never select the legacy stateless session/full modes;
-// keeping them valid here preserves deterministic unit/helper behavior for
-// migration and diagnostics.
+// codexFingerprintRuntimeMode validates a mode supplied by a pure helper.
+// The account setting remains the authority for production requests, and its
+// explicit opt-in values (device/session/full) are intentionally preserved;
+// this guard only rejects malformed values at the helper boundary.
 func codexFingerprintRuntimeMode(mode codexFingerprintMode) codexFingerprintMode {
 	switch mode {
 	case codexFingerprintOff, codexFingerprintDevice, codexFingerprintSession, codexFingerprintFull:
@@ -307,16 +466,548 @@ func shouldPreserveCodexClientSessionIdentity(account *Account) bool {
 		codexFingerprintRuntimeMode(account.GetCodexFingerprintMode()) != codexFingerprintDevice {
 		return false
 	}
-	// An explicit device override is a complete installation identity. Without
-	// it, require the persisted seed; missing/invalid seeds must fail closed to
-	// the normal per-API-key isolation path instead of leaking raw aliases.
 	return strings.TrimSpace(account.GetOpenAIDeviceID()) != "" || account.getCodexFingerprintSeed() != ""
 }
 
-// normalizeCodexFingerprintModeForStorage migrates the historical session and
-// full values when an account is written through an older API client. Existing
-// backups remain readable, while new writes cannot reintroduce an unsupported
-// stateless identity graph.
+// shouldPreserveCodexClientSessionIdentityForRequest is the request-scoped
+// version used by outbound builders. Device mode intentionally keeps the
+// caller's session/thread, but only after a valid fingerprint snapshot was
+// produced for this exact body. A malformed turn-metadata projection must use
+// the normal API-key isolation path; otherwise a raw client session can cross
+// users while only installation_id is rewritten.
+func shouldPreserveCodexClientSessionIdentityForRequest(c *gin.Context, account *Account) bool {
+	if !shouldPreserveCodexClientSessionIdentity(account) {
+		return false
+	}
+	ids := stagedCodexFingerprintIDs(c, account)
+	return ids != nil &&
+		codexFingerprintRuntimeMode(ids.mode) == codexFingerprintDevice &&
+		!ids.projectionMalformed &&
+		strings.TrimSpace(ids.installationID) != ""
+}
+
+// hasValidStagedCodexFingerprint reports whether this request already has an
+// account-owned lifecycle snapshot. Session/full modes still isolate their
+// session and thread fields, but they must not manufacture a separate
+// conversation_id from prompt_cache_key when the snapshot is authoritative.
+func hasValidStagedCodexFingerprint(c *gin.Context, account *Account) bool {
+	ids := stagedCodexFingerprintIDs(c, account)
+	return ids != nil && !ids.projectionMalformed && strings.TrimSpace(ids.installationID) != ""
+}
+
+// shouldPassThroughCodexClientIdentity recognizes a complete genuine Codex
+// identity carrier on the inbound request. A matching User-Agent alone is not
+// sufficient: older compatibility clients often send one without the official
+// session/thread lifecycle snapshot. Passing that incomplete shape upstream
+// would create a half-spoofed request, so it stays on the gateway's normal
+// compatibility path instead.
+func shouldPassThroughCodexClientIdentity(account *Account, headers http.Header) bool {
+	return shouldPassThroughCodexClientIdentityWithBody(account, headers, nil)
+}
+
+// captureCodexClientIdentityPassthrough freezes the result from the first
+// complete request shape seen at ingress. Keep this separate from the pure
+// detector so direct builders and unit tests can still evaluate a supplied
+// header/body pair without a Gin context.
+func captureCodexClientIdentityPassthrough(c *gin.Context, account *Account, headers http.Header, body []byte) bool {
+	if c != nil {
+		if value, exists := c.Get(codexClientIdentityPassthroughContextKey); exists {
+			if preserve, ok := value.(bool); ok {
+				return preserve
+			}
+		}
+	}
+	preserve := shouldPassThroughCodexClientIdentityWithBody(account, headers, body)
+	// Do not cache a negative decision made for an API-key/non-OAuth account.
+	// A later failover may select an OAuth account for the same official Codex
+	// request; that account must still be able to evaluate the untouched ingress
+	// identity instead of inheriting the first account's false result.
+	if c != nil && account != nil && account.IsOpenAIOAuth() {
+		c.Set(codexClientIdentityPassthroughContextKey, preserve)
+	}
+	return preserve
+}
+
+// shouldPreserveCodexClientIdentityForRequest returns the immutable ingress
+// decision when present. A retry can switch between OAuth accounts, so retain
+// the client-owned identity only for OAuth accounts; account credentials,
+// proxy routing, and foreign turn-state validation remain selected-account
+// concerns in the request builders.
+func shouldPreserveCodexClientIdentityForRequestWithBody(c *gin.Context, account *Account, headers http.Header, body []byte) bool {
+	if account == nil || !account.IsOpenAIOAuth() {
+		return false
+	}
+	if c != nil {
+		if value, exists := c.Get(codexClientIdentityPassthroughContextKey); exists {
+			if preserve, ok := value.(bool); ok {
+				return preserve
+			}
+		}
+	}
+	return shouldPassThroughCodexClientIdentityWithBody(account, headers, body)
+}
+
+// shouldPassThroughCodexClientIdentityWithBody recognizes the complete
+// identity snapshot emitted by the official Codex client. Reverse proxies can
+// legitimately drop the canonical session/thread headers while preserving the
+// request body, so the body projection is considered only when the caller has
+// also supplied a strict official Codex User-Agent. The real CLI always emits
+// that header; accepting originator alone would preserve an incomplete request
+// after a proxy strips the User-Agent. Generic clients therefore keep the
+// normal tenant-isolation path even if they happen to send similarly named
+// client_metadata keys.
+func shouldPassThroughCodexClientIdentityWithBody(account *Account, headers http.Header, body []byte) bool {
+	if account == nil || !account.IsOpenAIOAuth() || headers == nil {
+		return false
+	}
+	if !codexClientIdentityHeaderTripletConsistent(headers) {
+		return false
+	}
+	headerProjection := codexIdentityFromHeaders(headers)
+	bodyProjection := codexIdentityFromBody(body)
+	if !headerProjection.valid || !bodyProjection.valid {
+		return false
+	}
+
+	// When both projections survive the relay, reject a mixed snapshot. Sending
+	// a body from one CLI session with headers from another is precisely the
+	// half-identity shape that causes upstream routing and risk checks to fail.
+	if !codexIdentityTuplesAgree(headerProjection.tuple, bodyProjection.tuple) {
+		return false
+	}
+	return headerProjection.complete || bodyProjection.complete
+}
+
+// codexClientIdentityHeaderTripletConsistent verifies the transport-level
+// portion of a genuine Codex CLI identity before the request can bypass the
+// normal compatibility path. The official client derives User-Agent and
+// Originator from the same originator value; older clients that send Version
+// derive it from that same User-Agent version. Accepting only a recognizable
+// User-Agent would pass an internally contradictory partial identity upstream.
+func codexClientIdentityHeaderTripletConsistent(headers http.Header) bool {
+	userAgent, userAgentOK := consistentCodexIdentityHeaderValue(headers, "user-agent")
+	originator, originatorOK := consistentCodexIdentityHeaderValue(headers, "originator")
+	version, versionOK := consistentCodexIdentityHeaderValue(headers, "version")
+	if !userAgentOK || !originatorOK || !versionOK ||
+		!openai.IsCodexOfficialClientRequestStrict(userAgent) || originator == "" {
+		return false
+	}
+
+	slash := strings.IndexByte(userAgent, '/')
+	if slash <= 0 || originator != strings.TrimSpace(userAgent[:slash]) {
+		return false
+	}
+	if version == "" {
+		return true
+	}
+	userAgentVersion := NormalizeCodexClientVersion(openai.CodexUserAgentVersion(userAgent))
+	return userAgentVersion != "" && version == userAgentVersion
+}
+
+type codexClientIdentityTuple struct {
+	installationID string
+	sessionID      string
+	threadID       string
+	turnID         string
+	windowID       string
+	parentThreadID string
+}
+
+type codexClientIdentityProjection struct {
+	tuple    codexClientIdentityTuple
+	complete bool
+	valid    bool
+}
+
+func codexIdentityFromHeaders(headers http.Header) codexClientIdentityProjection {
+	if headers == nil {
+		return codexClientIdentityProjection{valid: true}
+	}
+	installationID, installationOK := consistentCodexIdentityHeaderValue(headers, "x-codex-installation-id")
+	sessionID, sessionOK := consistentCodexIdentityHeaderValue(headers, "session-id", "session_id")
+	threadID, threadOK := consistentCodexIdentityHeaderValue(headers, "thread-id", "thread_id")
+	windowID, windowOK := consistentCodexIdentityHeaderValue(headers, "x-codex-window-id")
+	parentThreadID, parentThreadOK := consistentCodexIdentityHeaderValue(headers, "x-codex-parent-thread-id")
+	metadata, metadataOK := consistentCodexIdentityHeaderValue(headers, "x-codex-turn-metadata")
+	if !installationOK || !sessionOK || !threadOK || !windowOK || !parentThreadOK || !metadataOK {
+		return codexClientIdentityProjection{valid: false}
+	}
+	identity := codexClientIdentityTuple{
+		installationID: installationID,
+		sessionID:      sessionID,
+		threadID:       threadID,
+		turnID:         "",
+		windowID:       windowID,
+		parentThreadID: parentThreadID,
+	}
+	if metadata != "" {
+		metadataIdentity, ok := codexIdentityFromTurnMetadata(metadata)
+		if !ok {
+			return codexClientIdentityProjection{valid: false}
+		}
+		var agree bool
+		identity, agree = mergeCodexIdentityTuple(identity, metadataIdentity)
+		if !agree {
+			return codexClientIdentityProjection{valid: false}
+		}
+	}
+	return codexClientIdentityProjection{
+		tuple:    identity,
+		complete: codexIdentityTupleComplete(identity),
+		valid:    true,
+	}
+}
+
+func codexIdentityFromBody(body []byte) codexClientIdentityProjection {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return codexClientIdentityProjection{valid: true}
+	}
+	if !gjson.ValidBytes(trimmed) {
+		return codexClientIdentityProjection{valid: false}
+	}
+	if !gjson.ParseBytes(trimmed).IsObject() {
+		// Arrays and scalar request bodies do not carry a client_metadata
+		// projection. Leave their normal request validation to the upstream.
+		return codexClientIdentityProjection{valid: true}
+	}
+	metadata := gjson.GetBytes(body, "client_metadata")
+	if !metadata.Exists() {
+		return codexClientIdentityProjection{valid: true}
+	}
+	if !metadata.IsObject() {
+		return codexClientIdentityProjection{valid: false}
+	}
+	installationID, installationOK := consistentCodexBodyMetadataValue(
+		metadata,
+		"x-codex-installation-id",
+		"installation_id",
+	)
+	windowID, windowOK := consistentCodexBodyMetadataValue(
+		metadata,
+		"x-codex-window-id",
+		"window_id",
+	)
+	parentThreadID, parentThreadOK := consistentCodexBodyMetadataValue(
+		metadata,
+		"x-codex-parent-thread-id",
+		"parent_thread_id",
+	)
+	if !installationOK || !windowOK || !parentThreadOK {
+		return codexClientIdentityProjection{valid: false}
+	}
+	sessionID, sessionOK := consistentCodexBodyMetadataValue(metadata, "session_id", "session-id")
+	threadID, threadOK := consistentCodexBodyMetadataValue(metadata, "thread_id", "thread-id")
+	turnID, turnOK := consistentCodexBodyMetadataValue(metadata, "turn_id", "turn-id")
+	if !sessionOK || !threadOK || !turnOK {
+		return codexClientIdentityProjection{valid: false}
+	}
+	identity := codexClientIdentityTuple{
+		installationID: installationID,
+		sessionID:      sessionID,
+		threadID:       threadID,
+		turnID:         turnID,
+		windowID:       windowID,
+		parentThreadID: parentThreadID,
+	}
+
+	// The current CLI also carries the canonical tuple as a JSON string under
+	// x-codex-turn-metadata. Accept an object form as well for compatible
+	// clients that decode the envelope before forwarding it.
+	turnMetadata := metadata.Get("x-codex-turn-metadata")
+	if turnMetadata.Exists() {
+		metadataIdentity, ok := codexIdentityFromTurnMetadataValue(turnMetadata)
+		if !ok {
+			return codexClientIdentityProjection{valid: false}
+		}
+		var agree bool
+		identity, agree = mergeCodexIdentityTuple(identity, metadataIdentity)
+		if !agree {
+			return codexClientIdentityProjection{valid: false}
+		}
+	}
+	return codexClientIdentityProjection{
+		tuple:    identity,
+		complete: codexIdentityTupleComplete(identity),
+		valid:    true,
+	}
+}
+
+func firstNonEmptyGJSONString(values ...gjson.Result) string {
+	for _, value := range values {
+		if value.Exists() {
+			if candidate := strings.TrimSpace(value.String()); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func consistentCodexBodyMetadataValue(metadata gjson.Result, names ...string) (string, bool) {
+	value := ""
+	for _, name := range names {
+		candidate := strings.TrimSpace(metadata.Get(name).String())
+		if candidate == "" {
+			continue
+		}
+		if value != "" && value != candidate {
+			return "", false
+		}
+		value = candidate
+	}
+	return value, true
+}
+
+func consistentCodexIdentityHeaderValue(headers http.Header, names ...string) (string, bool) {
+	value := ""
+	for key, values := range headers {
+		matches := false
+		for _, name := range names {
+			if strings.EqualFold(strings.TrimSpace(key), name) {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		for _, candidate := range values {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "" {
+				continue
+			}
+			if value != "" && value != candidate {
+				return "", false
+			}
+			value = candidate
+		}
+	}
+	return value, true
+}
+
+// codexIdentityTupleFillMissing copies only fields absent from dst. It is used
+// for malformed ingress snapshots where a deterministic source is still
+// needed to keep the eventual header/body projections on one identity. The
+// strict parsers above continue to reject contradictions; this helper is only
+// a fallback for the isolated repair path.
+func codexIdentityTupleFillMissing(dst *codexClientIdentityTuple, supplement codexClientIdentityTuple) {
+	if dst == nil {
+		return
+	}
+	if dst.installationID == "" {
+		dst.installationID = supplement.installationID
+	}
+	if dst.sessionID == "" {
+		dst.sessionID = supplement.sessionID
+	}
+	if dst.threadID == "" {
+		dst.threadID = supplement.threadID
+	}
+	if dst.turnID == "" {
+		dst.turnID = supplement.turnID
+	}
+	if dst.windowID == "" {
+		dst.windowID = supplement.windowID
+	}
+	if dst.parentThreadID == "" {
+		dst.parentThreadID = supplement.parentThreadID
+	}
+}
+
+// codexBestEffortIdentityFromHeaders reads direct header carriers first, then
+// fills missing fields from a valid embedded turn-metadata object. Direct
+// headers are deliberately authoritative when the two sources conflict: the
+// outbound OAuth isolation path already uses these values for its aliases.
+func codexBestEffortIdentityFromHeaders(headers http.Header) codexClientIdentityTuple {
+	if headers == nil {
+		return codexClientIdentityTuple{}
+	}
+	identity := codexClientIdentityTuple{
+		installationID: firstHeaderValue(headers, "x-codex-installation-id"),
+		sessionID:      firstHeaderValue(headers, "session-id", "session_id"),
+		threadID:       firstHeaderValue(headers, "thread-id", "thread_id"),
+		windowID:       firstHeaderValue(headers, "x-codex-window-id"),
+		parentThreadID: firstHeaderValue(headers, "x-codex-parent-thread-id"),
+	}
+	if metadata := strings.TrimSpace(headers.Get("x-codex-turn-metadata")); metadata != "" {
+		if nested, ok := codexIdentityFromTurnMetadata(metadata); ok {
+			codexIdentityTupleFillMissing(&identity, nested)
+		}
+	}
+	return identity
+}
+
+// codexBestEffortIdentityFromBody follows the official precedence rule for a
+// body snapshot: the nested x-codex-turn-metadata object is canonical, while
+// flat client_metadata fields only fill gaps. When the nested value is
+// malformed, flat fields remain usable for the isolation fallback.
+func codexBestEffortIdentityFromBody(body []byte) codexClientIdentityTuple {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || !gjson.ValidBytes(trimmed) || !gjson.ParseBytes(trimmed).IsObject() {
+		return codexClientIdentityTuple{}
+	}
+	metadata := gjson.GetBytes(trimmed, "client_metadata")
+	if !metadata.Exists() || !metadata.IsObject() {
+		return codexClientIdentityTuple{}
+	}
+	identity := codexClientIdentityTuple{
+		installationID: firstNonEmptyGJSONString(
+			metadata.Get("x-codex-installation-id"),
+			metadata.Get("installation_id"),
+		),
+		sessionID: firstNonEmptyGJSONString(metadata.Get("session_id"), metadata.Get("session-id")),
+		threadID:  firstNonEmptyGJSONString(metadata.Get("thread_id"), metadata.Get("thread-id")),
+		turnID:    firstNonEmptyGJSONString(metadata.Get("turn_id"), metadata.Get("turn-id")),
+		windowID: firstNonEmptyGJSONString(
+			metadata.Get("x-codex-window-id"),
+			metadata.Get("window_id"),
+		),
+		parentThreadID: firstNonEmptyGJSONString(
+			metadata.Get("x-codex-parent-thread-id"),
+			metadata.Get("parent_thread_id"),
+		),
+	}
+	if nestedValue := metadata.Get("x-codex-turn-metadata"); nestedValue.Exists() {
+		if nested, ok := codexIdentityFromTurnMetadataValue(nestedValue); ok {
+			// Nested metadata is canonical, so overlay the flat projection with
+			// the nested tuple before any missing-field fill.
+			codexIdentityTupleFillMissing(&nested, identity)
+			identity = nested
+		}
+	}
+	return identity
+}
+
+func codexBestEffortIdentityFromRequest(headers http.Header, body []byte) codexClientIdentityTuple {
+	identity := codexBestEffortIdentityFromHeaders(headers)
+	// Header values win; body metadata only supplies carriers removed by a
+	// relay. This makes the isolated body match the same header identity.
+	codexIdentityTupleFillMissing(&identity, codexBestEffortIdentityFromBody(body))
+	return identity
+}
+
+func codexIdentityFromTurnMetadata(raw string) (codexClientIdentityTuple, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || codexTurnMetadataMalformed(raw) {
+		return codexClientIdentityTuple{}, false
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return codexClientIdentityTuple{}, false
+	}
+	installationID, installationOK := consistentCodexMapMetadataValue(metadata, "installation_id", "x-codex-installation-id")
+	windowID, windowOK := consistentCodexMapMetadataValue(metadata, "x-codex-window-id", "window_id")
+	parentThreadID, parentThreadOK := consistentCodexMapMetadataValue(metadata, "x-codex-parent-thread-id", "parent_thread_id")
+	if !installationOK || !windowOK || !parentThreadOK {
+		return codexClientIdentityTuple{}, false
+	}
+	return codexClientIdentityTuple{
+		installationID: installationID,
+		sessionID:      strings.TrimSpace(stringValue(metadata["session_id"])),
+		threadID:       strings.TrimSpace(stringValue(metadata["thread_id"])),
+		turnID:         strings.TrimSpace(stringValue(metadata["turn_id"])),
+		windowID:       windowID,
+		parentThreadID: parentThreadID,
+	}, true
+}
+
+func consistentCodexMapMetadataValue(metadata map[string]any, names ...string) (string, bool) {
+	value := ""
+	for _, name := range names {
+		candidate := strings.TrimSpace(stringValue(metadata[name]))
+		if candidate == "" {
+			continue
+		}
+		if value != "" && value != candidate {
+			return "", false
+		}
+		value = candidate
+	}
+	return value, true
+}
+
+func codexIdentityFromTurnMetadataValue(value gjson.Result) (codexClientIdentityTuple, bool) {
+	if !value.Exists() {
+		return codexClientIdentityTuple{}, false
+	}
+	if value.Type == gjson.JSON {
+		return codexIdentityFromTurnMetadata(value.Raw)
+	}
+	return codexIdentityFromTurnMetadata(value.String())
+}
+
+func mergeCodexIdentityTuple(base, overlay codexClientIdentityTuple) (codexClientIdentityTuple, bool) {
+	if base.installationID != "" && overlay.installationID != "" && base.installationID != overlay.installationID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.sessionID != "" && overlay.sessionID != "" && base.sessionID != overlay.sessionID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.threadID != "" && overlay.threadID != "" && base.threadID != overlay.threadID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.turnID != "" && overlay.turnID != "" && base.turnID != overlay.turnID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.windowID != "" && overlay.windowID != "" && base.windowID != overlay.windowID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.parentThreadID != "" && overlay.parentThreadID != "" && base.parentThreadID != overlay.parentThreadID {
+		return codexClientIdentityTuple{}, false
+	}
+	if base.installationID == "" {
+		base.installationID = overlay.installationID
+	}
+	if base.sessionID == "" {
+		base.sessionID = overlay.sessionID
+	}
+	if base.threadID == "" {
+		base.threadID = overlay.threadID
+	}
+	if base.turnID == "" {
+		base.turnID = overlay.turnID
+	}
+	if base.windowID == "" {
+		base.windowID = overlay.windowID
+	}
+	if base.parentThreadID == "" {
+		base.parentThreadID = overlay.parentThreadID
+	}
+	return base, true
+}
+
+func codexIdentityTupleComplete(identity codexClientIdentityTuple) bool {
+	return strings.TrimSpace(identity.installationID) != "" &&
+		strings.TrimSpace(identity.sessionID) != "" &&
+		strings.TrimSpace(identity.threadID) != ""
+}
+
+func codexIdentityTuplesAgree(left, right codexClientIdentityTuple) bool {
+	return (left.installationID == "" || right.installationID == "" || left.installationID == right.installationID) &&
+		(left.sessionID == "" || right.sessionID == "" || left.sessionID == right.sessionID) &&
+		(left.threadID == "" || right.threadID == "" || left.threadID == right.threadID) &&
+		(left.turnID == "" || right.turnID == "" || left.turnID == right.turnID) &&
+		(left.windowID == "" || right.windowID == "" || left.windowID == right.windowID) &&
+		(left.parentThreadID == "" || right.parentThreadID == "" || left.parentThreadID == right.parentThreadID)
+}
+
+func hasCompleteCodexTurnMetadata(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || codexTurnMetadataMalformed(raw) {
+		return false
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return false
+	}
+	return strings.TrimSpace(stringValue(metadata["installation_id"])) != "" &&
+		strings.TrimSpace(stringValue(metadata["session_id"])) != "" &&
+		strings.TrimSpace(stringValue(metadata["thread_id"])) != ""
+}
+
+// normalizeCodexFingerprintModeForStorage canonicalizes the opt-in mode while
+// preserving the complete lifecycle values used by the official Codex client.
 func normalizeCodexFingerprintModeForStorage(extra map[string]any) map[string]any {
 	if extra == nil {
 		return extra
@@ -326,30 +1017,61 @@ func normalizeCodexFingerprintModeForStorage(extra map[string]any) map[string]an
 		return extra
 	}
 	mode := codexFingerprintMode(strings.ToLower(strings.TrimSpace(raw)))
-	var canonical codexFingerprintMode
 	switch mode {
-	case codexFingerprintSession, codexFingerprintFull:
-		// The old stateless modes cannot reproduce Codex's stateful
-		// session/thread lifecycle. Persist the protocol-compatible device
-		// projection when an older client still sends either value.
-		canonical = codexFingerprintDevice
-	case codexFingerprintOff, codexFingerprintDevice:
-		canonical = mode
+	case codexFingerprintOff, codexFingerprintDevice, codexFingerprintSession, codexFingerprintFull:
 	default:
-		// Validation is performed at the API boundary. Preserve an invalid
-		// value here so callers that only read legacy data still see it and
-		// can report the original validation error.
 		return extra
 	}
-	if raw == string(canonical) {
+	if raw == string(mode) {
 		return extra
 	}
 	out := make(map[string]any, len(extra))
 	for key, value := range extra {
 		out[key] = value
 	}
-	out[codexFingerprintModeExtraKey] = string(canonical)
+	out[codexFingerprintModeExtraKey] = string(mode)
 	return out
+}
+
+// canonicalCodexFingerprintSeed accepts the UUID spellings used by exports
+// and older clients, then returns the single lowercase, trimmed representation
+// persisted by the gateway. The seed is opaque account state; UUID version is
+// intentionally unrestricted, and only the nil UUID is rejected.
+func canonicalCodexFingerprintSeed(seed string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(seed))
+	id, err := uuid.Parse(trimmed)
+	if err != nil || id == uuid.Nil || trimmed != id.String() {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func normalizeCodexFingerprintSeedForStorage(extra map[string]any) map[string]any {
+	if extra == nil {
+		return extra
+	}
+	raw, ok := extra[codexFingerprintSeedExtraKey].(string)
+	if !ok {
+		return extra
+	}
+	canonical, ok := canonicalCodexFingerprintSeed(raw)
+	if !ok || raw == canonical {
+		return extra
+	}
+	out := make(map[string]any, len(extra))
+	for key, value := range extra {
+		out[key] = value
+	}
+	out[codexFingerprintSeedExtraKey] = canonical
+	return out
+}
+
+// RetireCodexFingerprintExtra is retained as a compatibility name for callers
+// from the previous migration. It now performs canonicalization only; the
+// account seed and lifecycle mode must survive imports and edits when the
+// administrator explicitly opted in.
+func RetireCodexFingerprintExtra(extra map[string]any) map[string]any {
+	return normalizeCodexFingerprintSeedForStorage(normalizeCodexFingerprintModeForStorage(extra))
 }
 
 const (
@@ -372,45 +1094,20 @@ func codexFingerprintDeploymentSeed(cfg *config.Config) string {
 	return strings.TrimSpace(cfg.JWT.Secret)
 }
 
-func codexFingerprintSeed(account *Account) string {
-	if account == nil {
-		return ""
-	}
-	if seed := account.getCodexFingerprintSeed(); seed != "" {
-		return "extra:" + seed
-	}
-	return ""
-}
-
-func codexFingerprintDerivationSeed(account *Account, purpose, deploymentSeed string, extra ...string) string {
-	identity := codexFingerprintSeed(account)
-	if identity == "" {
-		return ""
-	}
-	if len(extra) > 0 {
-		identity += "\x00" + strings.Join(extra, "\x00")
-	}
-	label := "sub2api:codex-fingerprint:v2:" + purpose + "\x00" + identity
-	// Keep the variadic deploymentSeed parameter for old call sites, but do not
-	// mix it into persisted identities (see codexFingerprintDeploymentSeed).
-	_ = deploymentSeed
-	return label
-}
-
 func (a *Account) getCodexFingerprintSeed() string {
 	if a == nil || !a.IsOpenAIOAuth() {
 		return ""
 	}
-	seed := strings.TrimSpace(a.GetExtraString(codexFingerprintSeedExtraKey))
-	if !isCodexFingerprintSeed(seed) {
+	seed, ok := canonicalCodexFingerprintSeed(a.GetExtraString(codexFingerprintSeedExtraKey))
+	if !ok {
 		return ""
 	}
 	return seed
 }
 
 func isCodexFingerprintSeed(seed string) bool {
-	id, err := uuid.Parse(strings.TrimSpace(seed))
-	return err == nil && id.Version() == uuid.Version(4) && id.Variant() == uuid.RFC4122
+	_, ok := canonicalCodexFingerprintSeed(seed)
+	return ok
 }
 
 func codexFingerprintModeEnabledExtra(extra map[string]any) bool {
@@ -434,29 +1131,26 @@ func ShouldEnsureCodexFingerprintSeedForExtraUpdates(extra map[string]any) bool 
 	return codexFingerprintModeEnabledExtra(extra)
 }
 
-// ValidateCodexFingerprintExtra rejects identity settings on channels that do
-// not own an OpenAI OAuth installation. Legacy session/full values remain
-// accepted for import compatibility and are normalized to device on write.
+// ValidateCodexFingerprintExtra validates the explicit opt-in fields and keeps
+// them limited to OpenAI OAuth accounts.
 func ValidateCodexFingerprintExtra(platform, accountType string, extra map[string]any) error {
 	if extra == nil {
 		return nil
 	}
-	rawMode, modePresent := extra[codexFingerprintModeExtraKey]
-	if modePresent && rawMode != nil {
+	if rawMode, present := extra[codexFingerprintModeExtraKey]; present && rawMode != nil {
 		mode, ok := rawMode.(string)
 		mode = strings.ToLower(strings.TrimSpace(mode))
-		if !ok || (mode != string(codexFingerprintOff) && mode != string(codexFingerprintDevice) &&
-			mode != string(codexFingerprintSession) && mode != string(codexFingerprintFull)) {
+		if !ok || (mode != string(codexFingerprintOff) && mode != string(codexFingerprintDevice) && mode != string(codexFingerprintSession) && mode != string(codexFingerprintFull)) {
 			return fmt.Errorf("codex_fingerprint_mode must be one of off, device, session, or full")
 		}
 		if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
 			return fmt.Errorf("codex_fingerprint_mode only applies to OpenAI OAuth accounts")
 		}
 	}
-	if rawSeed, seedPresent := extra[codexFingerprintSeedExtraKey]; seedPresent && rawSeed != nil {
+	if rawSeed, present := extra[codexFingerprintSeedExtraKey]; present && rawSeed != nil {
 		seed, ok := rawSeed.(string)
 		if !ok || !isCodexFingerprintSeed(seed) {
-			return fmt.Errorf("codex_fingerprint_seed must be an RFC4122 UUIDv4")
+			return fmt.Errorf("codex_fingerprint_seed must be a canonical non-nil UUID")
 		}
 		if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
 			return fmt.Errorf("codex_fingerprint_seed only applies to OpenAI OAuth accounts")
@@ -465,9 +1159,8 @@ func ValidateCodexFingerprintExtra(platform, accountType string, extra map[strin
 	return nil
 }
 
-// ensureCodexFingerprintSeed adds an opaque random seed only when convergence
-// is explicitly enabled. Existing extra values are preserved and callers
-// receive their original map when no change is needed.
+// ensureCodexFingerprintSeed adds a random seed only when convergence is
+// explicitly enabled, preserving an existing seed across edits/imports.
 func ensureCodexFingerprintSeed(platform, accountType string, extra map[string]any) map[string]any {
 	if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
 		return extra
@@ -475,9 +1168,17 @@ func ensureCodexFingerprintSeed(platform, accountType string, extra map[string]a
 	if !codexFingerprintModeEnabledExtra(extra) {
 		return extra
 	}
-	if seed := strings.TrimSpace(extraStringValue(extra, codexFingerprintSeedExtraKey)); seed != "" {
-		if isCodexFingerprintSeed(seed) {
-			return extra
+	if rawSeed := extraStringValue(extra, codexFingerprintSeedExtraKey); rawSeed != "" {
+		if seed, ok := canonicalCodexFingerprintSeed(rawSeed); ok {
+			if rawSeed == seed {
+				return extra
+			}
+			out := make(map[string]any, len(extra))
+			for key, value := range extra {
+				out[key] = value
+			}
+			out[codexFingerprintSeedExtraKey] = seed
+			return out
 		}
 	}
 	out := make(map[string]any, len(extra)+1)
@@ -502,7 +1203,7 @@ func extraStringValue(extra map[string]any, key string) string {
 	}
 }
 
-// GetCodexFingerprintMode 从账号 extra JSON 读取指纹收敛模式。
+// GetCodexFingerprintMode 从账号 extra JSON 读取历史指纹收敛模式。
 //
 // **收敛是显式 opt-in**：未设置、空值或非法值一律按 off 处理，只有管理员
 // 明确配置 device / session / full 才收敛。
@@ -519,12 +1220,8 @@ func (a *Account) GetCodexFingerprintMode() codexFingerprintMode {
 	}
 	raw := strings.ToLower(strings.TrimSpace(a.GetExtraString(codexFingerprintModeExtraKey)))
 	switch codexFingerprintMode(raw) {
-	case codexFingerprintOff, codexFingerprintDevice:
+	case codexFingerprintOff, codexFingerprintDevice, codexFingerprintSession, codexFingerprintFull:
 		return codexFingerprintMode(raw)
-	case codexFingerprintSession, codexFingerprintFull:
-		// Legacy values are read as the only stateless projection that matches
-		// the official client: stable installation, real client session/thread.
-		return codexFingerprintDevice
 	default:
 		return codexFingerprintOff
 	}
@@ -547,68 +1244,48 @@ func deriveStableUUIDv4(seed string) string {
 
 // resolveConvergedInstallationID 返回账号级恒定的 installation_id。
 // 优先使用管理员配置的真实 device_id，无则使用持久化的随机种子。
-func resolveConvergedInstallationID(account *Account, deploymentSeed ...string) string {
+func resolveConvergedInstallationID(account *Account) string {
 	if account == nil {
 		return ""
 	}
 	if deviceID := account.GetOpenAIDeviceID(); deviceID != "" {
 		return deviceID
 	}
-	// installation_id is itself the persisted identity. Hashing it again
-	// changes the client-visible value and diverges from the official Codex
-	// seed persistence contract.
-	return account.getCodexFingerprintSeed()
-}
-
-// resolveConvergedSessionID returns the account-wide session used only by full
-// convergence mode.
-func resolveConvergedSessionID(account *Account, deploymentSeed ...string) string {
-	if account == nil {
-		return ""
-	}
-	seed := codexFingerprintDerivationSeed(account, "session", firstCodexFingerprintSeed(deploymentSeed))
+	// The persisted seed is server-side state, not the client-visible
+	// installation_id. Match the official sub2api derivation so an account
+	// export/import produces the same stable UUID without exposing the seed.
+	seed := account.getCodexFingerprintSeed()
 	if seed == "" {
 		return ""
 	}
-	return deriveStableUUIDv4(seed)
+	return deriveStableUUIDv4("sub2api:codex-install-id:v2:" + seed)
 }
 
-// resolveCodexConversationSessionID derives a stable upstream session for one
-// client conversation while keeping different conversations isolated.
-func resolveCodexConversationSessionID(account *Account, clientSessionSeed string, deploymentSeed ...string) string {
+// resolveConvergedSessionID returns the account-wide session used by the
+// official session and full convergence modes.
+func resolveConvergedSessionID(account *Account) string {
 	if account == nil {
 		return ""
 	}
-	clientSessionSeed = strings.TrimSpace(clientSessionSeed)
-	if clientSessionSeed == "" {
-		clientSessionSeed = "default"
-	}
-	seed := codexFingerprintDerivationSeed(account, "conversation-session", firstCodexFingerprintSeed(deploymentSeed), clientSessionSeed)
+	seed := account.getCodexFingerprintSeed()
 	if seed == "" {
 		return ""
 	}
-	return deriveStableUUIDv4(seed)
+	return deriveStableUUIDv4("sub2api:codex-session-id:v2:" + seed)
 }
 
 // resolveConvergedThreadID 按客户端原始 session-id 确定性派生 thread_id。
 // 每个真实 Codex 会话（不同客户端启动实例）获得一个独立线程，
 // 模拟正常用户 spawn 子代理或开多窗口的模式。
-func resolveConvergedThreadID(account *Account, clientSessionID string, deploymentSeed ...string) string {
+func resolveConvergedThreadID(account *Account, clientSessionID string) string {
 	if account == nil || clientSessionID == "" {
 		return ""
 	}
-	seed := codexFingerprintDerivationSeed(account, "thread", firstCodexFingerprintSeed(deploymentSeed), clientSessionID)
+	seed := account.getCodexFingerprintSeed()
 	if seed == "" {
 		return ""
 	}
-	return deriveStableUUIDv4(seed)
-}
-
-func firstCodexFingerprintSeed(seeds []string) string {
-	if len(seeds) == 0 {
-		return ""
-	}
-	return seeds[0]
+	return deriveStableUUIDv4("sub2api:codex-thread-id:v2:" + seed + ":" + clientSessionID)
 }
 
 // codexFingerprintIDs 收敛后的完整 ID 集合。
@@ -623,6 +1300,18 @@ type codexFingerprintIDs struct {
 	turnID              string
 	windowID            string
 	turnStartedAtUnixMS int64
+	// projectionMalformed records whether the ingress request carried a
+	// malformed client_metadata projection. The IDs can still be generated so
+	// the outbound metadata is rebuilt into a legal shape, but device mode must
+	// not preserve raw session/thread aliases for that request.
+	projectionMalformed bool
+	// fallbackIdentity is captured from the ingress snapshot before account
+	// isolation. It is used only for malformed device projections, where the
+	// body still needs to follow the same per-API-key values as the isolated
+	// transport headers.
+	fallbackIdentity    codexClientIdentityTuple
+	fallbackAPIKeyID    int64
+	fallbackIdentitySet bool
 }
 
 // resolveCodexFingerprintIDs 按收敛模式计算出站 ID 集合。
@@ -631,14 +1320,30 @@ type codexFingerprintIDs struct {
 // 返回 nil 表示 off 模式，不需要改写。
 // 注意：包含随机生成的 turn_id，调用方必须只调用一次并共享结果给头改写和体改写。
 func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode codexFingerprintMode, deploymentSeed ...string) *codexFingerprintIDs {
+	// The old call surface carried the deployment JWT secret. Official
+	// convergence is keyed solely by the persisted per-account seed, so it is
+	// deliberately ignored to keep an import stable across deployments.
+	_ = deploymentSeed
+	if account == nil {
+		return nil
+	}
 	mode = codexFingerprintRuntimeMode(mode)
 	if mode == codexFingerprintOff {
+		return nil
+	}
+	// A convergence snapshot is account state, not a best-effort derivation
+	// from the legacy openai_device_id.  The official implementation requires
+	// the persisted canonical non-nil UUID seed for every opt-in mode; without it, session/full
+	// would otherwise emit empty lifecycle IDs and overwrite the client's
+	// session/thread headers.  Fail closed until the account write path creates
+	// the seed atomically.
+	if account.getCodexFingerprintSeed() == "" {
 		return nil
 	}
 
 	ids := &codexFingerprintIDs{accountID: account.ID, mode: mode}
 
-	ids.installationID = resolveConvergedInstallationID(account, firstCodexFingerprintSeed(deploymentSeed))
+	ids.installationID = resolveConvergedInstallationID(account)
 	if ids.installationID == "" {
 		return nil
 	}
@@ -648,9 +1353,10 @@ func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode c
 		return ids
 
 	case codexFingerprintSession:
-		seed := firstCodexFingerprintSeed(deploymentSeed)
-		ids.sessionID = resolveCodexConversationSessionID(account, clientSessionID, seed)
-		ids.threadID = resolveConvergedThreadID(account, clientSessionID, seed)
+		// Official session mode keeps one upstream session per account and
+		// derives a separate thread for each real client conversation.
+		ids.sessionID = resolveConvergedSessionID(account)
+		ids.threadID = resolveConvergedThreadID(account, clientSessionID)
 		if ids.threadID == "" {
 			ids.threadID = ids.sessionID
 		}
@@ -660,7 +1366,7 @@ func resolveCodexFingerprintIDs(account *Account, clientSessionID string, mode c
 		return ids
 
 	case codexFingerprintFull:
-		ids.sessionID = resolveConvergedSessionID(account, firstCodexFingerprintSeed(deploymentSeed))
+		ids.sessionID = resolveConvergedSessionID(account)
 		ids.threadID = ids.sessionID
 		ids.turnID = uuid.Must(uuid.NewV7()).String()
 		ids.windowID = ids.threadID + ":0"
@@ -675,14 +1381,37 @@ func codexFingerprintIDsBelongToAccount(ids *codexFingerprintIDs, account *Accou
 	if ids == nil || account == nil || ids.accountID <= 0 || account.ID <= 0 {
 		return false
 	}
-	if ids.accountID != account.ID || codexFingerprintRuntimeMode(ids.mode) != account.GetCodexFingerprintMode() {
+	// Do not let an invalid/stale snapshot become "off" through the runtime
+	// normalizer and then pass an account that is currently off. Only the three
+	// explicit convergence modes can ever be staged for an outbound request.
+	snapshotMode := ids.mode
+	if snapshotMode != codexFingerprintDevice &&
+		snapshotMode != codexFingerprintSession &&
+		snapshotMode != codexFingerprintFull {
 		return false
 	}
-	// Account configuration can change while an in-flight attempt is being
-	// failed over. Bind the staged snapshot to the current installation too, so
-	// a mode/seed rotation cannot reuse a half-old identity tuple.
+	if ids.accountID != account.ID || snapshotMode != account.GetCodexFingerprintMode() {
+		return false
+	}
+	// Failover can change the account configuration while a request is in
+	// flight. Bind the staged snapshot to the selected account's current
+	// installation identity before applying it to an outbound request. Session
+	// and full modes also carry an account-wide session derived from the
+	// persisted seed. Comparing that projection is important when an
+	// administrator keeps an explicit openai_device_id but rotates the seed:
+	// the installation would remain equal while the lifecycle snapshot would be
+	// stale. Device mode has no account-owned session projection, so the
+	// installation comparison is the complete ownership check there.
 	expectedInstallation := strings.TrimSpace(resolveConvergedInstallationID(account))
-	return expectedInstallation != "" && expectedInstallation == strings.TrimSpace(ids.installationID)
+	if expectedInstallation == "" || expectedInstallation != strings.TrimSpace(ids.installationID) {
+		return false
+	}
+	mode := snapshotMode
+	if mode == codexFingerprintSession || mode == codexFingerprintFull {
+		expectedSession := strings.TrimSpace(resolveConvergedSessionID(account))
+		return expectedSession != "" && expectedSession == strings.TrimSpace(ids.sessionID)
+	}
+	return true
 }
 
 // extractClientSessionID 从请求头中提取客户端原始的会话标识。
@@ -695,41 +1424,36 @@ func extractClientSessionID(h http.Header) string {
 	if v := strings.TrimSpace(h.Get("session_id")); v != "" {
 		return v
 	}
-	if v := strings.TrimSpace(h.Get("conversation_id")); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(h.Get("thread-id")); v != "" {
-		return v
-	}
-	if v := strings.TrimSpace(h.Get("x-codex-window-id")); v != "" {
-		return strings.TrimSuffix(v, ":0")
-	}
 	return ""
 }
 
-// resolveCodexConversationSeed prefers explicit client identity, then stable
-// body metadata/cache identity, and finally a content-derived conversation
-// anchor. apiKeyID prevents identical prompts from different downstream users
-// sharing an upstream session.
+// resolveCodexConversationSeed extracts only a client-owned conversation
+// identity. A prompt cache key or request content is not a lifecycle identity:
+// both can legitimately change between turns, and using either as a thread
+// seed makes one real Codex session appear as many upstream threads. The
+// account-level session is the documented fallback when the client omitted
+// all lifecycle carriers.
 func resolveCodexConversationSeed(clientHeaders http.Header, body []byte, apiKeyID int64) string {
+	_ = apiKeyID // retained for callers compiled against the older helper signature
 	if clientHeaders != nil {
 		if explicit := extractClientSessionID(clientHeaders); explicit != "" {
-			return fmt.Sprintf("apikey:%d:header:%s", apiKeyID, explicit)
+			return explicit
 		}
 	}
-	for _, path := range []string{
-		"client_metadata.session_id",
-		"client_metadata.thread_id",
-		"prompt_cache_key",
-	} {
-		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); value != "" {
-			return fmt.Sprintf("apikey:%d:body:%s", apiKeyID, value)
+	// Some reverse proxies remove the canonical headers while preserving the
+	// official client_metadata envelope. Read both the flat fields and the
+	// nested x-codex-turn-metadata projection. The shared body parser rejects a
+	// contradictory/malformed projection instead of selecting one half of a
+	// mixed identity. Never infer a lifecycle identity from cache/content.
+	if projection := codexIdentityFromBody(body); projection.valid {
+		if sessionID := strings.TrimSpace(projection.tuple.sessionID); sessionID != "" {
+			return sessionID
+		}
+		if threadID := strings.TrimSpace(projection.tuple.threadID); threadID != "" {
+			return threadID
 		}
 	}
-	if contentSeed := deriveOpenAIAnchoredContentSessionSeed(body); contentSeed != "" {
-		return fmt.Sprintf("apikey:%d:content:%s", apiKeyID, contentSeed)
-	}
-	return fmt.Sprintf("apikey:%d:default", apiKeyID)
+	return ""
 }
 
 // resolveCodexFingerprintIDsFromRequest 从客户端原始请求头中提取 session-id，
@@ -747,7 +1471,15 @@ func resolveCodexFingerprintIDsFromRequest(account *Account, clientHeaders http.
 	if clientHeaders != nil {
 		clientSessionID = extractClientSessionID(clientHeaders)
 	}
-	return resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
+	ids := resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
+	if ids != nil {
+		ids.projectionMalformed = codexFingerprintProjectionMalformed(clientHeaders, nil)
+		if ids.projectionMalformed {
+			ids.fallbackIdentity = codexBestEffortIdentityFromRequest(clientHeaders, nil)
+			ids.fallbackIdentitySet = true
+		}
+	}
+	return ids
 }
 
 func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.Header, body []byte, apiKeyID int64, deploymentSeed ...string) *codexFingerprintIDs {
@@ -759,7 +1491,27 @@ func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.H
 		return nil
 	}
 	clientSessionID := resolveCodexConversationSeed(clientHeaders, body, apiKeyID)
-	return resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
+	ids := resolveCodexFingerprintIDs(account, clientSessionID, mode, deploymentSeed...)
+	if ids != nil {
+		ids.projectionMalformed = codexFingerprintProjectionMalformed(clientHeaders, body)
+		if ids.projectionMalformed {
+			ids.fallbackIdentity = codexBestEffortIdentityFromRequest(clientHeaders, body)
+			ids.fallbackAPIKeyID = apiKeyID
+			ids.fallbackIdentitySet = true
+		}
+	}
+	return ids
+}
+
+// resolveCodexFingerprintIDsForRuntime is retained for callers introduced by
+// the prior compatibility layer. Runtime paths must use the same opt-in,
+// account-bound snapshot as the normal HTTP and WebSocket builders.
+func resolveCodexFingerprintIDsForRuntime(account *Account, clientHeaders http.Header, body []byte, apiKeyID int64, deploymentSeed ...string) *codexFingerprintIDs {
+	return resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, apiKeyID, deploymentSeed...)
+}
+
+func resolveCodexFingerprintIDsForRuntimeFromRequest(account *Account, clientHeaders http.Header, deploymentSeed ...string) *codexFingerprintIDs {
+	return resolveCodexFingerprintIDsFromRequest(account, clientHeaders, deploymentSeed...)
 }
 
 // applyCodexFingerprintHeaders 按预计算的收敛 ID 改写出站 HTTP 头中的设备指纹。
@@ -768,34 +1520,51 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 	if h == nil || ids == nil {
 		return
 	}
-	// Regular Responses and Responses-WebSocket requests carry the converged
-	// installation identity in body `client_metadata`. The direct
-	// x-codex-installation-id header belongs only to legacy /responses/compact.
-	// Remove a client/stale projection before any other rewrite.
-	h.Del("x-codex-installation-id")
-	if codexTurnMetadataMalformed(h.Get("x-codex-turn-metadata")) {
-		// Do not partially rewrite a request whose embedded metadata cannot be
-		// parsed. Keeping the original identity tuple is safer than mixing a
-		// converged installation with stale turn fields.
-		return
-	}
+	// Keep the transport-level projection in sync with client_metadata. The
+	// official Codex gateway sends x-codex-installation-id on ordinary
+	// Responses, passthrough, and WebSocket requests as well as compact.
+	// Set it before rebuilding embedded metadata so a stale client value cannot
+	// survive when the embedded turn metadata cannot be decoded.
+	h.Set("x-codex-installation-id", ids.installationID)
 
 	// 所有非 off 模式都收敛 installation_id
-	// The regular HTTP/WS path deliberately does not emit the direct
-	// x-codex-installation-id header; compact adds it in its dedicated helper.
+	// The direct installation projection is shared by regular HTTP/WS and
+	// compact; session/full lifecycle fields are handled below.
 	// A request ID identifies one upstream attempt, not a conversation. Keeping
 	// it stable across a session makes unrelated turns look like replays.
 
 	if ids.mode == codexFingerprintDevice {
-		rewriteCodexTurnMetadataFields(h, map[string]any{
+		fields := map[string]any{
 			"installation_id": ids.installationID,
-		})
+		}
+		if ids.projectionMalformed && ids.fallbackIdentitySet {
+			// The normal builder has already isolated direct session/thread
+			// headers. Rebuild an existing embedded snapshot from the same raw
+			// source so it cannot reintroduce the client's unisolated aliases.
+			fallback := ids.fallbackIdentity
+			if fallback.sessionID != "" {
+				fields["session_id"] = isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.sessionID)
+			}
+			if fallback.threadID != "" {
+				fields["thread_id"] = isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.threadID)
+			}
+			if fallback.turnID != "" {
+				fields["turn_id"] = fallback.turnID
+			}
+			if fallback.windowID != "" {
+				fields["window_id"] = fallback.windowID
+			}
+			if fallback.parentThreadID != "" {
+				fields["parent_thread_id"] = fallback.parentThreadID
+			}
+		}
+		rewriteCodexTurnMetadataFields(h, fields)
 		return
 	}
 
 	// session / full 模式：改写所有相关头
-	// Defensive guard for snapshots produced by pre-device-only callers. Do not
-	// emit a second stateless session graph after the runtime gate above.
+	// Defensive guard for snapshots produced by legacy callers. Do not emit a
+	// second stateless session graph after the runtime mode gate above.
 	if ids.mode != codexFingerprintSession && ids.mode != codexFingerprintFull {
 		return
 	}
@@ -805,8 +1574,8 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 	// 连字符形式和下划线形式都改写，保证一致
 	h.Set("session-id", ids.sessionID)
 	h.Set("session_id", ids.sessionID)
-	h.Set("conversation_id", ids.sessionID)
 	h.Set("thread-id", ids.threadID)
+	h.Set("thread_id", ids.threadID)
 
 	rewriteCodexTurnMetadataFields(h, map[string]any{
 		"installation_id":         ids.installationID,
@@ -816,6 +1585,12 @@ func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
 		"window_id":               ids.windowID,
 		"turn_started_at_unix_ms": ids.turnStartedAtUnixMS,
 	})
+	if ids.projectionMalformed && ids.fallbackIdentitySet && ids.fallbackIdentity.parentThreadID != "" {
+		// Parent threads are client-owned in session/full modes. When the
+		// ingress projections disagree, choose the same header-priority value
+		// that the body repair path uses instead of leaving a split graph.
+		h.Set("x-codex-parent-thread-id", ids.fallbackIdentity.parentThreadID)
+	}
 }
 
 func applyCodexFingerprintToBodyBytes(body []byte, ids *codexFingerprintIDs) ([]byte, bool) {
@@ -858,8 +1633,11 @@ func rewriteCodexTurnMetadataFields(h http.Header, fields map[string]any) {
 		return
 	}
 	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil || metadata == nil {
+		// Match the official Codex compatibility projection: a malformed
+		// embedded snapshot is replaced with a minimal legal object instead of
+		// leaving only the flat installation header rewritten.
+		metadata = make(map[string]any, len(fields))
 	}
 	for k, v := range fields {
 		metadata[k] = v
@@ -938,14 +1716,23 @@ func rewriteCodexPromptCacheKey(reqBody map[string]any, ids *codexFingerprintIDs
 	return true
 }
 
+func setExistingClientMetadataAliases(metadata map[string]any, names []string, value string) {
+	value = strings.TrimSpace(value)
+	if metadata == nil || value == "" {
+		return
+	}
+	for _, name := range names {
+		if _, exists := metadata[name]; exists {
+			metadata[name] = value
+		}
+	}
+}
+
 // applyCodexFingerprintToClientMetadataMap 是 client_metadata 改写的共享核心，
 // map 版（非透传，body 已解码）与 raw 字节版（透传热路径）都经由它，保证两条
 // 路径的收敛语义永不漂移。
 func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *codexFingerprintIDs) bool {
 	if existing == nil || ids == nil {
-		return false
-	}
-	if raw, ok := existing["x-codex-turn-metadata"].(string); ok && codexTurnMetadataMalformed(raw) {
 		return false
 	}
 	mode := codexFingerprintRuntimeMode(ids.mode)
@@ -957,13 +1744,59 @@ func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *code
 
 	if ids.installationID != "" {
 		existing["x-codex-installation-id"] = ids.installationID
+		// A few compatible clients use the unprefixed body alias alongside the
+		// canonical x-codex key. Keep an existing alias in lockstep instead of
+		// forwarding two contradictory installation identities.
+		if _, exists := existing["installation_id"]; exists {
+			existing["installation_id"] = ids.installationID
+		}
 		modified = true
 	}
 
 	if mode == codexFingerprintDevice {
+		if ids.projectionMalformed && ids.fallbackIdentitySet {
+			fallback := ids.fallbackIdentity
+			// Only rewrite fields that were already present in the flat
+			// projection. A body with no lifecycle carriers must not acquire a
+			// synthetic session graph merely because device convergence is on.
+			setExistingClientMetadataAliases(existing, []string{"session_id", "session-id"}, isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.sessionID))
+			setExistingClientMetadataAliases(existing, []string{"thread_id", "thread-id"}, isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.threadID))
+			setExistingClientMetadataAliases(existing, []string{"turn_id", "turn-id"}, fallback.turnID)
+			setExistingClientMetadataAliases(existing, []string{"x-codex-window-id", "window_id"}, fallback.windowID)
+			setExistingClientMetadataAliases(existing, []string{"x-codex-parent-thread-id", "parent_thread_id"}, fallback.parentThreadID)
+		}
+		fields := map[string]any{
+			"installation_id":         ids.installationID,
+			"x-codex-installation-id": ids.installationID,
+		}
+		if ids.projectionMalformed && ids.fallbackIdentitySet {
+			fallback := ids.fallbackIdentity
+			if fallback.sessionID != "" {
+				fields["session_id"] = isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.sessionID)
+			}
+			if fallback.threadID != "" {
+				fields["thread_id"] = isolateOpenAISessionID(ids.fallbackAPIKeyID, fallback.threadID)
+			}
+			if fallback.turnID != "" {
+				fields["turn_id"] = fallback.turnID
+			}
+			if fallback.windowID != "" {
+				fields["window_id"] = fallback.windowID
+			}
+			if fallback.parentThreadID != "" {
+				fields["parent_thread_id"] = fallback.parentThreadID
+			}
+		}
 		rewriteClientMetadataEmbeddedTurnMetadata(existing, map[string]any{
-			"installation_id": ids.installationID,
+			"installation_id":         fields["installation_id"],
+			"x-codex-installation-id": fields["x-codex-installation-id"],
 		})
+		// Reapply the fallback lifecycle only when an embedded projection was
+		// present. The helper above intentionally leaves a missing envelope
+		// absent, preserving generic request shape in device mode.
+		if _, exists := existing["x-codex-turn-metadata"]; exists && len(fields) > 2 {
+			rewriteClientMetadataEmbeddedTurnMetadata(existing, fields)
+		}
 		return modified
 	}
 
@@ -972,15 +1805,41 @@ func applyCodexFingerprintToClientMetadataMap(existing map[string]any, ids *code
 	existing["thread_id"] = ids.threadID
 	existing["turn_id"] = ids.turnID
 	existing["x-codex-window-id"] = ids.windowID
+	if _, exists := existing["session-id"]; exists {
+		existing["session-id"] = ids.sessionID
+	}
+	if _, exists := existing["thread-id"]; exists {
+		existing["thread-id"] = ids.threadID
+	}
+	if _, exists := existing["window_id"]; exists {
+		existing["window_id"] = ids.windowID
+	}
+	if ids.projectionMalformed && ids.fallbackIdentitySet && ids.fallbackIdentity.parentThreadID != "" {
+		setExistingClientMetadataAliases(
+			existing,
+			[]string{"x-codex-parent-thread-id", "parent_thread_id"},
+			ids.fallbackIdentity.parentThreadID,
+		)
+	}
 
 	rewriteClientMetadataEmbeddedTurnMetadata(existing, map[string]any{
 		"installation_id":         ids.installationID,
+		"x-codex-installation-id": ids.installationID,
 		"session_id":              ids.sessionID,
+		"session-id":              ids.sessionID,
 		"thread_id":               ids.threadID,
+		"thread-id":               ids.threadID,
 		"turn_id":                 ids.turnID,
 		"window_id":               ids.windowID,
+		"x-codex-window-id":       ids.windowID,
 		"turn_started_at_unix_ms": ids.turnStartedAtUnixMS,
 	})
+	if ids.projectionMalformed && ids.fallbackIdentitySet && ids.fallbackIdentity.parentThreadID != "" {
+		rewriteClientMetadataEmbeddedTurnMetadata(existing, map[string]any{
+			"parent_thread_id":         ids.fallbackIdentity.parentThreadID,
+			"x-codex-parent-thread-id": ids.fallbackIdentity.parentThreadID,
+		})
+	}
 	return true
 }
 
@@ -1045,19 +1904,45 @@ func applyCodexFingerprintClientMetadataRaw(body []byte, ids *codexFingerprintID
 // rewriteClientMetadataEmbeddedTurnMetadata 改写 client_metadata 中内嵌的
 // x-codex-turn-metadata JSON 字符串里的指定字段。
 func rewriteClientMetadataEmbeddedTurnMetadata(clientMetadata map[string]any, fields map[string]any) {
-	raw, ok := clientMetadata["x-codex-turn-metadata"].(string)
-	if !ok || raw == "" {
+	value, exists := clientMetadata["x-codex-turn-metadata"]
+	if !exists || value == nil {
 		return
 	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return
+	apply := func(metadata map[string]any) {
+		for k, v := range fields {
+			metadata[k] = v
+		}
 	}
-	for k, v := range fields {
-		metadata[k] = v
-	}
-	if rebuilt, err := json.Marshal(metadata); err == nil {
-		clientMetadata["x-codex-turn-metadata"] = string(rebuilt)
+	switch raw := value.(type) {
+	case string:
+		if strings.TrimSpace(raw) == "" {
+			metadata := make(map[string]any, len(fields))
+			apply(metadata)
+			if rebuilt, err := json.Marshal(metadata); err == nil {
+				clientMetadata["x-codex-turn-metadata"] = string(rebuilt)
+			}
+			return
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(raw), &metadata); err != nil || metadata == nil {
+			metadata = make(map[string]any, len(fields))
+		}
+		apply(metadata)
+		if rebuilt, err := json.Marshal(metadata); err == nil {
+			clientMetadata["x-codex-turn-metadata"] = string(rebuilt)
+		}
+	case map[string]any:
+		apply(raw)
+	case map[string]string:
+		for key, value := range fields {
+			if text, ok := value.(string); ok {
+				raw[key] = text
+			}
+		}
+	default:
+		metadata := make(map[string]any, len(fields))
+		apply(metadata)
+		clientMetadata["x-codex-turn-metadata"] = metadata
 	}
 }
 
@@ -1081,6 +1966,14 @@ func codexBodyTurnMetadataMalformed(body []byte) bool {
 }
 
 func codexFingerprintProjectionMalformed(headers http.Header, body []byte) bool {
-	return (headers != nil && codexTurnMetadataMalformed(headers.Get("x-codex-turn-metadata"))) ||
-		codexBodyTurnMetadataMalformed(body)
+	headerProjection := codexIdentityFromHeaders(headers)
+	bodyProjection := codexIdentityFromBody(body)
+	if !headerProjection.valid || !bodyProjection.valid {
+		return true
+	}
+	// Installation and turn IDs are intentionally excluded here. Device mode
+	// rewrites installation_id, and a pooled WS connection legitimately rotates
+	// turn_id on each response.create frame. The stable lifecycle tuple must
+	// still agree across every surviving carrier.
+	return !codexIdentityLifecycleTuplesAgree(headerProjection.tuple, bodyProjection.tuple)
 }

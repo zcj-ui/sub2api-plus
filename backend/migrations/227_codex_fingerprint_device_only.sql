@@ -1,13 +1,9 @@
--- The gateway cannot faithfully synthesize Codex's stateful session/thread/
--- compact-window lineage. Keep the persisted opt-in, but migrate the legacy
--- stateless modes to the only projection that is protocol-consistent: device.
-UPDATE accounts
-SET extra = jsonb_set(
-    COALESCE(extra, '{}'::jsonb),
-    '{codex_fingerprint_mode}',
-    to_jsonb('device'::text),
-    true
-)
-WHERE platform = 'openai'
-  AND type = 'oauth'
-  AND extra->>'codex_fingerprint_mode' IN ('session', 'full');
+-- Compatibility no-op.
+--
+-- This migration was originally published with a destructive UPDATE that
+-- collapsed the explicit `session` and `full` Codex fingerprint modes into
+-- `device`.  The gateway now supports the complete opt-in lifecycle, so a
+-- fresh install must preserve all four modes.  Keep the historical filename
+-- for migration ordering; the checksum compatibility rule in the runner
+-- allows databases that already recorded the original file to upgrade.
+SELECT 1;

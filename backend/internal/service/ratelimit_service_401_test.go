@@ -25,6 +25,14 @@ type rateLimitAccountRepoStub struct {
 	lastTempReason         string
 	lastErrorID            int64
 	lastTempID             int64
+	platformAccounts       []Account
+}
+
+func (r *rateLimitAccountRepoStub) ListByPlatform(_ context.Context, platform string) ([]Account, error) {
+	if platform != PlatformOpenAI {
+		return nil, nil
+	}
+	return append([]Account(nil), r.platformAccounts...), nil
 }
 
 func (r *rateLimitAccountRepoStub) SetError(ctx context.Context, id int64, errorMsg string) error {
@@ -148,6 +156,26 @@ func TestRateLimitService_HandleUpstreamError_OAuth401SetsTempUnschedulable(t *t
 		require.Len(t, invalidator.accounts, 1)
 		require.Equal(t, int64(100), invalidator.accounts[0].ID)
 	})
+}
+
+func TestRateLimitService_TeamLinkedWorkspaceErrorFansOutOnce(t *testing.T) {
+	teamID := "team-linked-1"
+	trigger := Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Credentials: map[string]any{"chatgpt_account_id": teamID}}
+	peer := Account{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Credentials: map[string]any{"chatgpt_account_id": teamID}}
+	other := Account{ID: 3, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		Credentials: map[string]any{"chatgpt_account_id": "other"}}
+	repo := &rateLimitAccountRepoStub{platformAccounts: []Account{trigger, peer, other}}
+	svc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+
+	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
+	svc.maybeHandleOpenAITeamLinkedError(context.Background(), &trigger, http.StatusPaymentRequired, body)
+	svc.maybeHandleOpenAITeamLinkedError(context.Background(), &trigger, http.StatusPaymentRequired, body)
+
+	require.Equal(t, 1, repo.setErrorCalls)
+	require.Equal(t, int64(2), repo.lastErrorID)
+	require.Contains(t, repo.lastErrorMsg, "team-linked")
 }
 
 // TestRateLimitService_HandleUpstreamError_SparkShadow401RedirectsToParent 外审第9轮:影子无独立凭据,

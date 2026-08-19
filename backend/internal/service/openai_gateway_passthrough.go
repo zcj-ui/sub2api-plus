@@ -18,7 +18,6 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -208,21 +207,26 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	}
 	body = updatedBody
 
-	// Resolve convergence once, after body policy has settled. The raw client
-	// metadata rewrite and staged outbound headers share this exact ID set.
+	// Resolve convergence once after the body policy has settled. The raw body
+	// rewrite and all outbound header projections must share this exact snapshot.
 	if account.IsOpenAIOAuth() {
 		var clientHeaders http.Header
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
 		}
 		var fpIDs *codexFingerprintIDs
-		if !codexFingerprintProjectionMalformed(clientHeaders, body) {
-			fpIDs = resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, getAPIKeyIDFromContext(c), codexFingerprintDeploymentSeed(s.cfg))
+		if !isOpenAIResponsesCompactPath(c) && shouldApplyCodexFingerprintForRequest(c, account, body) {
+			fpIDs = resolveCodexFingerprintIDsForRequest(
+				account,
+				clientHeaders,
+				body,
+				getAPIKeyIDFromContext(c),
+				codexFingerprintDeploymentSeed(s.cfg),
+			)
 		}
-		// Legacy /responses/compact carries the installation projection in
-		// dedicated headers; do not manufacture a normal Responses
-		// client_metadata object in its body. The staged snapshot is still kept
-		// for applyStagedCodexCompactHeaders below.
+		// Legacy /responses/compact is intentionally outside the fingerprint
+		// convergence projection. It keeps its own protocol/session handling and
+		// must not receive a synthetic client_metadata identity snapshot.
 		if !isOpenAIResponsesCompactPath(c) {
 			nextBody, changed, fpErr := applyCodexFingerprintClientMetadataRaw(body, fpIDs)
 			if fpErr != nil {
@@ -233,6 +237,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			}
 		}
 		stageCodexFingerprintIDs(c, fpIDs)
+	} else {
+		stageCodexFingerprintIDs(c, nil)
 	}
 
 	apiKey := getAPIKeyFromContext(c)
@@ -508,6 +514,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 
 	// DeepSeek 原生 Responses 端点为无状态实现（见 normalizeDeepSeekResponsesRequestBody）。
 	body = normalizeDeepSeekResponsesRequestBody(account, body)
+	if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, body); changed {
+		body = scrubbed
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -532,6 +541,10 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	// 客户端回带的 x-codex-turn-state 若已知由其他账号铸造（failover 换号），
 	// 剥离后再出站（openai_codex_turn_state.go）。
 	s.guardOpenAICodexTurnStateEcho(c, account, req.Header)
+	// Keep a complete body-carried Codex lifecycle coherent when a relay removed
+	// only its transport projections. This runs before passthrough snapshots
+	// the aliases, and never overwrites an explicit inbound header.
+	restoreStagedCodexIdentityHeadersFromBody(c, account, req.Header, body)
 
 	// 覆盖入站鉴权残留，并注入上游认证
 	req.Header.Del("authorization")
@@ -552,9 +565,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	var clientCanonicalRequestID string
 	var clientConversationID string
 	if account.Type == AccountTypeOAuth {
-		// Current Codex OAuth HTTP no longer negotiates the legacy Responses
-		// experiment. Passthrough may receive it from an older client, so remove
-		// only that token while preserving any independent beta negotiation.
+		canonical := resolveCodexOutboundIdentity("")
+		// Keep independent beta tokens, but discard the legacy Responses
+		// experiment marker before sending OAuth traffic upstream.
 		stripOpenAILegacyResponsesBeta(req.Header)
 		promptCacheKey := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
 		req.Host = "chatgpt.com"
@@ -562,17 +575,16 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 			return nil, fmt.Errorf("resolve chatgpt account headers: %w", err)
 		}
 		apiKeyID = getAPIKeyIDFromContext(c)
-		// 先保存客户端原始值，再做 compact 补充，避免后续统一隔离时读到已处理的值。
 		clientSessionID := strings.TrimSpace(req.Header.Get("session_id"))
 		clientConversationID = strings.TrimSpace(req.Header.Get("conversation_id"))
-		clientCanonicalSessionID := firstHeaderValue(c.Request.Header, "session-id", "session_id")
-		clientCanonicalThreadID = firstHeaderValue(c.Request.Header, "thread-id", "thread_id")
-		clientCanonicalRequestID = firstHeaderValue(c.Request.Header, "x-client-request-id")
-		preserveCodexSession := shouldPreserveCodexClientSessionIdentity(account)
+		clientCanonicalSessionID := firstHeaderValue(req.Header, "session-id", "session_id")
+		clientCanonicalThreadID = firstHeaderValue(req.Header, "thread-id", "thread_id")
+		clientCanonicalRequestID = firstHeaderValue(req.Header, "x-client-request-id")
+		preserveCodexSession := shouldPreserveCodexClientSessionIdentityForRequest(c, account)
 		if isOpenAIResponsesCompactPath(c) {
 			req.Header.Set("accept", "application/json")
 			if req.Header.Get("version") == "" {
-				req.Header.Set("version", codexCLIVersion)
+				req.Header.Set("version", canonical.version)
 			}
 			if clientSessionID == "" {
 				clientSessionID = resolveOpenAICompactSessionID(c)
@@ -581,9 +593,8 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 			req.Header.Set("accept", "text/event-stream")
 		}
 		if req.Header.Get("originator") == "" {
-			req.Header.Set("originator", openai.CodexDefaultOriginator)
+			req.Header.Set("originator", canonical.originator)
 		}
-		// 用隔离后的 session 标识符覆盖客户端透传值，防止跨用户会话碰撞。
 		if clientSessionID == "" {
 			clientSessionID = promptCacheKey
 		}
@@ -595,9 +606,6 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		}
 		if clientConversationID != "" {
 			req.Header.Set("conversation_id", isolateOpenAISessionID(apiKeyID, clientConversationID))
-		}
-		if ids := stagedCodexFingerprintIDs(c, account); ids != nil {
-			applyCodexFingerprintHeaders(req.Header, ids)
 		}
 		if preserveCodexSession {
 			if clientCanonicalSessionID != "" {
@@ -613,28 +621,16 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 			}
 		}
 	} else if isOpenAIResponsesCompactPath(c) {
-		// 透传白名单会放行客户端的 Accept: text/event-stream；compact 上游是
-		// unary JSON 协议，API-key 账号同样强制 Accept，避免上游按 SSE 返回
-		// （#3777 期望行为 4）。
 		req.Header.Set("accept", "application/json")
 	}
 
-	// 透传模式也支持账户自定义 User-Agent 与 ForceCodexCLI 兜底。
-	customUA := account.GetOpenAIUserAgent()
-	if customUA != "" {
+	if customUA := account.GetOpenAIUserAgent(); customUA != "" {
 		req.Header.Set("user-agent", customUA)
 	}
 	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
-		req.Header.Set("user-agent", codexCLIUserAgent)
+		req.Header.Set("user-agent", CodexCanonicalUserAgent())
 	}
-	// 指纹收敛：使用 forwardOpenAIPassthrough 中预计算的收敛 ID 改写出站头，
-	// 与请求体 client_metadata 共享同一份 IDs（与非透传路径相同的相对位置：
-	// 会话隔离之后、终态身份收口之前）。
-	applyStagedCodexFingerprintHeaders(c, account, req.Header)
-	if isOpenAIResponsesCompactPath(c) {
-		applyStagedCodexCompactHeaders(c, account, req.Header, body)
-	}
-	if account.Type == AccountTypeOAuth && !shouldPreserveCodexClientSessionIdentity(account) {
+	if account.Type == AccountTypeOAuth && !shouldPreserveCodexClientSessionIdentityForRequest(c, account) {
 		normalizeOpenAIOAuthSessionHeadersForIsolation(
 			req.Header,
 			apiKeyID,
@@ -644,8 +640,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 			clientConversationID,
 		)
 	}
-	// 终态收口：透传路径的 OAuth 与非透传完全一致，同样强制统一出站身份
-	// （User-Agent / originator / version 同源自洽），客户端自报身份不会到达上游。
+	applyStagedCodexFingerprintHeaders(c, account, req.Header)
 	if account.Type == AccountTypeOAuth {
 		enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
 	}
