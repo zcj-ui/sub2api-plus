@@ -1,10 +1,18 @@
 # Sub2API Plus 更新日志
 
-当前准备版本：`0.2.4`
+当前准备版本：`0.2.5`
 
 发布日期：2026-08-18
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
+
+## 0.2.5 Codex 生命周期兼容性与 CI 修复
+
+- 恢复官方 Codex 指纹四档生命周期（`off`、`device`、`session`、`full`），统一 HTTP 与 WebSocket 行为。
+- WebSocket 连接池按稳定的 session、thread、parent-thread、installation 和 API key 隔离，并忽略每回合变化的标识。
+- 增加历史 device-only 迁移恢复标记，保留管理员明确编辑后的档位语义。
+- 修复 `golangci-lint` 报错，补充正文投影、连接复用和错误检查回归测试。
+- 已通过完整 CI、安全扫描、前端检查、后端单元/集成测试和开发构建。
 
 ## 0.2.4 发布门禁与 WebSocket 状态清理
 
