@@ -1036,10 +1036,12 @@ func TestApplyCodexFingerprintClientMetadata_SynchronizesCompatibilityInstallati
 		},
 	}
 	require.True(t, applyCodexFingerprintClientMetadata(reqBody, ids))
-	metadata := reqBody["client_metadata"].(map[string]any)
+	metadata, ok := reqBody["client_metadata"].(map[string]any)
+	require.True(t, ok)
 	assert.Equal(t, ids.installationID, metadata["installation_id"])
 	assert.Equal(t, ids.installationID, metadata["x-codex-installation-id"])
-	nested := metadata["x-codex-turn-metadata"].(map[string]any)
+	nested, ok := metadata["x-codex-turn-metadata"].(map[string]any)
+	require.True(t, ok)
 	assert.Equal(t, ids.installationID, nested["installation_id"])
 	assert.Equal(t, ids.installationID, nested["x-codex-installation-id"])
 	assert.Equal(t, "turn", nested["request_kind"])

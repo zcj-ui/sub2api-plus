@@ -101,10 +101,10 @@ func TestOpenAIGatewayService_Forward_WSv2ErrorEventUsageLimitPersistsRateLimit(
 			t.Errorf("read ws request failed: %v", err)
 			return
 		}
-			_ = conn.WriteJSON(map[string]any{
-				"type": "error",
-				"status_code": http.StatusTooManyRequests,
-				"error": map[string]any{
+		_ = conn.WriteJSON(map[string]any{
+			"type":        "error",
+			"status_code": http.StatusTooManyRequests,
+			"error": map[string]any{
 				"code":      "rate_limit_exceeded",
 				"type":      "usage_limit_reached",
 				"message":   "The usage limit has been reached",

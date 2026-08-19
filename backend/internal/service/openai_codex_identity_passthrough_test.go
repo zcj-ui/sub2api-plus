@@ -59,65 +59,6 @@ func newCompleteOfficialCodexIdentityContext(t *testing.T) (*gin.Context, *Accou
 	return c, account, body
 }
 
-func requireCompleteOfficialCodexIdentity(t *testing.T, headers http.Header) {
-	t.Helper()
-	for key, want := range map[string]string{
-		"User-Agent":                            "cccc/0.146.0 (Ubuntu 24.04; x86_64) xterm-256color (codex-tui; 0.146.0)",
-		"Originator":                            "cccc",
-		"Version":                               "0.146.0",
-		"OpenAI-Beta":                           "responses_websockets=2026-02-06",
-		"Accept-Language":                       "en-US",
-		"Session-Id":                            "session-1",
-		"Thread-Id":                             "thread-1",
-		"X-Client-Request-Id":                   "thread-1",
-		"X-Codex-Installation-Id":               "install-1",
-		"X-Codex-Inference-Call-Id":             "inference-call-1",
-		"X-Codex-Parent-Thread-Id":              "parent-1",
-		"X-Codex-Routing-Hint":                  "model=client-model;tier=flex",
-		"X-Codex-Turn-Metadata":                 `{"installation_id":"install-1","session_id":"session-1","thread_id":"thread-1"}`,
-		"X-Codex-Turn-State":                    "turn-state-1",
-		"X-Codex-Window-Id":                     "thread-1:0",
-		"X-Oai-Attestation":                     "attestation-1",
-		"X-Openai-Internal-Codex-Residency":     "us",
-		"X-Openai-Memgen-Request":               "true",
-		"X-Responsesapi-Include-Timing-Metrics": "true",
-		"X-Openai-Subagent":                     "review",
-		"X-Codex-Beta-Features":                 "feature-a",
-	} {
-		require.Equal(t, want, headers.Get(key), key)
-	}
-}
-
-func requireCompleteOfficialCodexWSHandshakeIdentity(t *testing.T, headers http.Header) {
-	t.Helper()
-	for key, want := range map[string]string{
-		"User-Agent":                            "cccc/0.146.0 (Ubuntu 24.04; x86_64) xterm-256color (codex-tui; 0.146.0)",
-		"Originator":                            "cccc",
-		"Version":                               "0.146.0",
-		"OpenAI-Beta":                           openAIWSBetaV2Value,
-		"Accept-Language":                       "en-US",
-		"Session-Id":                            "session-1",
-		"Thread-Id":                             "thread-1",
-		"X-Client-Request-Id":                   "thread-1",
-		"X-Codex-Installation-Id":               "install-1",
-		"X-Codex-Inference-Call-Id":             "inference-call-1",
-		"X-Codex-Parent-Thread-Id":              "parent-1",
-		"X-Codex-Routing-Hint":                  "model=client-model;tier=flex",
-		"X-Codex-Turn-Metadata":                 `{"installation_id":"install-1","session_id":"session-1","thread_id":"thread-1"}`,
-		"X-Codex-Window-Id":                     "thread-1:0",
-		"X-Oai-Attestation":                     "attestation-1",
-		"X-Openai-Internal-Codex-Residency":     "us",
-		"X-Openai-Memgen-Request":               "true",
-		"X-Responsesapi-Include-Timing-Metrics": "true",
-		"X-Openai-Subagent":                     "review",
-		"X-Codex-Beta-Features":                 "feature-a",
-	} {
-		require.Equal(t, want, headers.Get(key), key)
-	}
-	require.Empty(t, headers.Get(openAIWSTurnStateHeader))
-	require.Empty(t, headers.Get(responsesLiteHeaderKey))
-}
-
 // Direct request builders apply the gateway's canonical Codex identity. The
 // full client snapshot is tested separately at ingress/body projection seams;
 // these assertions intentionally avoid treating a builder call in isolation
@@ -328,7 +269,8 @@ func TestOfficialCodexWSMovesClientTurnStateAndResponsesLiteIntoPayload(t *testi
 		payload,
 		openAIWSResponseCreateProtocolOptionsFromHeaders(c.Request.Header, "server-state"),
 	)
-	metadata := payload["client_metadata"].(map[string]any)
+	metadata, ok := payload["client_metadata"].(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, "client-state", metadata[openAIWSTurnStateHeader])
 	require.Equal(t, "true", metadata[responsesLiteWSMetadataKey])
 }
@@ -353,7 +295,8 @@ func TestOfficialCodexWSMapsCachedTurnStateIntoPayload(t *testing.T) {
 		payload,
 		openAIWSResponseCreateProtocolOptionsFromHeaders(c.Request.Header, "server-state"),
 	)
-	metadata := payload["client_metadata"].(map[string]any)
+	metadata, ok := payload["client_metadata"].(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, "server-state", metadata[openAIWSTurnStateHeader])
 }
 

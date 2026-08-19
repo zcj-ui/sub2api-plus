@@ -1677,7 +1677,7 @@ func TestOpenAIGatewayService_Forward_WSv2_GeneratePrewarmSecond429PinsOldConnec
 
 	captureConn := &openAIWSCaptureConn{events: [][]byte{
 		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
-			[]byte(`{"type":"response.failed","status_code":429,"response":{"id":"resp_second429_prewarm","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
+		[]byte(`{"type":"response.failed","status_code":429,"response":{"id":"resp_second429_prewarm","status":"failed","error":{"code":"rate_limit_exceeded","message":"quota reached"}}}`),
 		[]byte(`{"type":"response.completed","response":{"id":"resp_second429_main","model":"gpt-5.1","usage":{"input_tokens":2,"output_tokens":1}}}`),
 	}}
 	captureDialer := &openAIWSCaptureDialer{conn: captureConn}

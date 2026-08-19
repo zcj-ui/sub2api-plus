@@ -168,20 +168,6 @@ var openaiOfficialCodexIdentityHeaders = map[string]bool{
 // headers that the official Codex client itself may emit. It deliberately
 // excludes credentials and proxy metadata, which must be rebuilt for the
 // selected account and network route.
-func copyOpenAIOfficialCodexIdentityHeaders(dst, src http.Header) {
-	if dst == nil || src == nil {
-		return
-	}
-	for key, values := range src {
-		if !openaiOfficialCodexIdentityHeaders[strings.ToLower(strings.TrimSpace(key))] {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
 // codex_cli_only 拒绝时记录的请求头白名单（仅用于诊断日志，不参与上游透传）
 var codexCLIOnlyDebugHeaderWhitelist = []string{
 	"User-Agent",

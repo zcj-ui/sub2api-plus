@@ -409,24 +409,6 @@ func codexClientMetadataCompatibilityJSONValue(value gjson.Result) string {
 	return string(projected)
 }
 
-func copyCompactHeaderIfEmpty(dst, src http.Header, name string) {
-	if strings.TrimSpace(dst.Get(name)) != "" {
-		return
-	}
-	if value := strings.TrimSpace(src.Get(name)); value != "" {
-		dst.Set(name, value)
-	}
-}
-
-func copyCompactHeaderFromBodyIfEmpty(dst http.Header, body []byte, name, path string) {
-	if strings.TrimSpace(dst.Get(name)) != "" {
-		return
-	}
-	if value := firstBodyString(body, path); value != "" {
-		dst.Set(name, value)
-	}
-}
-
 // codexFingerprintMode 控制 OAuth 账号出站请求的设备指纹收敛强度。
 // 多人共享同一 OAuth 账号时，每个用户的 Codex 客户端会携带各自不同的
 // installation_id / session_id / thread_id，上游据此判定设备数和会话数。
@@ -493,16 +475,6 @@ func shouldPreserveCodexClientSessionIdentityForRequest(c *gin.Context, account 
 func hasValidStagedCodexFingerprint(c *gin.Context, account *Account) bool {
 	ids := stagedCodexFingerprintIDs(c, account)
 	return ids != nil && !ids.projectionMalformed && strings.TrimSpace(ids.installationID) != ""
-}
-
-// shouldPassThroughCodexClientIdentity recognizes a complete genuine Codex
-// identity carrier on the inbound request. A matching User-Agent alone is not
-// sufficient: older compatibility clients often send one without the official
-// session/thread lifecycle snapshot. Passing that incomplete shape upstream
-// would create a half-spoofed request, so it stays on the gateway's normal
-// compatibility path instead.
-func shouldPassThroughCodexClientIdentity(account *Account, headers http.Header) bool {
-	return shouldPassThroughCodexClientIdentityWithBody(account, headers, nil)
 }
 
 // captureCodexClientIdentityPassthrough freezes the result from the first
@@ -990,20 +962,6 @@ func codexIdentityTuplesAgree(left, right codexClientIdentityTuple) bool {
 		(left.turnID == "" || right.turnID == "" || left.turnID == right.turnID) &&
 		(left.windowID == "" || right.windowID == "" || left.windowID == right.windowID) &&
 		(left.parentThreadID == "" || right.parentThreadID == "" || left.parentThreadID == right.parentThreadID)
-}
-
-func hasCompleteCodexTurnMetadata(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || codexTurnMetadataMalformed(raw) {
-		return false
-	}
-	var metadata map[string]any
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return false
-	}
-	return strings.TrimSpace(stringValue(metadata["installation_id"])) != "" &&
-		strings.TrimSpace(stringValue(metadata["session_id"])) != "" &&
-		strings.TrimSpace(stringValue(metadata["thread_id"])) != ""
 }
 
 // normalizeCodexFingerprintModeForStorage canonicalizes the opt-in mode while
@@ -1503,17 +1461,6 @@ func resolveCodexFingerprintIDsForRequest(account *Account, clientHeaders http.H
 	return ids
 }
 
-// resolveCodexFingerprintIDsForRuntime is retained for callers introduced by
-// the prior compatibility layer. Runtime paths must use the same opt-in,
-// account-bound snapshot as the normal HTTP and WebSocket builders.
-func resolveCodexFingerprintIDsForRuntime(account *Account, clientHeaders http.Header, body []byte, apiKeyID int64, deploymentSeed ...string) *codexFingerprintIDs {
-	return resolveCodexFingerprintIDsForRequest(account, clientHeaders, body, apiKeyID, deploymentSeed...)
-}
-
-func resolveCodexFingerprintIDsForRuntimeFromRequest(account *Account, clientHeaders http.Header, deploymentSeed ...string) *codexFingerprintIDs {
-	return resolveCodexFingerprintIDsFromRequest(account, clientHeaders, deploymentSeed...)
-}
-
 // applyCodexFingerprintHeaders 按预计算的收敛 ID 改写出站 HTTP 头中的设备指纹。
 // 在 buildUpstreamRequest 的白名单透传之后、enforceCodexIdentityHeaders 之前调用。
 func applyCodexFingerprintHeaders(h http.Header, ids *codexFingerprintIDs) {
@@ -1956,13 +1903,6 @@ func codexTurnMetadataMalformed(raw string) bool {
 		return true
 	}
 	return metadata == nil
-}
-
-func codexBodyTurnMetadataMalformed(body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	return codexTurnMetadataMalformed(gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata").String())
 }
 
 func codexFingerprintProjectionMalformed(headers http.Header, body []byte) bool {

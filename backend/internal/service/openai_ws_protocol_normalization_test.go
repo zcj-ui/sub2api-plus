@@ -42,7 +42,9 @@ func TestNormalizeOpenAIWSResponseCreatePayload_MapsOnlyProtocolMetadata(t *test
 	require.Equal(t, "client-turn-metadata", metadata["x-codex-turn-metadata"])
 	require.Equal(t, "body-turn-state", metadata[openAIWSTurnStateHeader], "body state is authoritative")
 	require.Equal(t, "true", metadata[responsesLiteWSMetadataKey])
-	stamp, err := strconv.ParseInt(metadata[openAIWSStreamRequestStartMSMetadataKey].(string), 10, 64)
+	stampValue, ok := metadata[openAIWSStreamRequestStartMSMetadataKey].(string)
+	require.True(t, ok)
+	stamp, err := strconv.ParseInt(stampValue, 10, 64)
 	require.NoError(t, err)
 	require.Greater(t, stamp, int64(1))
 	require.LessOrEqual(t, stamp, time.Now().UnixMilli())
@@ -102,7 +104,8 @@ func TestOpenAIWSV2HandshakeMovesStateAndLiteIntoResponseCreate(t *testing.T) {
 		payload,
 		openAIWSResponseCreateProtocolOptionsFromHeaders(c.Request.Header, c.GetHeader(openAIWSTurnStateHeader)),
 	)
-	metadata := payload["client_metadata"].(map[string]any)
+	metadata, ok := payload["client_metadata"].(map[string]any)
+	require.True(t, ok)
 	require.Equal(t, "turn-state-1", metadata[openAIWSTurnStateHeader])
 	require.Equal(t, "true", metadata[responsesLiteWSMetadataKey])
 }

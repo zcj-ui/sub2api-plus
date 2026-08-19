@@ -106,7 +106,8 @@ func codexWSIdentityCompatibilityKey(account *Account, c *gin.Context, headers h
 		// thread projection is identical. Turn-scoped fields remain excluded
 		// from material below, preserving reuse across turns for one API key.
 		apiKeyID := getAPIKeyIDFromContext(c)
-		if mode == codexFingerprintSession || mode == codexFingerprintFull {
+		switch mode {
+		case codexFingerprintSession, codexFingerprintFull:
 			// Session/full convergence is stateful across turns. Without a
 			// downstream API key there is no tenant scope to bind that state to;
 			// force an isolated dial instead of reusing an account-wide socket.
@@ -114,7 +115,7 @@ func codexWSIdentityCompatibilityKey(account *Account, c *gin.Context, headers h
 				return "", true
 			}
 			scope = fmt.Sprintf("apikey:%d", apiKeyID)
-		} else if mode == codexFingerprintDevice {
+		case codexFingerprintDevice:
 			if apiKeyID <= 0 {
 				// Device mode preserves the caller's conversation identity. Without
 				// a downstream API-key tenant boundary, reusing a stable socket could
@@ -334,15 +335,7 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	}
 
 	sessionResolution := resolveOpenAIWSSessionHeaders(c, promptCacheKey)
-	canonicalSessionID := ""
-	canonicalThreadID := ""
-	canonicalRequestID := ""
-	canonicalConversationID := ""
 	if c != nil && c.Request != nil {
-		canonicalSessionID = firstHeaderValue(c.Request.Header, "session-id", "session_id")
-		canonicalThreadID = firstHeaderValue(c.Request.Header, "thread-id", "thread_id")
-		canonicalRequestID = firstHeaderValue(c.Request.Header, "x-client-request-id")
-		canonicalConversationID = firstHeaderValue(c.Request.Header, "conversation_id")
 		if v := strings.TrimSpace(c.Request.Header.Get("accept-language")); v != "" {
 			headers.Set("accept-language", v)
 		}
@@ -386,10 +379,10 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	// headers. Restore its validated projections before this builder decides
 	// whether to preserve or isolate the OAuth session aliases.
 	restoreStagedCodexIdentityHeadersFromBody(c, account, headers, identityBody)
-	canonicalSessionID = firstHeaderValue(headers, "session-id", "session_id")
-	canonicalThreadID = firstHeaderValue(headers, "thread-id", "thread_id")
-	canonicalRequestID = firstHeaderValue(headers, "x-client-request-id")
-	canonicalConversationID = firstHeaderValue(headers, "conversation_id")
+	canonicalSessionID := firstHeaderValue(headers, "session-id", "session_id")
+	canonicalThreadID := firstHeaderValue(headers, "thread-id", "thread_id")
+	canonicalRequestID := firstHeaderValue(headers, "x-client-request-id")
+	canonicalConversationID := firstHeaderValue(headers, "conversation_id")
 	// A state blob minted by a failed-over OAuth account is not valid for the
 	// selected account. This mutates only the outbound handshake copy; the
 	// client request headers remain untouched for retry/failover diagnostics.
