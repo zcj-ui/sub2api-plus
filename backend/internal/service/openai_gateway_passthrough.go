@@ -1003,62 +1003,11 @@ func openAIStreamEventIsPreamble(eventType string) bool {
 	}
 }
 
-func openAIStreamDataStartsClientOutput(data, eventType string) bool {
-	trimmed := strings.TrimSpace(data)
-	if trimmed == "" {
-		return false
-	}
-	switch strings.TrimSpace(eventType) {
-	case "response.failed":
-		return false
-	case "error":
-		// 上游降载/瞬时故障会先推 {"type":"error"} 帧、再以 response.failed 收尾。
-		// 可重试类错误帧不能算客户端输出：一旦把它当首输出 flush，
-		// clientOutputStarted 即被固化，随后的 failed 事件永远进不了 pre-output
-		// failover 分支，只能把致命错误原样转发给客户端。不可重试类
-		// （content_policy / invalid_request 等）维持原样转发，保留上游错误细节。
-		payload := []byte(trimmed)
-		return !openAIStreamFailedEventShouldFailover(payload, extractOpenAISSEErrorMessage(payload))
-	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
-		return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), eventType)
-	}
-	return !openAIStreamEventIsPreamble(eventType)
-}
-
-// openAIStreamDataStartsClientOutputForStaging applies the stricter semantic
-// boundary used by OpenAI pre-output staging. Empty output-item/content-part
-// announcements remain buffered so a following capacity-shed response.failed
-// can still fail over, while legacy/non-staged callers retain their historical
-// behavior through openAIStreamDataStartsClientOutput.
-func openAIStreamDataStartsClientOutputForStaging(data, eventType string) bool {
-	eventType = strings.TrimSpace(eventType)
-	switch eventType {
-	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
-		return openAIStreamAddedEventStartsClientOutput([]byte(strings.TrimSpace(data)), eventType)
-	default:
-		return openAIStreamDataStartsClientOutput(data, eventType)
-	}
-}
-
-// openAIStreamDataStartsClientOutputForLegacy keeps the historical behavior
-// of treating an output-item announcement as the first committed event. The
-// compatibility path has no OpenAI pre-output failover contract, so changing
-// that boundary would turn a missing-terminal error into an account switch.
-func openAIStreamDataStartsClientOutputForLegacy(data, eventType string) bool {
-	eventType = strings.TrimSpace(eventType)
-	if eventType == "response.output_item.added" || eventType == "response.content_part.added" || eventType == "response.reasoning_summary_part.added" {
-		return true
-	}
-	return openAIStreamDataStartsClientOutput(data, eventType)
-}
-
-// Added events often only announce an output item. They are protocol
-// progress, not semantic output, until the item contains content. Buffering
-// them keeps a following capacity-shed response.failed eligible for failover.
 func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) bool {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return true
 	}
+
 	switch strings.TrimSpace(eventType) {
 	case "response.output_item.added":
 		item := gjson.GetBytes(payload, "item")
@@ -1131,6 +1080,55 @@ func openAIStreamAddedEventStartsClientOutput(payload []byte, eventType string) 
 	default:
 		return true
 	}
+}
+
+func openAIStreamDataStartsClientOutput(data, eventType string) bool {
+	trimmed := strings.TrimSpace(data)
+	if trimmed == "" {
+		return false
+	}
+	switch strings.TrimSpace(eventType) {
+	case "response.failed":
+		return false
+	case "error":
+		// 上游降载/瞬时故障会先推 {"type":"error"} 帧、再以 response.failed 收尾。
+		// 可重试类错误帧不能算客户端输出：一旦把它当首输出 flush，
+		// clientOutputStarted 即被固化，随后的 failed 事件永远进不了 pre-output
+		// failover 分支，只能把致命错误原样转发给客户端。不可重试类
+		// （content_policy / invalid_request 等）维持原样转发，保留上游错误细节。
+		payload := []byte(trimmed)
+		return !openAIStreamFailedEventShouldFailover(payload, extractOpenAISSEErrorMessage(payload))
+	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
+		return openAIStreamAddedEventStartsClientOutput([]byte(trimmed), eventType)
+	}
+	return !openAIStreamEventIsPreamble(eventType)
+}
+
+// openAIStreamDataStartsClientOutputForStaging applies the stricter semantic
+// boundary used by OpenAI pre-output staging. Empty output-item/content-part
+// announcements remain buffered so a following capacity-shed response.failed
+// can still fail over, while legacy/non-staged callers retain their historical
+// behavior through openAIStreamDataStartsClientOutput.
+func openAIStreamDataStartsClientOutputForStaging(data, eventType string) bool {
+	eventType = strings.TrimSpace(eventType)
+	switch eventType {
+	case "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
+		return openAIStreamAddedEventStartsClientOutput([]byte(strings.TrimSpace(data)), eventType)
+	default:
+		return openAIStreamDataStartsClientOutput(data, eventType)
+	}
+}
+
+// openAIStreamDataStartsClientOutputForLegacy keeps the historical behavior
+// of treating an output-item announcement as the first committed event. The
+// compatibility path has no OpenAI pre-output failover contract, so changing
+// that boundary would turn a missing-terminal error into an account switch.
+func openAIStreamDataStartsClientOutputForLegacy(data, eventType string) bool {
+	eventType = strings.TrimSpace(eventType)
+	if eventType == "response.output_item.added" || eventType == "response.content_part.added" || eventType == "response.reasoning_summary_part.added" {
+		return true
+	}
+	return openAIStreamDataStartsClientOutput(data, eventType)
 }
 
 func openAIStreamItemHasVisibleOutput(item gjson.Result) bool {

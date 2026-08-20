@@ -138,7 +138,7 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 		isOpenAICapacityShedMessage(string(upstreamBody)) {
 		return true
 	}
-	if upstreamStatusCode != http.StatusBadRequest && upstreamStatusCode != http.StatusServiceUnavailable {
+	if upstreamStatusCode != http.StatusBadRequest {
 		return false
 	}
 

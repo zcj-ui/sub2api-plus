@@ -10,7 +10,13 @@
             ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50'
             : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-dark-800 dark:text-dark-400 dark:hover:bg-dark-700'
         ]"
-        :title="hasUpdate ? t('version.updateAvailable') : t('version.upToDate')"
+        :title="
+          hasUpdate
+            ? t('version.updateAvailable')
+            : versionCheckUncertain
+              ? versionCheckError || versionWarning || t('version.currentVersion')
+              : t('version.upToDate')
+        "
       >
         <span v-if="currentVersion" class="font-medium">v{{ currentVersion }}</span>
         <span
@@ -89,7 +95,7 @@
                   <span v-else class="text-2xl font-bold text-gray-400 dark:text-dark-500">--</span>
                   <!-- Show check mark when up to date -->
                   <span
-                    v-if="!hasUpdate"
+                    v-if="!hasUpdate && !versionCheckUncertain"
                     class="flex h-5 w-5 items-center justify-center rounded-full bg-green-100 dark:bg-green-900/30"
                   >
                     <svg
@@ -105,13 +111,44 @@
                     </svg>
                   </span>
                 </div>
-                <p class="mt-1 text-xs text-gray-500 dark:text-dark-400">
-                  {{
-                    hasUpdate
-                      ? t('version.latestVersion') + ': v' + latestVersion
-                      : t('version.upToDate')
-                  }}
+                <p v-if="hasUpdate" class="mt-1 text-xs text-gray-500 dark:text-dark-400">
+                  {{ t('version.latestVersion') + ': v' + latestVersion }}
                 </p>
+                <p
+                  v-else-if="!versionCheckUncertain"
+                  class="mt-1 text-xs text-gray-500 dark:text-dark-400"
+                >
+                  {{ t('version.upToDate') }}
+                </p>
+              </div>
+
+              <div
+                v-if="versionCheckError || versionWarning || versionCached"
+                data-testid="version-check-status"
+                class="mb-4 flex items-start gap-2 rounded-lg border p-2 text-xs"
+                :class="
+                  versionCheckError || versionWarning
+                    ? 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-800/50 dark:bg-amber-900/20 dark:text-amber-300'
+                    : 'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/50 dark:bg-blue-900/20 dark:text-blue-300'
+                "
+              >
+                <Icon
+                  :name="versionCheckError || versionWarning ? 'exclamationTriangle' : 'clock'"
+                  size="xs"
+                  :stroke-width="2"
+                  class="mt-0.5 flex-shrink-0"
+                  :title="versionCached ? 'Cached update status' : undefined"
+                />
+                <p v-if="versionCheckError || versionWarning" class="min-w-0 flex-1 break-words">
+                  {{ versionCheckError || versionWarning }}
+                </p>
+                <span
+                  v-else
+                  class="sr-only"
+                  aria-label="Cached update status"
+                >
+                  Cached update status
+                </span>
               </div>
 
               <!-- Priority 1: Update error (must check before hasUpdate) -->
@@ -141,6 +178,7 @@
 
                 <!-- Retry button -->
                 <button
+                  v-if="canPerformInPlaceUpdate"
                   @click="handleUpdate"
                   :disabled="updating"
                   class="flex w-full items-center justify-center gap-2 rounded-lg bg-red-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
@@ -229,13 +267,19 @@
                   </template>
                   <span v-else>{{ t('version.restartNow') }}</span>
                 </button>
+                <p
+                  v-if="restartError"
+                  class="rounded-lg border border-red-200 bg-red-50 p-2 text-xs text-red-600 dark:border-red-800/50 dark:bg-red-900/20 dark:text-red-400"
+                >
+                  {{ restartError }}
+                </p>
               </div>
 
               <!-- Priority 3: Update available for source build - show git pull hint -->
               <div v-else-if="hasUpdate && !isReleaseBuild" class="space-y-2">
                 <a
-                  v-if="releaseInfo?.html_url && releaseInfo.html_url !== '#'"
-                  :href="releaseInfo.html_url"
+                  v-if="releaseURL"
+                  :href="releaseURL"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="group flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 transition-colors hover:bg-amber-100 dark:border-amber-800/50 dark:bg-amber-900/20 dark:hover:bg-amber-900/30"
@@ -317,8 +361,10 @@
                   </div>
                 </div>
 
-                <!-- Update button -->
+                <!-- In-place operations require an explicit backend capability. -->
                 <button
+                  v-if="canPerformInPlaceUpdate"
+                  data-testid="version-update-action"
                   @click="handleUpdate"
                   :disabled="updating"
                   class="flex w-full items-center justify-center gap-2 rounded-lg bg-primary-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-50"
@@ -342,10 +388,18 @@
                   {{ updating ? t('version.updating') : t('version.updateNow') }}
                 </button>
 
+                <p
+                  v-else-if="inPlaceUpdateRestriction"
+                  data-testid="version-update-restriction"
+                  class="rounded-lg border border-blue-200 bg-blue-50 p-2 text-xs text-blue-600 dark:border-blue-800/50 dark:bg-blue-900/20 dark:text-blue-400"
+                >
+                  {{ inPlaceUpdateRestriction }}
+                </p>
+
                 <!-- View release link -->
                 <a
-                  v-if="releaseInfo?.html_url && releaseInfo.html_url !== '#'"
-                  :href="releaseInfo.html_url"
+                  v-if="releaseURL"
+                  :href="releaseURL"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="flex items-center justify-center gap-1 text-xs text-gray-500 transition-colors hover:text-gray-700 dark:text-dark-400 dark:hover:text-dark-200"
@@ -355,11 +409,25 @@
                 </a>
               </div>
 
-              <!-- Priority 5: Up to date - GitHub link + version rollback -->
+              <!-- Priority 5: an uncertain check must not impersonate an up-to-date result. -->
+              <div v-else-if="versionCheckUncertain" class="space-y-2">
+                <a
+                  v-if="releaseURL"
+                  :href="releaseURL"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="flex items-center justify-center gap-2 py-2 text-sm text-gray-500 transition-colors hover:text-gray-700 dark:text-dark-400 dark:hover:text-dark-200"
+                >
+                  {{ t('version.viewRelease') }}
+                  <Icon name="externalLink" size="xs" :stroke-width="2" />
+                </a>
+              </div>
+
+              <!-- Priority 6: Up to date - GitHub link + version rollback -->
               <div v-else class="space-y-2">
                 <a
-                  v-if="releaseInfo?.html_url && releaseInfo.html_url !== '#'"
-                  :href="releaseInfo.html_url"
+                  v-if="releaseURL"
+                  :href="releaseURL"
                   target="_blank"
                   rel="noopener noreferrer"
                   class="flex items-center justify-center gap-2 py-2 text-sm text-gray-500 transition-colors hover:text-gray-700 dark:text-dark-400 dark:hover:text-dark-200"
@@ -375,8 +443,12 @@
                 </a>
 
                 <!-- Version rollback entry -->
-                <div class="border-t border-gray-100 pt-2 dark:border-dark-700">
+                <div
+                  v-if="isReleaseBuild"
+                  class="border-t border-gray-100 pt-2 dark:border-dark-700"
+                >
                   <button
+                    data-testid="version-rollback-action"
                     @click="toggleRollbackPanel"
                     class="group flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-xs text-gray-400 transition-colors hover:bg-gray-50 hover:text-gray-600 dark:text-dark-500 dark:hover:bg-dark-700/50 dark:hover:text-dark-300"
                   >
@@ -395,32 +467,9 @@
 
                   <transition name="rollback">
                     <div v-if="rollbackPanelOpen" class="mt-2 space-y-2">
-                      <!-- Source build: online rollback unavailable, use git instead -->
-                      <div
-                        v-if="!isReleaseBuild"
-                        class="flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 p-2 dark:border-blue-800/50 dark:bg-blue-900/20"
-                      >
-                        <svg
-                          class="h-3.5 w-3.5 flex-shrink-0 text-blue-500 dark:text-blue-400"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                          stroke-width="2"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                          />
-                        </svg>
-                        <p class="min-w-0 flex-1 text-xs leading-4 text-blue-600 dark:text-blue-400">
-                          {{ t('version.rollbackSourceHint') }}
-                        </p>
-                      </div>
-
                       <!-- Loading versions -->
                       <div
-                        v-else-if="rollbackVersionsLoading"
+                        v-if="rollbackVersionsLoading"
                         class="flex items-center justify-center py-4"
                       >
                         <svg
@@ -584,6 +633,7 @@
                             </p>
 
                             <button
+                              v-if="canPerformInPlaceUpdate"
                               @click="handleRollback"
                               :disabled="rollingBack"
                               class="flex w-full items-center justify-center gap-2 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
@@ -617,6 +667,13 @@
                                     })
                               }}</span>
                             </button>
+                            <p
+                              v-else
+                              data-testid="version-rollback-manual-only"
+                              class="rounded-lg border border-blue-200 bg-blue-50 p-2 text-xs text-blue-600 dark:border-blue-800/50 dark:bg-blue-900/20 dark:text-blue-400"
+                            >
+                              {{ inPlaceUpdateRestriction || t('version.rollbackSourceHint') }}
+                            </p>
                           </div>
                         </transition>
                       </template>
@@ -651,8 +708,8 @@ import {
 import { useClipboard } from '@/composables/useClipboard'
 import Icon from '@/components/icons/Icon.vue'
 
-const GITHUB_REPO = 'zcj-ui/sub2api-plus'
-const DOCKER_IMAGE = 'ghcr.io/zcj-ui/sub2api-plus'
+const RESTART_COUNTDOWN_SECONDS = 8
+const HEALTH_CHECK_BACKOFF_MS = [500, 1000, 2000, 4000, 8000]
 
 const { t } = useI18n()
 
@@ -675,6 +732,32 @@ const latestVersion = computed(() => appStore.latestVersion)
 const hasUpdate = computed(() => appStore.hasUpdate)
 const releaseInfo = computed(() => appStore.releaseInfo)
 const buildType = computed(() => appStore.buildType)
+// Development snapshots and stable releases are both packaged binaries.
+const isReleaseBuild = computed(() => buildType.value === 'release' || buildType.value === 'dev')
+const versionWarning = computed(() => appStore.versionWarning)
+const versionCached = computed(() => appStore.versionCached)
+const versionCheckError = computed(() => appStore.versionCheckError)
+const inPlaceUpdate = computed(() => appStore.inPlaceUpdate)
+const versionCheckUncertain = computed(
+  () => !appStore.versionLoaded || Boolean(versionCheckError.value || versionWarning.value)
+)
+const canPerformInPlaceUpdate = computed(
+  () => isReleaseBuild.value && inPlaceUpdate.value?.supported === true
+)
+const inPlaceUpdateRestriction = computed(
+  () => inPlaceUpdate.value?.restriction_message?.trim() || ''
+)
+const updateRepo = computed(() => {
+  const repo = appStore.updateRepo.trim()
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ? repo : ''
+})
+const updateRepositoryURL = computed(() =>
+  updateRepo.value ? `https://github.com/${updateRepo.value}` : ''
+)
+const releaseURL = computed(() => {
+  const url = releaseInfo.value?.html_url?.trim()
+  return url && url !== '#' ? url : updateRepositoryURL.value
+})
 
 // Update process states (local to this component)
 const updating = ref(false)
@@ -683,6 +766,7 @@ const needRestart = ref(false)
 const updateError = ref('')
 const updateSuccess = ref(false)
 const restartCountdown = ref(0)
+const restartError = ref('')
 // Distinguishes the success + restart panel between update and rollback flows
 const successKind = ref<'update' | 'rollback'>('update')
 
@@ -697,8 +781,8 @@ const rollbackError = ref('')
 
 const { copied, copyToClipboard } = useClipboard()
 
-// Manual rollback methods differ by deployment: script installs use install.sh,
-// docker deployments pin the image tag instead
+// Manual rollback stays deployment-agnostic. The updater repository identifies
+// source/release links, but it cannot safely identify a container image name.
 const manualTab = ref<'script' | 'docker'>('script')
 
 const manualTabs = computed(() => [
@@ -707,16 +791,19 @@ const manualTabs = computed(() => [
 ])
 
 const scriptRollbackCommand = computed(() => {
-  if (!selectedRollbackVersion.value) return ''
+  if (!selectedRollbackVersion.value || !updateRepo.value) return ''
   const tag = `v${selectedRollbackVersion.value}`
-  return `curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/${tag}/deploy/install.sh | sudo bash -s -- rollback ${tag}`
+  return [
+    `git -C <install-directory> fetch https://github.com/${updateRepo.value}.git --tags`,
+    `git -C <install-directory> checkout ${tag}`
+  ].join('\n')
 })
 
 const dockerRollbackCommand = computed(() => {
   if (!selectedRollbackVersion.value) return ''
   return [
     `# ${t('version.dockerEditCompose')}`,
-    `image: ${DOCKER_IMAGE}:${selectedRollbackVersion.value}`,
+    `# ${releaseURL.value || updateRepositoryURL.value}`,
     '',
     `# ${t('version.dockerRecreate')}`,
     'docker compose up -d'
@@ -726,9 +813,6 @@ const dockerRollbackCommand = computed(() => {
 const activeManualCommand = computed(() =>
   manualTab.value === 'docker' ? dockerRollbackCommand.value : scriptRollbackCommand.value
 )
-
-// Development snapshots and stable releases are both packaged binaries.
-const isReleaseBuild = computed(() => buildType.value === 'release' || buildType.value === 'dev')
 
 function toggleDropdown() {
   dropdownOpen.value = !dropdownOpen.value
@@ -745,17 +829,19 @@ async function refreshVersion(force = true) {
   updateError.value = ''
   updateSuccess.value = false
   needRestart.value = false
+  restartError.value = ''
   resetRollbackState()
 
   await appStore.fetchVersion(force)
 }
 
 async function handleUpdate() {
-  if (updating.value) return
+  if (updating.value || !canPerformInPlaceUpdate.value) return
 
   updating.value = true
   updateError.value = ''
   updateSuccess.value = false
+  restartError.value = ''
 
   try {
     const result = await performUpdate()
@@ -782,12 +868,10 @@ function resetRollbackState() {
 }
 
 async function toggleRollbackPanel() {
-  if (!isAdmin.value) return
+  if (!isAdmin.value || !isReleaseBuild.value) return
   rollbackPanelOpen.value = !rollbackPanelOpen.value
-  // Source builds only show a hint, no version list to fetch
   if (
     rollbackPanelOpen.value &&
-    isReleaseBuild.value &&
     rollbackVersions.value.length === 0 &&
     !rollbackVersionsLoading.value
   ) {
@@ -796,7 +880,7 @@ async function toggleRollbackPanel() {
 }
 
 async function loadRollbackVersions() {
-  if (!isAdmin.value) return
+  if (!isAdmin.value || !isReleaseBuild.value) return
   rollbackVersionsLoading.value = true
   rollbackVersionsError.value = ''
   try {
@@ -825,11 +909,12 @@ function formatPublishedAt(publishedAt: string): string {
 }
 
 async function handleRollback() {
-  if (!isAdmin.value) return
+  if (!isAdmin.value || !canPerformInPlaceUpdate.value) return
   if (rollingBack.value || !selectedRollbackVersion.value) return
 
   rollingBack.value = true
   rollbackError.value = ''
+  restartError.value = ''
 
   try {
     const result = await rollbackAPI(selectedRollbackVersion.value)
@@ -847,57 +932,99 @@ async function handleRollback() {
   }
 }
 
-async function handleRestart() {
-  if (restarting.value) return
+let restartRun = 0
+let restartDelayTimer: ReturnType<typeof setTimeout> | null = null
+let resolveRestartDelay: ((completed: boolean) => void) | null = null
 
-  restarting.value = true
-  restartCountdown.value = 8
-
-  try {
-    await restartService()
-    // Service will restart, page will reload automatically or show disconnected
-  } catch (error) {
-    // Expected - connection will be lost during restart
-    console.log('Service restarting...')
-  }
-
-  // Start countdown
-  const countdownInterval = setInterval(() => {
-    restartCountdown.value--
-    if (restartCountdown.value <= 0) {
-      clearInterval(countdownInterval)
-      // Try to check if service is back before reload
-      checkServiceAndReload()
-    }
-  }, 1000)
+function waitForRestartDelay(delayMs: number, run: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    resolveRestartDelay = resolve
+    restartDelayTimer = setTimeout(() => {
+      restartDelayTimer = null
+      resolveRestartDelay = null
+      resolve(run === restartRun)
+    }, delayMs)
+  })
 }
 
-async function checkServiceAndReload() {
-  const maxRetries = 5
-  const retryDelay = 1000
+function cancelRestartWait() {
+  if (restartDelayTimer !== null) {
+    clearTimeout(restartDelayTimer)
+    restartDelayTimer = null
+  }
+  if (resolveRestartDelay) {
+    const resolve = resolveRestartDelay
+    resolveRestartDelay = null
+    resolve(false)
+  }
+}
 
-  for (let i = 0; i < maxRetries; i++) {
+async function waitForRestartCountdown(run: number): Promise<boolean> {
+  for (let remaining = RESTART_COUNTDOWN_SECONDS; remaining > 0; remaining--) {
+    restartCountdown.value = remaining
+    if (!(await waitForRestartDelay(1000, run))) {
+      return false
+    }
+  }
+  restartCountdown.value = 0
+  return true
+}
+
+async function checkServiceHealth(run: number): Promise<boolean> {
+  for (let attempt = 0; attempt < HEALTH_CHECK_BACKOFF_MS.length; attempt++) {
+    if (run !== restartRun) return false
     try {
       const response = await fetch('/health', {
         method: 'GET',
         cache: 'no-cache'
       })
       if (response.ok) {
-        // Service is back, reload page
-        window.location.reload()
-        return
+        return true
       }
     } catch {
-      // Service not ready yet
+      // The process is still restarting; retry with bounded backoff.
     }
 
-    if (i < maxRetries - 1) {
-      await new Promise((resolve) => setTimeout(resolve, retryDelay))
+    if (attempt < HEALTH_CHECK_BACKOFF_MS.length - 1) {
+      if (!(await waitForRestartDelay(HEALTH_CHECK_BACKOFF_MS[attempt], run))) {
+        return false
+      }
+    }
+  }
+  return false
+}
+
+async function handleRestart() {
+  if (restarting.value) return
+
+  const run = ++restartRun
+  restarting.value = true
+  restartError.value = ''
+
+  try {
+    await restartService()
+  } catch (error: unknown) {
+    const err = error as { status?: number; response?: { data?: { message?: string } }; message?: string }
+    // A disconnect can happen after the service accepted the restart. A
+    // structured HTTP failure did not start a restart and must remain visible.
+    if (err.status && err.status !== 0) {
+      restartError.value = err.response?.data?.message || err.message || t('version.updateFailed')
+      restarting.value = false
+      return
     }
   }
 
-  // After retries, reload anyway
-  window.location.reload()
+  if (!(await waitForRestartCountdown(run))) return
+  const healthy = await checkServiceHealth(run)
+  if (healthy && run === restartRun) {
+    window.location.reload()
+    return
+  }
+
+  if (run === restartRun) {
+    restarting.value = false
+    restartError.value = t('version.updateFailed')
+  }
 }
 
 function handleClickOutside(event: MouseEvent) {
@@ -917,6 +1044,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  restartRun++
+  cancelRestartWait()
   document.removeEventListener('click', handleClickOutside)
 })
 </script>

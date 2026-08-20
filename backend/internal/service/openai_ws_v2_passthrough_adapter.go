@@ -1196,6 +1196,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// Any failover, protocol error, client close, or upstream return drops the
 	// connection-local audit state; it must never survive this relay invocation.
 	defer pendingAuditItems.clear()
+	var acceptedTurnStartedAt atomic.Pointer[time.Time]
 	clientFrameConn := &openAIWSClientFrameConn{
 		conn:                 clientConn,
 		controlCtx:           ctx,
@@ -1230,8 +1231,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid staged conversation item", err)
 				}
 			}
+			responseCreateAt := time.Time{}
 			acceptedTurn := false
 			if isResponseCreate {
+				responseCreateAt = time.Now()
 				if !turnLifecycle.beginResponseCreate(clientFrameConn.markTurnStarted) {
 					err := errors.New("overlapping response.create is not supported")
 					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, err.Error(), err)
@@ -1365,6 +1368,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					}
 				}
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
+				responseCreateAtCopy := responseCreateAt
+				acceptedTurnStartedAt.Store(&responseCreateAtCopy)
 				acceptedTurn = true
 			}
 			return out, blocked, policyErr
@@ -1438,13 +1443,25 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		}
 	}
 
+	firstTurnStartedAt := time.Time{}
+	if hooks != nil {
+		firstTurnStartedAt = hooks.InitialTurnStartedAt
+	}
 	relayResult, relayExit := openaiwsv2.RunEntry(openaiwsv2.EntryInput{
 		Ctx:                ctx,
 		ClientConn:         policyClientConn,
 		UpstreamConn:       relayUpstreamFrameConn,
 		FirstClientMessage: firstClientMessage,
 		Options: openaiwsv2.RelayOptions{
-			WriteTimeout: s.openAIWSWriteTimeout(),
+			WriteTimeout:       s.openAIWSWriteTimeout(),
+			FirstTurnStartedAt: firstTurnStartedAt,
+			TakeNextTurnStartedAt: func() time.Time {
+				startedAt := acceptedTurnStartedAt.Swap(nil)
+				if startedAt == nil {
+					return time.Time{}
+				}
+				return *startedAt
+			},
 			// Passthrough idle is enforced only after a completed turn by
 			// clientFrameConn. The relay-wide activity watchdog would also
 			// terminate a healthy active upstream turn.
@@ -1462,6 +1479,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			},
 			OnTurnComplete: func(turn openaiwsv2.RelayTurnResult) {
 				turnNo := int(completedTurns.Add(1))
+				if hooks != nil && hooks.TurnStarted != nil && !turn.StartedAt.IsZero() {
+					hooks.TurnStarted(turnNo, turn.StartedAt)
+				}
 				turnRequestModel, turnUpstreamModel := usageMeta.turnModels(turn.RequestModel)
 				turnResult := &OpenAIForwardResult{
 					RequestID: turn.RequestID,
@@ -1636,6 +1656,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		)
 		// 正常路径按 terminal 事件逐 turn 已回调；仅在零 turn 场景兜底回调一次。
 		if turnCount == 0 && hooks != nil && hooks.AfterTurn != nil {
+			if hooks.TurnStarted != nil {
+				hooks.TurnStarted(1, time.Now().Add(-result.Duration))
+			}
 			hooks.AfterTurn(1, result, nil)
 		}
 		return nil
@@ -1702,6 +1725,9 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		relayExit.WroteDownstream,
 	)
 	if hooks != nil && hooks.AfterTurn != nil {
+		if hooks.TurnStarted != nil {
+			hooks.TurnStarted(turnCount+1, time.Now().Add(-result.Duration))
+		}
 		hooks.AfterTurn(turnCount+1, nil, turnErr)
 	}
 	return turnErr

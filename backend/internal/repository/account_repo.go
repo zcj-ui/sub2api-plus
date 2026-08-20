@@ -136,9 +136,9 @@ func compactProbeExtraDeleteKeys(updates map[string]any) []string {
 
 const postgresParameterBatchSize = 50000
 
-// Keep the persisted seed opaque. New seeds are UUIDv4, but imports and
-// backups may contain another canonical UUID version; rotating those values
-// would change the account's converged Codex identity.
+// Keep persisted seeds opaque. New/imported records receive a server-generated
+// UUIDv4, while key-level edits preserve a valid seed already stored on an
+// existing account, including canonical UUID versions from older rows.
 const codexFingerprintSeedCanonicalPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 const codexFingerprintNilSeed = "00000000-0000-0000-0000-000000000000"
 
@@ -146,8 +146,8 @@ func codexFingerprintSeedValidSQL(extraExpr string) string {
 	value := "((" + extraExpr + ") ->> 'codex_fingerprint_seed')"
 	// Match the service canonicalizer: trim surrounding whitespace, compare the
 	// UUID in lowercase, and reject only the nil UUID. New seeds remain v4, but
-	// imported/backed-up account state may contain another canonical UUID
-	// version and must not be rotated during a key-level update.
+	// older persisted account state may contain another canonical UUID version
+	// and must not be rotated during a key-level update.
 	canonical := "LOWER(BTRIM(" + value + "))"
 	return "(" + canonical + " ~ '" + codexFingerprintSeedCanonicalPattern + "' AND " + canonical + " <> '" + codexFingerprintNilSeed + "')"
 }
@@ -2770,6 +2770,7 @@ func containsCodexFingerprintExtraUpdate(extra map[string]any) bool {
 	for _, key := range []string{
 		"codex_fingerprint_mode",
 		"codex_fingerprint_seed",
+		service.CodexFingerprintRecoveryRequiredExtraKey,
 		"openai_device_id",
 		"openai_session_id",
 	} {
@@ -2782,7 +2783,7 @@ func containsCodexFingerprintExtraUpdate(extra map[string]any) bool {
 
 func codexFingerprintExtraForOAuthOnlySQL(extraExpr string) string {
 	return "CASE WHEN platform = 'openai' AND type = 'oauth' THEN " + extraExpr +
-		" ELSE (" + extraExpr + ") - 'codex_fingerprint_mode' - 'codex_fingerprint_seed' - 'openai_device_id' - 'openai_session_id' END"
+		" ELSE (" + extraExpr + ") - 'codex_fingerprint_mode' - 'codex_fingerprint_seed' - '" + service.CodexFingerprintRecoveryRequiredExtraKey + "' - 'openai_device_id' - 'openai_session_id' END"
 }
 
 // UpdateUpstreamBillingProbeSnapshot stores a probe result only while the

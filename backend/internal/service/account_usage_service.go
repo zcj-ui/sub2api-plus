@@ -506,6 +506,13 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 	return s.getUsageForAccount(ctx, account, forceProbe)
 }
 
+// GetUsageForAccount 已加载账号的使用量直通入口（配额监控 fetcher 复用，
+// 避免缓存未命中时账号被加载两次——每次 GetByID 含 proxies/groups 联查）。
+func (s *AccountUsageService) GetUsageForAccount(ctx context.Context, account *Account, force ...bool) (*UsageInfo, error) {
+	forceProbe := len(force) > 0 && force[0]
+	return s.getUsageForAccount(ctx, account, forceProbe)
+}
+
 // GetUsageBatch 批量获取账号使用量。
 // Anthropic OAuth/SetupToken 统一走 passive 链路，其他账号复用现有主动查询逻辑。
 // 单个账号失败不会中断整批请求，错误会按账号返回。
@@ -901,10 +908,10 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	probeIdentity := resolveCodexOutboundIdentity("")
-	req.Header.Set("Originator", probeIdentity.originator)
-	req.Header.Set("Version", probeIdentity.version)
-	req.Header.Set("User-Agent", probeIdentity.userAgent)
+	canonical := resolveCodexOutboundIdentity("")
+	req.Header.Set("Originator", canonical.originator)
+	req.Header.Set("Version", canonical.version)
+	req.Header.Set("User-Agent", canonical.userAgent)
 	if s.identityCache != nil {
 		if fp, fpErr := s.identityCache.GetFingerprint(reqCtx, account.ID); fpErr == nil && fp != nil && strings.TrimSpace(fp.UserAgent) != "" {
 			req.Header.Set("User-Agent", strings.TrimSpace(fp.UserAgent))

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -75,6 +76,37 @@ func TestStreamFailedEventCapacityShedRetriesOnSameAccount(t *testing.T) {
 	other := []byte(`{"type":"response.failed","response":{"error":{"code":"server_error"}}}`)
 	require.False(t, isOpenAIUpstreamCapacityShedEvent(other))
 	require.False(t, openAIStreamFailedEventRetryableOnSameAccount(nonPool, other, "boom"))
+}
+
+func TestOpenAIHTTPCapacityShedIsRequestScopedForOAuthAccounts(t *testing.T) {
+	payload := []byte(`{"error":{"type":"server_error","message":"Our servers are currently overloaded. Please try again later."}}`)
+	failoverErr := newOpenAIUpstreamFailoverError(
+		http.StatusBadRequest,
+		http.Header{"X-Request-Id": []string{"rid-http-capacity"}},
+		payload,
+		"Our servers are currently overloaded. Please try again later.",
+		false,
+	)
+
+	require.True(t, failoverErr.RetryableOnSameAccount)
+	require.True(t, failoverErr.RequestScopedTransient)
+
+	repo := &capacityShedAccountRepoStub{}
+	(&GatewayService{accountRepo: repo}).TempUnscheduleRetryableError(context.Background(), 1, failoverErr)
+	require.Zero(t, repo.tempUnschedCalls)
+
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	gateway := &OpenAIGatewayService{rateLimitService: rateLimitService}
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	require.False(t, gateway.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusBadRequest,
+		nil,
+		payload,
+		"gpt-5",
+	))
+	require.Zero(t, repo.tempUnschedCalls)
 }
 
 // 上游降载的真实序列是「event: error → event: response.failed」。error 帧不算
@@ -146,25 +178,40 @@ func TestOpenAIStreamMetadataPreambleAndMessageOnlyOverloadFailOver(t *testing.T
 		"",
 	}, "\n")
 
-	for _, passthrough := range []bool{false, true} {
-		name := "native"
-		if passthrough {
-			name = "passthrough"
-		}
-		t.Run(name, func(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*OpenAIGatewayService, *gin.Context, *http.Response, *Account) error
+	}{
+		{
+			name: "native",
+			run: func(svc *OpenAIGatewayService, c *gin.Context, resp *http.Response, account *Account) error {
+				_, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+				return err
+			},
+		},
+		{
+			name: "passthrough",
+			run: func(svc *OpenAIGatewayService, c *gin.Context, resp *http.Response, account *Account) error {
+				_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
 			rec := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(rec)
 			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
-			resp := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Header: http.Header{"X-Request-Id": []string{"rid-message-only-overload"}}}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(stream)),
+				Header:     http.Header{"X-Request-Id": []string{"rid-message-only-overload"}},
+			}
 			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Name: "acc"}
 
-			var err error
-			if passthrough {
-				_, err = svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
-			} else {
-				_, err = svc.handleStreamingResponse(c.Request.Context(), resp, c, account, time.Now(), "model", "model")
-			}
+			err := tt.run(svc, c, resp, account)
 			require.Error(t, err)
 			var failoverErr *UpstreamFailoverError
 			require.ErrorAs(t, err, &failoverErr)
@@ -223,6 +270,8 @@ func TestOpenAIStreamCapacityShedErrorFramePrecedingFailedStillFailsOver(t *test
 // 并终止会话，对其余错误码执行内置退避重试。消息原样保留。
 func TestOpenAIStreamCapacityShedAfterOutputRewritesCodeForClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	logSink, restore := captureStructuredLog(t)
+	defer restore()
 	cfg := &config.Config{
 		Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize},
 	}
@@ -262,6 +311,9 @@ func TestOpenAIStreamCapacityShedAfterOutputRewritesCodeForClient(t *testing.T) 
 	require.Contains(t, body, `"code":"server_error"`)
 	require.NotContains(t, body, "server_is_overloaded")
 	require.Contains(t, body, "Our servers are currently overloaded")
+	require.True(t, logSink.ContainsMessage("gateway.failover_suppressed_after_semantic_output"))
+	require.True(t, logSink.ContainsFieldValue("path", "native_sse"))
+	require.True(t, logSink.ContainsFieldValue("upstream_request_id", "rid-shed-after-output"))
 }
 
 // helper 单测：只有降载码被改写，其余错误码（尤其 rate_limit_exceeded，客户端
@@ -282,6 +334,18 @@ func TestSanitizeOpenAICapacityShedErrorCodeForClient(t *testing.T) {
 		{
 			name:        "error帧裸code改写",
 			payload:     `{"type":"error","error":{"code":"slow_down","message":"slow down"}}`,
+			wantChanged: true,
+			wantContain: `"code":"server_error"`,
+		},
+		{
+			name:        "failed事件只有过载文案时补充code",
+			payload:     `{"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded. Please try again later."}}}`,
+			wantChanged: true,
+			wantContain: `"code":"server_error"`,
+		},
+		{
+			name:        "error帧只有过载文案时补充code",
+			payload:     `{"type":"error","error":{"message":"Server is overloaded. Please try again later."}}`,
 			wantChanged: true,
 			wantContain: `"code":"server_error"`,
 		},
@@ -329,4 +393,14 @@ func TestSanitizeOpenAICapacityShedErrorCodeMissingCode(t *testing.T) {
 	out, changed = sanitizeOpenAICapacityShedErrorCodeForClient(capacity)
 	require.True(t, changed)
 	require.Equal(t, "server_error", gjson.GetBytes(out, "response.error.code").String())
+}
+
+func TestCodexOutboundVersionHasSingleSource(t *testing.T) {
+	require.True(t,
+		strings.HasPrefix(codexCLIUserAgent, openai.CodexDefaultOriginator+"/"+codexCLIVersion+" "),
+		"codexCLIUserAgent=%q 必须以 codexCLIVersion=%q 作为版本段", codexCLIUserAgent, codexCLIVersion,
+	)
+	require.GreaterOrEqual(t, CompareVersions(codexCLIVersion, codexUpstreamMinVersion), 0,
+		"codexCLIVersion=%q 不得低于上游最低门槛 %q", codexCLIVersion, codexUpstreamMinVersion,
+	)
 }

@@ -115,6 +115,42 @@ type openAIWSIngressTurnError struct {
 	wroteSemanticDownstream bool
 }
 
+type openAIWSCurrentTurnFailoverError struct {
+	cause        error
+	retryPayload []byte
+}
+
+func (e *openAIWSCurrentTurnFailoverError) Error() string {
+	if e == nil || e.cause == nil {
+		return "openai websocket current-turn failover"
+	}
+	return e.cause.Error()
+}
+
+func (e *openAIWSCurrentTurnFailoverError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func newOpenAIWSCurrentTurnFailoverError(cause error, retryPayload []byte) error {
+	return &openAIWSCurrentTurnFailoverError{
+		cause:        cause,
+		retryPayload: append([]byte(nil), retryPayload...),
+	}
+}
+
+// OpenAIWSCurrentTurnRetryPayload returns an isolated copy of the payload that
+// may be retried on a replacement account without replaying the first turn.
+func OpenAIWSCurrentTurnRetryPayload(err error) ([]byte, bool) {
+	var retryErr *openAIWSCurrentTurnFailoverError
+	if !errors.As(err, &retryErr) || retryErr == nil {
+		return nil, false
+	}
+	return append([]byte(nil), retryErr.retryPayload...), true
+}
+
 func (e *openAIWSIngressTurnError) Error() string {
 	if e == nil {
 		return ""
@@ -416,6 +452,8 @@ type OpenAIWSIngressHooks struct {
 	// verifies that connection atomically instead of silently opening another
 	// connection for the rate-limited account.
 	Force429GuardContinuation bool
+	// InitialTurnStartedAt freezes when the first response.create was accepted.
+	InitialTurnStartedAt time.Time
 	// MaxReasoningEffort limits explicit reasoning effort values for this WS session.
 	MaxReasoningEffort string
 	// ReasoningEffortMappings rewrites explicit effort values for this WS session.
@@ -428,7 +466,11 @@ type OpenAIWSIngressHooks struct {
 	// InitialResponseMessageType preserves the client frame encoding for the
 	// first response.create when the direct relay writes it upstream.
 	InitialResponseMessageType coderws.MessageType
-	BeforeTurn                 func(turn int) error
+	// TurnStarted reports the accepted start time for each direct relay turn.
+	// Passthrough uses it for per-turn usage pricing without running the
+	// pooled-ingress admission hook again.
+	TurnStarted func(turn int, startedAt time.Time)
+	BeforeTurn  func(turn int) error
 	// BeforePassthroughTurn runs only for an admitted follow-up turn in the
 	// direct upstream WebSocket relay. The normal BeforeTurn hook owns the
 	// pooled ingress lifecycle; passthrough needs this separate callback to

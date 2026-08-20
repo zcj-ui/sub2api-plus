@@ -457,6 +457,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		// 指纹收敛：一次性解析收敛 ID，请求体和出站头共享同一份快照，
 		// 保证 turn_id / timestamp 在不同载体中一致。
+		stageCodexFingerprintIDs(c, nil)
 		var clientHeaders http.Header
 		if c != nil && c.Request != nil {
 			clientHeaders = c.Request.Header
@@ -482,7 +483,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if codexResult.NormalizedModel != "" {
 			upstreamModel = codexResult.NormalizedModel
 		}
-		if codexResult.PromptCacheKey != "" {
+		if currentPromptCacheKey, ok := decoded["prompt_cache_key"].(string); ok && currentPromptCacheKey != "" {
+			promptCacheKey = currentPromptCacheKey
+		} else if codexResult.PromptCacheKey != "" {
 			promptCacheKey = codexResult.PromptCacheKey
 		}
 	}
@@ -1237,6 +1240,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	if customUA := account.GetOpenAIUserAgent(); customUA != "" {
 		req.Header.Set("user-agent", customUA)
 	}
+
+	// 若开启 ForceCodexCLI，则强制将上游 User-Agent 伪装为规范 Codex 身份。
+	// 用于网关未透传/改写 User-Agent 时，仍能命中 Codex 侧识别逻辑。
 	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		req.Header.Set("user-agent", CodexCanonicalUserAgent())
 	}

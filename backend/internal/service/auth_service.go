@@ -276,7 +276,7 @@ func (s *AuthService) RegisterWithVerification(ctx context.Context, email, passw
 	}
 
 	// 邀请码占用已由 createUserAndClaimInvitation 在“用户创建 + 邀请码占用”的
-	// 同一个数据库事务内原子完成，此处不再单独标记。
+	// 同一个数据库事务内原子完成（一次性约束，见函数注释），此处不再单独标记。
 	// 应用优惠码（如果提供且功能已启用）
 	if promoCode != "" && s.promoService != nil && s.settingService != nil && s.settingService.IsPromoCodeEnabled(ctx) {
 		if err := s.promoService.ApplyPromoCode(ctx, user.ID, promoCode); err != nil {
@@ -1273,10 +1273,17 @@ func (s *AuthService) createUserWithRegistrationEmailGuard(ctx context.Context, 
 
 // createUserAndClaimInvitation 原子化完成“用户创建 + 邀请码占用”。
 //
-// 邀请码是一次性凭证，必须保证“一个邀请码最多注册一个账号”。旧实现先检查
-// CanUse()、再创建用户、最后才调用 Use()，并发请求可以同时通过检查并各自建号。
-// 这里把两个写入放在同一个数据库事务内：Use 的条件更新决定唯一获胜者，
-// 失败时整个事务回滚，避免留下未被邀请码授权的账号。
+// 背景：邀请码属于一次性凭证，必须保证“一个邀请码最多注册一个账号”。旧实现先检查
+// CanUse()、再创建用户、最后才 redeemRepo.Use()（且失败仅记日志），检查与消耗分离且
+// 不在同一事务，并发注册可在同一邀请码上同时通过检查并各自创建账号（TOCTOU 竞态）。
+//
+// 本实现把两者放入同一个数据库事务：
+//   - 占用走 redeemRepo.Use 的条件更新（WHERE status='unused'，乐观锁）；
+//   - 并发下只有一个事务能占用成功，其余事务回滚——既不产生多余账号，也不让码被烧掉；
+//   - 事务回滚同时撤销用户创建，避免“账号已建、码被占用”的中间态。
+//
+// 无邀请码时保持原单次创建路径（不开事务）；entClient 缺失的异常配置下退化为顺序执行，
+// 并发正确性仍由 Use 的条件更新兜底（可能产生孤儿用户，但不会放行第二个注册）。
 func (s *AuthService) createUserAndClaimInvitation(ctx context.Context, user *User, invitation *RedeemCode) error {
 	commitUser := func(execCtx context.Context) error {
 		if err := s.createUserWithRegistrationEmailGuard(execCtx, user); err != nil {

@@ -17,12 +17,11 @@ const (
 	openAITeamLinkedErrorBlockReason   = "team_linked_error"
 )
 
-// maybeHandleOpenAITeamLinkedError propagates a deactivated_workspace error
-// to other OAuth accounts belonging to the same ChatGPT workspace. This is
-// deliberately limited to OpenAI OAuth accounts and excludes Spark shadows.
+// maybeHandleOpenAITeamLinkedError fans a deactivated ChatGPT Team workspace
+// error out to its sibling OAuth accounts. The triggering account remains the
+// responsibility of the ordinary upstream error path.
 func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context, account *Account, statusCode int, responseBody []byte) {
-	if s == nil || s.accountRepo == nil || statusCode != http.StatusPaymentRequired ||
-		account == nil || !account.IsOpenAIOAuth() {
+	if s == nil || s.accountRepo == nil || statusCode != http.StatusPaymentRequired || !isOpenAIOAuthAccount(account) {
 		return
 	}
 	if strings.TrimSpace(gjson.GetBytes(responseBody, "detail.code").String()) != "deactivated_workspace" {
@@ -33,6 +32,8 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 		return
 	}
 
+	// Upstream error contexts may already be cancelled. Keep persistence
+	// independent while preserving any values that callers placed on ctx.
 	base := ctx
 	if base == nil {
 		base = context.Background()
@@ -48,8 +49,7 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	targets := make([]*Account, 0, len(accounts))
 	for i := range accounts {
 		candidate := &accounts[i]
-		if candidate.ID == account.ID || candidate.IsShadow() ||
-			strings.TrimSpace(candidate.GetChatGPTAccountID()) != teamID {
+		if candidate.ID == account.ID || candidate.IsShadow() || strings.TrimSpace(candidate.GetChatGPTAccountID()) != teamID {
 			continue
 		}
 		targets = append(targets, candidate)
@@ -57,6 +57,9 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	if len(targets) == 0 {
 		return
 	}
+
+	// Make the scheduler stop selecting every sibling before the first database
+	// write, then persist each state independently.
 	for _, candidate := range targets {
 		s.notifyAccountSchedulingBlocked(candidate, time.Time{}, openAITeamLinkedErrorBlockReason)
 	}
@@ -77,6 +80,7 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	)
 }
 
+// markOpenAITeamLinkedFired allows one fan-out per Team during the dedup TTL.
 func (s *RateLimitService) markOpenAITeamLinkedFired(teamID string) bool {
 	if s == nil || strings.TrimSpace(teamID) == "" {
 		return false

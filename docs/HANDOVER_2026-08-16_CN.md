@@ -77,6 +77,7 @@
 - 目录无写权限返回结构化 `UPDATE_DIRECTORY_NOT_WRITABLE`（HTTP 409），不再只有 `internal error`。
 - 安装/升级脚本对安装目录 `chown $SERVICE_USER` + `chmod u+rwx`，文档同步。
 - 更新源绑定本仓库（构建注入 + `SUB2API_UPDATE_REPO` 可覆盖），缓存按仓库隔离。
+- 面板原地更新与回滚仅适用于 Linux 非容器二进制服务；Docker 使用 compose 拉取并重建，Windows、macOS 与源码运行使用对应发布包或部署工具。更新检查会返回部署能力和限制原因，界面不会把不支持的运行形态伪装成可更新。
 
 ### 3.10 Antigravity/反代上游兼容（v0.2.1 前后）
 - `upstream` 账户支持 New API 类反代：URL 规范化（根/`/v1`/完整路径/query 保留）、双鉴权头、模型映射、头覆写、429/401/403/5xx 正确 failover。

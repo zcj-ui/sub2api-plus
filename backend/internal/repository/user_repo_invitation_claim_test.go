@@ -61,6 +61,7 @@ func TestCreateWithEmailAliasGuardJoinsOuterTransaction(t *testing.T) {
 			Concurrency:  1,
 		}
 		require.NoError(t, userRepo.CreateWithEmailAliasGuard(txCtx, created))
+		require.Greater(t, created.ID, int64(0))
 		require.NoError(t, redeemRepo.Use(txCtx, codeID, created.ID))
 		require.NoError(t, tx.Rollback())
 
@@ -85,6 +86,7 @@ func TestCreateWithEmailAliasGuardJoinsOuterTransaction(t *testing.T) {
 			Concurrency:  1,
 		}
 		require.NoError(t, userRepo.CreateWithEmailAliasGuard(txCtx, created))
+		require.Greater(t, created.ID, int64(0))
 		require.NoError(t, redeemRepo.Use(txCtx, codeID, created.ID))
 		require.NoError(t, tx.Commit())
 		committedEmails = append(committedEmails, created.Email)

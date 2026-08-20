@@ -25,8 +25,52 @@ import (
 )
 
 var (
-	ErrNoUpdateAvailable         = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
-	ErrRollbackVersionNotAllowed = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
+	ErrNoUpdateAvailable                = infraerrors.Conflict("ALREADY_UP_TO_DATE", "no update available; current version is latest")
+	ErrRollbackVersionNotAllowed        = infraerrors.BadRequest("ROLLBACK_VERSION_NOT_ALLOWED", "version is not in the allowed rollback list")
+	ErrInPlaceUpdateUnsupportedPlatform = infraerrors.Conflict(
+		"UPDATE_IN_PLACE_UNSUPPORTED_PLATFORM",
+		"in-place updates are supported only on Linux binary deployments; use the normal update procedure for this deployment",
+	)
+	ErrInPlaceUpdateUnsupportedContainer = infraerrors.Conflict(
+		"UPDATE_IN_PLACE_UNSUPPORTED_CONTAINER",
+		"in-place updates are unavailable in container deployments; pull the target image and recreate the container using deployment tooling",
+	)
+	ErrUpdateAssetNotAvailable = infraerrors.Conflict(
+		"UPDATE_ASSET_NOT_AVAILABLE",
+		"the selected release has no compatible update asset for this deployment",
+	)
+	ErrUpdateAssetInvalid = infraerrors.Conflict(
+		"UPDATE_ASSET_INVALID",
+		"the selected release asset cannot be used for an in-place update",
+	)
+	ErrUpdateDownloadFailed = infraerrors.ServiceUnavailable(
+		"UPDATE_DOWNLOAD_FAILED",
+		"failed to download the release asset; verify network or update-proxy access and retry",
+	)
+	ErrUpdateChecksumDownloadFailed = infraerrors.ServiceUnavailable(
+		"UPDATE_CHECKSUM_DOWNLOAD_FAILED",
+		"failed to download release checksums; verify network or update-proxy access and retry",
+	)
+	ErrUpdateChecksumVerificationFailed = infraerrors.Conflict(
+		"UPDATE_CHECKSUM_VERIFICATION_FAILED",
+		"release asset checksum verification failed; retry the update or verify the release",
+	)
+	ErrUpdateArchiveInvalid = infraerrors.Conflict(
+		"UPDATE_ARCHIVE_INVALID",
+		"release asset could not be unpacked as an executable",
+	)
+	ErrUpdateRollbackBackupNotAvailable = infraerrors.Conflict(
+		"UPDATE_ROLLBACK_BACKUP_NOT_AVAILABLE",
+		"no local update backup is available; select a published rollback version or use deployment tooling",
+	)
+	ErrUpdateReleaseLookupFailed = infraerrors.ServiceUnavailable(
+		"UPDATE_RELEASE_LOOKUP_FAILED",
+		"failed to retrieve release information; verify network or update-proxy access and retry",
+	)
+	ErrUpdateFilesystemOperationFailed = infraerrors.InternalServer(
+		"UPDATE_FILESYSTEM_OPERATION_FAILED",
+		"failed to modify the installed binary; verify the deployment directory and retry",
+	)
 )
 
 const (
@@ -48,14 +92,14 @@ const (
 )
 
 func updateFilesystemError(operation, directory string, err error) error {
-	wrapped := fmt.Errorf("%s: %w", operation, err)
+	wrapped := fmt.Errorf("%s in %s: %w", operation, filepath.Clean(directory), err)
 	if errors.Is(err, os.ErrPermission) {
 		return infraerrors.Conflict(
 			"UPDATE_DIRECTORY_NOT_WRITABLE",
-			fmt.Sprintf("the service user cannot write to the update directory %s; fix its ownership or permissions and retry", filepath.Clean(directory)),
+			"the service user cannot write to the update directory; fix its ownership or permissions and retry",
 		).WithCause(wrapped)
 	}
-	return wrapped
+	return infraerrors.Clone(ErrUpdateFilesystemOperationFailed).WithCause(wrapped)
 }
 
 // UpdateCache defines cache operations for update service
@@ -79,6 +123,12 @@ type UpdateService struct {
 	currentVersion string
 	buildType      string // "source" for manual builds, "dev" for snapshots, "release" for stable builds
 	updateRepo     string
+	runtimeInfo    func() updateRuntimeInfo
+}
+
+type updateRuntimeInfo struct {
+	goos          string
+	containerized bool
 }
 
 // NewUpdateService creates a new UpdateService
@@ -89,19 +139,101 @@ func NewUpdateService(cache UpdateCache, githubClient GitHubReleaseClient, versi
 		currentVersion: version,
 		buildType:      buildType,
 		updateRepo:     normalizeUpdateRepo(updateRepo),
+		runtimeInfo:    detectUpdateRuntime,
 	}
+}
+
+// InPlaceUpdateCapability tells the UI whether this process can safely replace
+// its own executable. It is intentionally separate from HasUpdate: an update
+// can exist even when the current deployment must use Docker or platform
+// tooling instead of the in-process updater.
+type InPlaceUpdateCapability struct {
+	Supported          bool   `json:"supported"`
+	RestrictionReason  string `json:"restriction_reason,omitempty"`
+	RestrictionMessage string `json:"restriction_message,omitempty"`
+}
+
+func (s *UpdateService) currentUpdateRuntime() updateRuntimeInfo {
+	if s != nil && s.runtimeInfo != nil {
+		return s.runtimeInfo()
+	}
+	return detectUpdateRuntime()
+}
+
+func detectUpdateRuntime() updateRuntimeInfo {
+	info := updateRuntimeInfo{goos: runtime.GOOS}
+	if info.goos == "linux" {
+		info.containerized = isContainerizedRuntime()
+	}
+	return info
+}
+
+func isContainerizedRuntime() bool {
+	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+		if _, err := os.Stat(marker); err == nil {
+			return true
+		}
+	}
+
+	if strings.TrimSpace(os.Getenv("container")) != "" ||
+		strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST")) != "" {
+		return true
+	}
+
+	cgroup, err := os.ReadFile("/proc/1/cgroup")
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(string(cgroup))
+	for _, marker := range []string{"docker", "containerd", "kubepods", "libpod", "podman"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *UpdateService) inPlaceUpdateCapability() InPlaceUpdateCapability {
+	runtimeInfo := s.currentUpdateRuntime()
+	if runtimeInfo.goos != "linux" {
+		return InPlaceUpdateCapability{
+			Supported:          false,
+			RestrictionReason:  "UPDATE_IN_PLACE_UNSUPPORTED_PLATFORM",
+			RestrictionMessage: "In-place updates are supported only on Linux binary deployments. Use this deployment's normal update procedure.",
+		}
+	}
+	if runtimeInfo.containerized {
+		return InPlaceUpdateCapability{
+			Supported:          false,
+			RestrictionReason:  "UPDATE_IN_PLACE_UNSUPPORTED_CONTAINER",
+			RestrictionMessage: "In-place updates are unavailable in containers. Pull the target image and recreate the container using deployment tooling.",
+		}
+	}
+	return InPlaceUpdateCapability{Supported: true}
+}
+
+func (s *UpdateService) requireInPlaceUpdateSupport() error {
+	capability := s.inPlaceUpdateCapability()
+	if capability.Supported {
+		return nil
+	}
+	if capability.RestrictionReason == "UPDATE_IN_PLACE_UNSUPPORTED_CONTAINER" {
+		return infraerrors.Clone(ErrInPlaceUpdateUnsupportedContainer)
+	}
+	return infraerrors.Clone(ErrInPlaceUpdateUnsupportedPlatform)
 }
 
 // UpdateInfo contains update information
 type UpdateInfo struct {
-	CurrentVersion string       `json:"current_version"`
-	LatestVersion  string       `json:"latest_version"`
-	HasUpdate      bool         `json:"has_update"`
-	ReleaseInfo    *ReleaseInfo `json:"release_info,omitempty"`
-	Cached         bool         `json:"cached"`
-	Warning        string       `json:"warning,omitempty"`
-	BuildType      string       `json:"build_type"` // "source", "dev", or "release"
-	UpdateRepo     string       `json:"update_repo"`
+	CurrentVersion string                  `json:"current_version"`
+	LatestVersion  string                  `json:"latest_version"`
+	HasUpdate      bool                    `json:"has_update"`
+	ReleaseInfo    *ReleaseInfo            `json:"release_info,omitempty"`
+	Cached         bool                    `json:"cached"`
+	Warning        string                  `json:"warning,omitempty"`
+	BuildType      string                  `json:"build_type"` // "source", "dev", or "release"
+	UpdateRepo     string                  `json:"update_repo"`
+	InPlaceUpdate  InPlaceUpdateCapability `json:"in_place_update"`
 }
 
 // ReleaseInfo contains GitHub release details
@@ -159,16 +291,17 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 	if err != nil {
 		// Return cached on error
 		if cached, cacheErr := s.getFromCache(ctx); cacheErr == nil && cached != nil {
-			cached.Warning = "Using cached data: " + err.Error()
+			cached.Warning = "Using cached data: " + updateCheckWarning(err)
 			return cached, nil
 		}
 		return &UpdateInfo{
 			CurrentVersion: s.currentVersion,
 			LatestVersion:  s.currentVersion,
 			HasUpdate:      false,
-			Warning:        err.Error(),
+			Warning:        updateCheckWarning(err),
 			BuildType:      s.buildType,
 			UpdateRepo:     s.updateRepo,
+			InPlaceUpdate:  s.inPlaceUpdateCapability(),
 		}, nil
 	}
 
@@ -177,9 +310,24 @@ func (s *UpdateService) CheckUpdate(ctx context.Context, force bool) (*UpdateInf
 	return info, nil
 }
 
+func updateCheckWarning(err error) string {
+	if err == nil {
+		return ""
+	}
+	if message := strings.TrimSpace(infraerrors.Message(err)); message != "" &&
+		infraerrors.Reason(err) != "" {
+		return message
+	}
+	return "unable to check for updates; verify network or update-proxy access and retry"
+}
+
 // PerformUpdate downloads and applies the update
 // Uses atomic file replacement pattern for safe in-place updates
 func (s *UpdateService) PerformUpdate(ctx context.Context) error {
+	if err := s.requireInPlaceUpdateSupport(); err != nil {
+		return err
+	}
+
 	info, err := s.CheckUpdate(ctx, true)
 	if err != nil {
 		return err
@@ -211,27 +359,27 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	}
 
 	if downloadURL == "" {
-		return fmt.Errorf("no compatible release found for %s/%s", runtime.GOOS, runtime.GOARCH)
+		return infraerrors.Clone(ErrUpdateAssetNotAvailable)
 	}
 
 	// SECURITY: Validate download URL is from trusted domain
 	if err := validateDownloadURL(downloadURL); err != nil {
-		return fmt.Errorf("invalid download URL: %w", err)
+		return infraerrors.Clone(ErrUpdateAssetInvalid).WithCause(err)
 	}
 	if checksumURL != "" {
 		if err := validateDownloadURL(checksumURL); err != nil {
-			return fmt.Errorf("invalid checksum URL: %w", err)
+			return infraerrors.Clone(ErrUpdateAssetInvalid).WithCause(err)
 		}
 	}
 
 	// Get current executable path
 	exePath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+		return updateFilesystemError("failed to determine the executable path", ".", err)
 	}
 	exePath, err = filepath.EvalSymlinks(exePath)
 	if err != nil {
-		return fmt.Errorf("failed to resolve symlinks: %w", err)
+		return updateFilesystemError("failed to resolve the executable path", filepath.Dir(exePath), err)
 	}
 
 	exeDir := filepath.Dir(exePath)
@@ -247,25 +395,25 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	// Download archive
 	archivePath := filepath.Join(tempDir, filepath.Base(downloadURL))
 	if err := s.downloadFile(ctx, downloadURL, archivePath); err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return err
 	}
 
 	// Verify checksum if available
 	if checksumURL != "" {
 		if err := s.verifyChecksum(ctx, archivePath, checksumURL); err != nil {
-			return fmt.Errorf("checksum verification failed: %w", err)
+			return err
 		}
 	}
 
 	// Extract binary from archive
 	newBinaryPath := filepath.Join(tempDir, "sub2api")
 	if err := s.extractBinary(archivePath, newBinaryPath); err != nil {
-		return fmt.Errorf("extraction failed: %w", err)
+		return err
 	}
 
 	// Set executable permission before replacement
 	if err := os.Chmod(newBinaryPath, 0755); err != nil {
-		return fmt.Errorf("chmod failed: %w", err)
+		return updateFilesystemError("failed to set executable permissions", exeDir, err)
 	}
 
 	// Atomic replacement using rename pattern:
@@ -289,7 +437,9 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	if err := os.Rename(newBinaryPath, exePath); err != nil {
 		// Restore backup on failure
 		if restoreErr := os.Rename(backupPath, exePath); restoreErr != nil {
-			return fmt.Errorf("replace failed and restore failed: %w (restore error: %v)", err, restoreErr)
+			return infraerrors.Clone(ErrUpdateFilesystemOperationFailed).WithCause(
+				fmt.Errorf("replace failed: %w; restore failed: %v", err, restoreErr),
+			)
 		}
 		return updateFilesystemError("failed to replace the binary; the backup was restored", exeDir, err)
 	}
@@ -301,18 +451,25 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 
 // Rollback restores the previous version
 func (s *UpdateService) Rollback() error {
+	if err := s.requireInPlaceUpdateSupport(); err != nil {
+		return err
+	}
+
 	exePath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+		return updateFilesystemError("failed to determine the executable path", ".", err)
 	}
 	exePath, err = filepath.EvalSymlinks(exePath)
 	if err != nil {
-		return fmt.Errorf("failed to resolve symlinks: %w", err)
+		return updateFilesystemError("failed to resolve the executable path", filepath.Dir(exePath), err)
 	}
 
 	backupFile := exePath + ".backup"
-	if _, err := os.Stat(backupFile); os.IsNotExist(err) {
-		return fmt.Errorf("no backup found")
+	if _, err := os.Stat(backupFile); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return infraerrors.Clone(ErrUpdateRollbackBackupNotAvailable)
+		}
+		return updateFilesystemError("failed to inspect the local update backup", filepath.Dir(exePath), err)
 	}
 
 	// Replace current with backup
@@ -347,6 +504,10 @@ func (s *UpdateService) ListRollbackVersions(ctx context.Context) ([]RollbackVer
 // The target must be one of the versions returned by ListRollbackVersions;
 // anything else (including the current version) is rejected.
 func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) error {
+	if err := s.requireInPlaceUpdateSupport(); err != nil {
+		return err
+	}
+
 	target := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if target == "" {
 		return ErrRollbackVersionNotAllowed
@@ -385,7 +546,7 @@ func (s *UpdateService) RollbackToVersion(ctx context.Context, version string) e
 func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubRelease, error) {
 	releases, err := s.githubClient.FetchRecentReleases(ctx, s.updateRepo, rollbackFetchPageSize)
 	if err != nil {
-		return nil, err
+		return nil, infraerrors.Clone(ErrUpdateReleaseLookupFailed).WithCause(err)
 	}
 
 	seen := make(map[string]bool, len(releases))
@@ -422,10 +583,12 @@ func (s *UpdateService) fetchRollbackCandidates(ctx context.Context) ([]*GitHubR
 func (s *UpdateService) fetchLatestRelease(ctx context.Context) (*UpdateInfo, error) {
 	release, err := s.githubClient.FetchLatestRelease(ctx, s.updateRepo)
 	if err != nil {
-		return nil, err
+		return nil, infraerrors.Clone(ErrUpdateReleaseLookupFailed).WithCause(err)
 	}
 	if release == nil {
-		return nil, fmt.Errorf("GitHub returned an empty release for %s", s.updateRepo)
+		return nil, infraerrors.Clone(ErrUpdateReleaseLookupFailed).WithCause(
+			fmt.Errorf("release lookup returned an empty release"),
+		)
 	}
 
 	latestVersion := strings.TrimPrefix(release.TagName, "v")
@@ -450,18 +613,22 @@ func (s *UpdateService) fetchLatestRelease(ctx context.Context) (*UpdateInfo, er
 			HTMLURL:     release.HTMLURL,
 			Assets:      assets,
 		},
-		Cached:     false,
-		BuildType:  s.buildType,
-		UpdateRepo: s.updateRepo,
+		Cached:        false,
+		BuildType:     s.buildType,
+		UpdateRepo:    s.updateRepo,
+		InPlaceUpdate: s.inPlaceUpdateCapability(),
 	}, nil
 }
 
 func (s *UpdateService) downloadFile(ctx context.Context, downloadURL, dest string) error {
-	return s.githubClient.DownloadFile(ctx, downloadURL, dest, maxDownloadSize)
+	if err := s.githubClient.DownloadFile(ctx, downloadURL, dest, maxDownloadSize); err != nil {
+		return infraerrors.Clone(ErrUpdateDownloadFailed).WithCause(err)
+	}
+	return nil
 }
 
 func (s *UpdateService) getArchiveName() string {
-	osName := runtime.GOOS
+	osName := s.currentUpdateRuntime().goos
 	arch := runtime.GOARCH
 	return fmt.Sprintf("%s_%s", osName, arch)
 }
@@ -496,19 +663,19 @@ func (s *UpdateService) verifyChecksum(ctx context.Context, filePath, checksumUR
 	// Download checksums file
 	checksumData, err := s.githubClient.FetchChecksumFile(ctx, checksumURL)
 	if err != nil {
-		return fmt.Errorf("failed to download checksums: %w", err)
+		return infraerrors.Clone(ErrUpdateChecksumDownloadFailed).WithCause(err)
 	}
 
 	// Calculate file hash
 	f, err := os.Open(filePath)
 	if err != nil {
-		return err
+		return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(err)
 	}
 	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return err
+		return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(err)
 	}
 	actualHash := hex.EncodeToString(h.Sum(nil))
 
@@ -522,14 +689,27 @@ func (s *UpdateService) verifyChecksum(ctx context.Context, filePath, checksumUR
 			if parts[0] == actualHash {
 				return nil
 			}
-			return fmt.Errorf("checksum mismatch: expected %s, got %s", parts[0], actualHash)
+			return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(
+				fmt.Errorf("checksum mismatch for %s", fileName),
+			)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(err)
+	}
 
-	return fmt.Errorf("checksum not found for %s", fileName)
+	return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(
+		fmt.Errorf("checksum not found for %s", fileName),
+	)
 }
 
-func (s *UpdateService) extractBinary(archivePath, destPath string) error {
+func (s *UpdateService) extractBinary(archivePath, destPath string) (err error) {
+	defer func() {
+		if err != nil {
+			err = infraerrors.Clone(ErrUpdateArchiveInvalid).WithCause(err)
+		}
+	}()
+
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
@@ -648,6 +828,7 @@ func (s *UpdateService) getFromCache(ctx context.Context) (*UpdateInfo, error) {
 		Cached:         true,
 		BuildType:      s.buildType,
 		UpdateRepo:     s.updateRepo,
+		InPlaceUpdate:  s.inPlaceUpdateCapability(),
 	}, nil
 }
 

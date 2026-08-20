@@ -67,3 +67,17 @@ func TestMigration230MarksOnlyAmbiguousHistoricalCodexRows(t *testing.T) {
 	require.NotContains(t, sql, "to_jsonb('full'::text)")
 	require.NotContains(t, sql, "'{codex_fingerprint_mode}'")
 }
+
+func TestMigration231RepairsOnlyActiveCodexFingerprintSeeds(t *testing.T) {
+	content, err := FS.ReadFile("231_repair_active_codex_fingerprint_seed.sql")
+	require.NoError(t, err)
+
+	sql := string(content)
+	require.Contains(t, sql, "Keep 225 immutable")
+	require.GreaterOrEqual(t, strings.Count(sql, "deleted_at IS NULL"), 2)
+	require.Contains(t, sql, "LOWER(BTRIM(COALESCE(extra->>'codex_fingerprint_mode', ''))) IN ('device', 'session', 'full')")
+	require.Contains(t, sql, "to_jsonb(LOWER(BTRIM(extra->>'codex_fingerprint_seed')))")
+	require.Contains(t, sql, "gen_random_uuid()")
+	require.NotContains(t, sql, "-4[0-9a-f]")
+	require.Contains(t, sql, "00000000-0000-0000-0000-000000000000")
+}

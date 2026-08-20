@@ -11,6 +11,11 @@ export interface ReleaseInfo {
   html_url: string
 }
 
+export interface InPlaceUpdateCapability {
+  supported: boolean
+  restriction_message?: string
+}
+
 export interface VersionInfo {
   current_version: string
   latest_version: string
@@ -20,6 +25,9 @@ export interface VersionInfo {
   warning?: string
   build_type: 'source' | 'dev' | 'release'
   update_repo: string
+  // Absent on older backends. The UI must treat an absent capability as
+  // unsupported so a browser never attempts to replace its own binary.
+  in_place_update?: InPlaceUpdateCapability
 }
 
 /**
@@ -44,6 +52,9 @@ export async function checkUpdates(force = false): Promise<VersionInfo> {
 export interface UpdateResult {
   message: string
   need_restart: boolean
+  already_up_to_date?: boolean
+  current_version?: string
+  latest_version?: string
 }
 
 export interface RollbackVersionInfo {
@@ -70,13 +81,38 @@ export async function getRollbackVersions(): Promise<{ versions: RollbackVersion
  */
 const UPDATE_REQUEST_TIMEOUT_MS = 15 * 60 * 1000
 
+export interface SystemOperationOptions {
+  /**
+   * Supplying a key is useful for callers that deliberately retry one logical
+   * operation. Axios authentication retries reuse the same request config and
+   * therefore the same key automatically.
+   */
+  idempotencyKey?: string
+}
+
+function createSystemOperationIdempotencyKey(operation: string): string {
+  const randomUUID = globalThis.crypto?.randomUUID
+  const unique =
+    typeof randomUUID === 'function'
+      ? randomUUID.call(globalThis.crypto)
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  return `system-${operation}-${unique}`
+}
+
+function systemOperationHeaders(operation: string, options?: SystemOperationOptions) {
+  return {
+    'Idempotency-Key': options?.idempotencyKey || createSystemOperationIdempotencyKey(operation)
+  }
+}
+
 /**
  * Perform system update
  * Downloads and applies the latest version
  */
-export async function performUpdate(): Promise<UpdateResult> {
+export async function performUpdate(options?: SystemOperationOptions): Promise<UpdateResult> {
   const { data } = await apiClient.post<UpdateResult>('/admin/system/update', undefined, {
-    timeout: UPDATE_REQUEST_TIMEOUT_MS
+    timeout: UPDATE_REQUEST_TIMEOUT_MS,
+    headers: systemOperationHeaders('update', options)
   })
   return data
 }
@@ -85,11 +121,17 @@ export async function performUpdate(): Promise<UpdateResult> {
  * Rollback to a previous version
  * @param version - Target version (e.g. "0.1.146"); omit to restore the local backup binary
  */
-export async function rollback(version?: string): Promise<UpdateResult> {
+export async function rollback(
+  version?: string,
+  options?: SystemOperationOptions
+): Promise<UpdateResult> {
   const { data } = await apiClient.post<UpdateResult>(
     '/admin/system/rollback',
     version ? { version } : undefined,
-    { timeout: UPDATE_REQUEST_TIMEOUT_MS }
+    {
+      timeout: UPDATE_REQUEST_TIMEOUT_MS,
+      headers: systemOperationHeaders('rollback', options)
+    }
   )
   return data
 }
@@ -97,8 +139,10 @@ export async function rollback(version?: string): Promise<UpdateResult> {
 /**
  * Restart the service
  */
-export async function restartService(): Promise<{ message: string }> {
-  const { data } = await apiClient.post<{ message: string }>('/admin/system/restart')
+export async function restartService(options?: SystemOperationOptions): Promise<{ message: string }> {
+  const { data } = await apiClient.post<{ message: string }>('/admin/system/restart', undefined, {
+    headers: systemOperationHeaders('restart', options)
+  })
   return data
 }
 

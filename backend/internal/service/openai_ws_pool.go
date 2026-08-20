@@ -84,8 +84,17 @@ type openAIWSAcquireRequest struct {
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
-	betaFeatures string
-	identity     string
+	betaFeatures        string
+	codexInstallationID string
+	sessionIDHyphen     string
+	sessionIDUnderscore string
+	threadID            string
+	clientRequestID     string
+	codexWindowID       string
+	// identity is the fork's non-reversible genuine-Codex session key. It
+	// protects a retained 429 continuation socket even when optional handshake
+	// features change between turns.
+	identity string
 }
 
 type openAIWSConnLease struct {
@@ -1122,30 +1131,35 @@ retryAcquire:
 			p.ensureTargetIdleAsync(accountID)
 			return lease, nil
 		}
-		for _, conn := range ap.conns {
-			if conn == nil || conn == best || p.isPermanentGuardConnLocked(ap, conn.id) || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesProxyURL(req.ProxyURL) || !conn.matchesWSURL(req.WSURL) || !conn.matchesRoutingAffinity(routingAffinity) {
-				continue
-			}
-			if conn.tryAcquire() {
-				connPick := time.Since(pickStartedAt)
-				p.recordConnPickDuration(connPick)
-				ap.mu.Unlock()
-				closeOpenAIWSConns(evicted)
-				if p.shouldHealthCheckConn(conn) {
-					if err := conn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
-						conn.close()
-						p.evictConn(accountID, conn.id)
-						if retry < 1 {
-							return p.acquire(ctx, req, retry+1)
-						}
-						return nil, err
-					}
+		if routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns {
+			for _, conn := range ap.conns {
+				if conn == nil || conn == best || p.isPermanentGuardConnLocked(ap, conn.id) ||
+					!conn.matchesHandshakeCompatibility(compatibility) ||
+					!conn.matchesProxyURL(req.ProxyURL) ||
+					!conn.matchesWSURL(req.WSURL) {
+					continue
 				}
-				lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick, reused: true}
-				p.metrics.acquireReuseTotal.Add(1)
-				p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
-				p.ensureTargetIdleAsync(accountID)
-				return lease, nil
+				if conn.tryAcquire() {
+					connPick := time.Since(pickStartedAt)
+					p.recordConnPickDuration(connPick)
+					ap.mu.Unlock()
+					closeOpenAIWSConns(evicted)
+					if p.shouldHealthCheckConn(conn) {
+						if err := conn.pingWithTimeout(openAIWSConnHealthCheckTO); err != nil {
+							conn.close()
+							p.evictConn(accountID, conn.id)
+							if retry < 1 {
+								return p.acquire(ctx, req, retry+1)
+							}
+							return nil, err
+						}
+					}
+					lease := &openAIWSConnLease{pool: p, accountID: accountID, conn: conn, connPick: connPick, reused: true}
+					p.metrics.acquireReuseTotal.Add(1)
+					p.recordLastSuccessfulAcquire(accountID, acquireGeneration, req)
+					p.ensureTargetIdleAsync(accountID)
+					return lease, nil
+				}
 			}
 		}
 	}
@@ -1357,7 +1371,7 @@ func (p *openAIWSConnPool) pickOldestIdleConnLocked(ap *openAIWSAccountPool) *op
 func (p *openAIWSConnPool) pickOldestIdleConnWithoutHandshakeCompatibilityOrRoutingAffinityLocked(
 	ap *openAIWSAccountPool,
 	compatibility openAIWSHandshakeCompatibilityKey,
-	routingAffinity string,
+	_ string,
 	proxyURL string,
 	wsURL string,
 ) *openAIWSConn {
@@ -1367,13 +1381,13 @@ func (p *openAIWSConnPool) pickOldestIdleConnWithoutHandshakeCompatibilityOrRout
 	var oldest *openAIWSConn
 	for _, conn := range ap.conns {
 		if conn == nil ||
-			(conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) && conn.matchesRoutingAffinity(routingAffinity)) ||
+			(conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL)) ||
 			conn.isLeased() || conn.waiters.Load() > 0 {
 			continue
 		}
 		// A guard pin protects a still-valid upstream identity. If the account's
 		// proxy or WS target changed, that identity is stale and must not block
-		// the replacement dial indefinitely; only matching targets remain pinned.
+		// a replacement dial indefinitely; only matching targets remain pinned.
 		if p.isConnPinnedLocked(ap, conn.id) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) {
 			continue
 		}
@@ -2694,14 +2708,53 @@ func normalizeOpenAIWSBetaFeatures(headers http.Header) string {
 	return strings.Join(normalized, ",")
 }
 
+// normalizeOpenAIWSHandshakeCompatibility retains the historic helper shape
+// for callers that only need beta feature normalization. Actual pool acquires
+// use the account-aware variant below so opt-in fingerprint modes participate
+// in compatibility without changing the default/off behavior.
 func normalizeOpenAIWSHandshakeCompatibility(headers http.Header) openAIWSHandshakeCompatibilityKey {
-	return openAIWSHandshakeCompatibilityKey{
+	return normalizeOpenAIWSHandshakeCompatibilityForAccount(nil, headers)
+}
+
+func normalizeOpenAIWSHandshakeCompatibilityForAccount(account *Account, headers http.Header) openAIWSHandshakeCompatibilityKey {
+	key := openAIWSHandshakeCompatibilityKey{
 		betaFeatures: normalizeOpenAIWSBetaFeatures(headers),
 	}
+	mode := activeCodexFingerprintMode(account)
+	if mode == codexFingerprintOff {
+		return key
+	}
+	key.codexInstallationID = normalizeOpenAIWSStableIdentityHeader(headers, "x-codex-installation-id")
+	if mode == codexFingerprintDevice {
+		return key
+	}
+	key.sessionIDHyphen = normalizeOpenAIWSStableIdentityHeader(headers, "session-id")
+	key.sessionIDUnderscore = normalizeOpenAIWSStableIdentityHeader(headers, "session_id")
+	key.threadID = normalizeOpenAIWSStableIdentityHeader(headers, "thread-id")
+	key.clientRequestID = normalizeOpenAIWSStableIdentityHeader(headers, "x-client-request-id")
+	key.codexWindowID = normalizeOpenAIWSStableIdentityHeader(headers, "x-codex-window-id")
+	return key
+}
+
+func activeCodexFingerprintMode(account *Account) codexFingerprintMode {
+	if account == nil || account.GetCodexFingerprintMode() == codexFingerprintOff {
+		return codexFingerprintOff
+	}
+	if _, ok := codexFingerprintSeed(account.Extra); !ok {
+		return codexFingerprintOff
+	}
+	return account.GetCodexFingerprintMode()
+}
+
+func normalizeOpenAIWSStableIdentityHeader(headers http.Header, name string) string {
+	if headers == nil {
+		return ""
+	}
+	return strings.TrimSpace(headers.Get(name))
 }
 
 func normalizeOpenAIWSHandshakeCompatibilityForRequest(req openAIWSAcquireRequest) openAIWSHandshakeCompatibilityKey {
-	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Headers)
+	compatibility := normalizeOpenAIWSHandshakeCompatibilityForAccount(req.Account, req.Headers)
 	compatibility.identity = strings.TrimSpace(req.IdentityCompatibility)
 	return compatibility
 }

@@ -72,6 +72,8 @@ pnpm install --frozen-lockfile
 pnpm build
 
 cd ../backend
+VERSION="$(./scripts/resolve-version.sh)"
+go build -tags embed -ldflags="-X main.Version=${VERSION}" -o sub2api ./cmd/server
 go run ./cmd/server
 ```
 
@@ -87,9 +89,9 @@ make build-release  # 正式编译版
 | 通道 | 入口 | 产物 | 用途 |
 |---|---|---|---|
 | 开发版 | `dev` 分支 | Actions 多平台归档、`ghcr.io/zcj-ui/sub2api-plus:dev` | 联调和功能验收 |
-| 发布版 | `vX.Y.Z` 标签 | GitHub Release、SHA256、多架构镜像、`latest` | 固定版本验收和在线更新验证 |
+| 发布版 | `vX.Y.Z` 标签 | GitHub Release、SHA256、多架构镜像、`latest` | 固定版本验收；Linux 非容器二进制可验证面板原地更新 |
 
-正式版与开发编译版都会写入当前更新仓库。运行时可用下面的环境变量显式覆盖：
+正式版与开发编译版都会写入当前更新仓库。面板中的原地更新和回滚仅支持由 Linux 服务管理器托管的非容器二进制部署；Docker 请按部署文档执行 `docker compose pull` 和 `docker compose up -d`，Windows、macOS 和源码运行请使用对应发布包或部署工具。运行时可用下面的环境变量显式覆盖更新仓库：
 
 ```bash
 SUB2API_UPDATE_REPO=zcj-ui/sub2api-plus
@@ -144,6 +146,14 @@ curl http://127.0.0.1:8080/v1/responses \
 ## 协议与归属
 
 本项目按 [GNU Lesser General Public License v3.0 or later](LICENSE) 发布。
+
+<a href="https://star-history.dera.page/#Wei-Shaw/sub2api&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date" />
+ </picture>
+</a>
 
 - 上游项目：[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
 - 当前发行版：[zcj-ui/sub2api-plus](https://github.com/zcj-ui/sub2api-plus)

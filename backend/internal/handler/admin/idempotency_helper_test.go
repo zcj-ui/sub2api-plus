@@ -94,9 +94,12 @@ func TestExecuteAdminIdempotentJSONFailOpenOnStoreUnavailable(t *testing.T) {
 }
 
 type memoryIdempotencyRepoStub struct {
-	mu     sync.Mutex
-	nextID int64
-	data   map[string]*service.IdempotencyRecord
+	mu                      sync.Mutex
+	nextID                  int64
+	data                    map[string]*service.IdempotencyRecord
+	rejectCanceledWrite     bool
+	markSucceededContextErr error
+	markFailedContextErr    error
 }
 
 func newMemoryIdempotencyRepoStub() *memoryIdempotencyRepoStub {
@@ -194,9 +197,15 @@ func (r *memoryIdempotencyRepoStub) ExtendProcessingLock(_ context.Context, id i
 	return false, nil
 }
 
-func (r *memoryIdempotencyRepoStub) MarkSucceeded(_ context.Context, id int64, responseStatus int, responseBody string, expiresAt time.Time) error {
+func (r *memoryIdempotencyRepoStub) MarkSucceeded(ctx context.Context, id int64, responseStatus int, responseBody string, expiresAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		r.markSucceededContextErr = ctx.Err()
+		if r.rejectCanceledWrite {
+			return ctx.Err()
+		}
+	}
 	for _, rec := range r.data {
 		if rec.ID != id {
 			continue
@@ -212,9 +221,15 @@ func (r *memoryIdempotencyRepoStub) MarkSucceeded(_ context.Context, id int64, r
 	return nil
 }
 
-func (r *memoryIdempotencyRepoStub) MarkFailedRetryable(_ context.Context, id int64, errorReason string, lockedUntil, expiresAt time.Time) error {
+func (r *memoryIdempotencyRepoStub) MarkFailedRetryable(ctx context.Context, id int64, errorReason string, lockedUntil, expiresAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		r.markFailedContextErr = ctx.Err()
+		if r.rejectCanceledWrite {
+			return ctx.Err()
+		}
+	}
 	for _, rec := range r.data {
 		if rec.ID != id {
 			continue

@@ -166,8 +166,9 @@ type AccountBulkUpdate struct {
 	Credentials    map[string]any
 	Extra          map[string]any
 	ProbeEnabled   *bool
-	// EnsureCodexFingerprintSeed asks the repository to generate one distinct
-	// seed per eligible OpenAI OAuth row inside the same bulk transaction.
+	// EnsureCodexFingerprintSeed asks the repository to atomically preserve an
+	// existing valid Codex fingerprint seed or create one per eligible OpenAI
+	// OAuth row inside the same bulk transaction.
 	EnsureCodexFingerprintSeed bool
 }
 
@@ -242,6 +243,8 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 		Platform:    req.Platform,
 		Type:        req.Type,
 		Credentials: SanitizeStoredCredentials(req.Platform, req.Credentials),
+		// The normalizer discards an external seed and mints a server-owned
+		// identity when an OAuth convergence mode is enabled.
 		Extra:       NormalizeCodexFingerprintExtraForAccount(req.Platform, req.Type, req.Extra),
 		ProxyID:     req.ProxyID,
 		Concurrency: req.Concurrency,

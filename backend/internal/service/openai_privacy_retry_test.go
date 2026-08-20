@@ -87,3 +87,108 @@ func TestTokenRefreshService_ensureOpenAIPrivacy_RetriesNonSuccessModes(t *testi
 		})
 	}
 }
+
+func TestAdminServiceEnsureOpenAIPrivacyFailsClosedWhenConfiguredProxyUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proxy *Proxy
+		err   error
+	}{
+		{name: "missing"},
+		{name: "lookup_error", err: errors.New("proxy repository unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyID := int64(301)
+			factoryCalls := 0
+			svc := &adminServiceImpl{
+				proxyRepo: &configuredProxyLookupStub{proxy: tc.proxy, err: tc.err},
+				privacyClientFactory: func(string) (*req.Client, error) {
+					factoryCalls++
+					return nil, errors.New("privacy factory must not be called")
+				},
+			}
+			account := &Account{
+				ID:       301,
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				ProxyID:  &proxyID,
+				Credentials: map[string]any{
+					"access_token": "token",
+				},
+			}
+
+			require.Empty(t, svc.EnsureOpenAIPrivacy(context.Background(), account))
+			require.Zero(t, factoryCalls)
+		})
+	}
+}
+
+func TestAdminServiceForceOpenAIPrivacyFailsClosedWhenConfiguredProxyUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proxy *Proxy
+		err   error
+	}{
+		{name: "missing"},
+		{name: "lookup_error", err: errors.New("proxy repository unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyID := int64(302)
+			factoryCalls := 0
+			svc := &adminServiceImpl{
+				proxyRepo: &configuredProxyLookupStub{proxy: tc.proxy, err: tc.err},
+				privacyClientFactory: func(string) (*req.Client, error) {
+					factoryCalls++
+					return nil, errors.New("privacy factory must not be called")
+				},
+			}
+			account := &Account{
+				ID:       302,
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				ProxyID:  &proxyID,
+				Credentials: map[string]any{
+					"access_token": "token",
+				},
+			}
+
+			require.Empty(t, svc.ForceOpenAIPrivacy(context.Background(), account))
+			require.Zero(t, factoryCalls)
+		})
+	}
+}
+
+func TestTokenRefreshEnsureOpenAIPrivacyFailsClosedWhenConfiguredProxyUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		proxy *Proxy
+		err   error
+	}{
+		{name: "missing"},
+		{name: "lookup_error", err: errors.New("proxy repository unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyID := int64(303)
+			factoryCalls := 0
+			service := &TokenRefreshService{
+				proxyRepo: &configuredProxyLookupStub{proxy: tc.proxy, err: tc.err},
+				privacyClientFactory: func(string) (*req.Client, error) {
+					factoryCalls++
+					return nil, errors.New("privacy factory must not be called")
+				},
+			}
+			account := &Account{
+				ID:       303,
+				Platform: PlatformOpenAI,
+				Type:     AccountTypeOAuth,
+				ProxyID:  &proxyID,
+				Credentials: map[string]any{
+					"access_token": "token",
+				},
+			}
+
+			service.ensureOpenAIPrivacy(context.Background(), account)
+			require.Zero(t, factoryCalls)
+		})
+	}
+}

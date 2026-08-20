@@ -325,6 +325,16 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 		"compact probe must keep the direct installation projection aligned with client_metadata")
 	require.Equal(t, resolveConvergedInstallationID(&account),
 		gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
+/*
+	// 显式 session 收敛模式：出站身份 = 账号级收敛值
+	seed, ok := codexFingerprintSeed(account.Extra)
+	require.True(t, ok)
+	converged := resolveConvergedSessionID(seed)
+	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
+	require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
+	require.Equal(t, resolveConvergedInstallationID(&account, seed), upstream.lastReq.Header.Get("x-codex-installation-id"),
+		"真实 Codex 每个请求必带 installation-id，探测不得缺失")
+*/
 	require.NotContains(t, upstream.lastReq.Header.Get("session-id"), "probe_compact",
 		"probe identity must not be a recognizable literal")
 	<-updateCalls

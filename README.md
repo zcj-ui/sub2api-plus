@@ -60,6 +60,8 @@ pnpm install --frozen-lockfile
 pnpm build
 
 cd ../backend
+VERSION="$(./scripts/resolve-version.sh)"
+go build -tags embed -ldflags="-X main.Version=${VERSION}" -o sub2api ./cmd/server
 go run ./cmd/server
 ```
 
@@ -120,6 +122,14 @@ Examples, Compose files, release archives, and `latest` images are evaluation ma
 ## License and Attribution
 
 Sub2API Plus is distributed under [GNU LGPL v3.0 or later](LICENSE).
+
+<a href="https://star-history.dera.page/#Wei-Shaw/sub2api&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=Wei-Shaw/sub2api&type=Date" />
+ </picture>
+</a>
 
 - Upstream: [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
 - Current distribution: [zcj-ui/sub2api-plus](https://github.com/zcj-ui/sub2api-plus)

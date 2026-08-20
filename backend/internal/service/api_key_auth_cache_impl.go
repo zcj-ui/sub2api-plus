@@ -14,7 +14,7 @@ import (
 	"github.com/dgraph-io/ristretto"
 )
 
-const apiKeyAuthSnapshotVersion = 20 // v20: preserve long-context and per-model pricing fields
+const apiKeyAuthSnapshotVersion = 20 // v20: group long-context and model pricing fields (force refresh of pre-fix snapshots)
 
 type apiKeyAuthCacheConfig struct {
 	l1Size        int
@@ -406,6 +406,8 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			AudioRealtimePricePerMin:        apiKey.Group.AudioRealtimePricePerMin,
 			AudioTTSPricePerMillionChars:    apiKey.Group.AudioTTSPricePerMillionChars,
 			AudioSTTPricePerHour:            apiKey.Group.AudioSTTPricePerHour,
+			LongContextPricingEnabled:       apiKey.Group.LongContextPricingEnabled,
+			ModelPricing:                    apiKey.Group.ModelPricing,
 			ClaudeCodeOnly:                  apiKey.Group.ClaudeCodeOnly,
 			FallbackGroupID:                 apiKey.Group.FallbackGroupID,
 			FallbackGroupIDOnInvalidRequest: apiKey.Group.FallbackGroupIDOnInvalidRequest,
@@ -428,8 +430,6 @@ func (s *APIKeyService) snapshotFromAPIKey(ctx context.Context, apiKey *APIKey) 
 			ProfitControlEnabled:            apiKey.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 apiKey.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              apiKey.Group.ProfitSafetyBuffer,
-			LongContextPricingEnabled:       apiKey.Group.LongContextPricingEnabled,
-			ModelPricing:                    apiKey.Group.ModelPricing,
 		}
 	}
 	return snapshot
@@ -503,6 +503,8 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			AudioRealtimePricePerMin:        snapshot.Group.AudioRealtimePricePerMin,
 			AudioTTSPricePerMillionChars:    snapshot.Group.AudioTTSPricePerMillionChars,
 			AudioSTTPricePerHour:            snapshot.Group.AudioSTTPricePerHour,
+			LongContextPricingEnabled:       snapshot.Group.LongContextPricingEnabled,
+			ModelPricing:                    snapshot.Group.ModelPricing,
 			ClaudeCodeOnly:                  snapshot.Group.ClaudeCodeOnly,
 			FallbackGroupID:                 snapshot.Group.FallbackGroupID,
 			FallbackGroupIDOnInvalidRequest: snapshot.Group.FallbackGroupIDOnInvalidRequest,
@@ -525,8 +527,6 @@ func (s *APIKeyService) snapshotToAPIKey(key string, snapshot *APIKeyAuthSnapsho
 			ProfitControlEnabled:            snapshot.Group.ProfitControlEnabled,
 			ProfitMinMargin:                 snapshot.Group.ProfitMinMargin,
 			ProfitSafetyBuffer:              snapshot.Group.ProfitSafetyBuffer,
-			LongContextPricingEnabled:       snapshot.Group.LongContextPricingEnabled,
-			ModelPricing:                    snapshot.Group.ModelPricing,
 		}
 	}
 	s.compileAPIKeyIPRules(apiKey)

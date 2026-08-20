@@ -33,15 +33,19 @@ func (s *updateServiceCacheStub) SetUpdateInfo(_ context.Context, data string, _
 
 type updateServiceGitHubClientStub struct {
 	release        *GitHubRelease
+	latestErr      error
 	recentReleases []*GitHubRelease
 	recentErr      error
 	latestRepo     string
 	recentRepo     string
+	downloadErr    error
+	checksumData   []byte
+	checksumErr    error
 }
 
 func (s *updateServiceGitHubClientStub) FetchLatestRelease(_ context.Context, repo string) (*GitHubRelease, error) {
 	s.latestRepo = repo
-	return s.release, nil
+	return s.release, s.latestErr
 }
 
 func (s *updateServiceGitHubClientStub) FetchRecentReleases(_ context.Context, repo string, _ int) ([]*GitHubRelease, error) {
@@ -50,15 +54,31 @@ func (s *updateServiceGitHubClientStub) FetchRecentReleases(_ context.Context, r
 }
 
 func (s *updateServiceGitHubClientStub) DownloadFile(context.Context, string, string, int64) error {
+	if s.downloadErr != nil {
+		return s.downloadErr
+	}
 	panic("DownloadFile should not be called when no update is available")
 }
 
 func (s *updateServiceGitHubClientStub) FetchChecksumFile(context.Context, string) ([]byte, error) {
+	if s.checksumErr != nil {
+		return nil, s.checksumErr
+	}
+	if s.checksumData != nil {
+		return s.checksumData, nil
+	}
 	panic("FetchChecksumFile should not be called when no update is available")
 }
 
+func forceLinuxBinaryUpdateRuntime(svc *UpdateService) *UpdateService {
+	svc.runtimeInfo = func() updateRuntimeInfo {
+		return updateRuntimeInfo{goos: "linux"}
+	}
+	return svc
+}
+
 func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
-	svc := NewUpdateService(
+	svc := forceLinuxBinaryUpdateRuntime(NewUpdateService(
 		&updateServiceCacheStub{},
 		&updateServiceGitHubClientStub{
 			release: &GitHubRelease{
@@ -69,7 +89,7 @@ func TestUpdateServicePerformUpdateNoUpdateReturnsSentinel(t *testing.T) {
 		"0.1.132",
 		"release",
 		"example/sub2api",
-	)
+	))
 
 	err := svc.PerformUpdate(context.Background())
 
@@ -84,19 +104,205 @@ func TestUpdateFilesystemPermissionErrorIsActionable(t *testing.T) {
 
 	require.Equal(t, http.StatusConflict, infraerrors.Code(err))
 	require.Equal(t, "UPDATE_DIRECTORY_NOT_WRITABLE", infraerrors.Reason(err))
-	require.Contains(t, infraerrors.Message(err), filepath.Clean(directory))
+	require.NotContains(t, infraerrors.Message(err), filepath.Clean(directory))
 	require.Contains(t, infraerrors.Message(err), "fix its ownership or permissions")
 	require.ErrorIs(t, err, os.ErrPermission)
 }
 
+func TestUpdateFilesystemFailureDoesNotExposeCause(t *testing.T) {
+	err := updateFilesystemError("failed to replace binary", "/srv/secret-deployment", errors.New("credential=hidden"))
+
+	require.Equal(t, http.StatusInternalServerError, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_FILESYSTEM_OPERATION_FAILED", infraerrors.Reason(err))
+	require.NotContains(t, infraerrors.Message(err), "secret-deployment")
+	require.NotContains(t, infraerrors.Message(err), "credential=hidden")
+}
+
+func TestUpdateServiceInPlaceCapabilityIsRuntimeIndependent(t *testing.T) {
+	tests := []struct {
+		name                string
+		runtime             updateRuntimeInfo
+		wantSupported       bool
+		wantRestrictionCode string
+	}{
+		{
+			name:          "linux binary",
+			runtime:       updateRuntimeInfo{goos: "linux"},
+			wantSupported: true,
+		},
+		{
+			name:                "linux container",
+			runtime:             updateRuntimeInfo{goos: "linux", containerized: true},
+			wantRestrictionCode: "UPDATE_IN_PLACE_UNSUPPORTED_CONTAINER",
+		},
+		{
+			name:                "windows binary",
+			runtime:             updateRuntimeInfo{goos: "windows"},
+			wantRestrictionCode: "UPDATE_IN_PLACE_UNSUPPORTED_PLATFORM",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := NewUpdateService(
+				&updateServiceCacheStub{},
+				&updateServiceGitHubClientStub{release: &GitHubRelease{TagName: "v0.1.133"}},
+				"0.1.132",
+				"release",
+				"example/sub2api",
+			)
+			svc.runtimeInfo = func() updateRuntimeInfo { return tt.runtime }
+
+			info, err := svc.CheckUpdate(context.Background(), true)
+
+			require.NoError(t, err)
+			require.Equal(t, tt.wantSupported, info.InPlaceUpdate.Supported)
+			require.Equal(t, tt.wantRestrictionCode, info.InPlaceUpdate.RestrictionReason)
+			if tt.wantSupported {
+				require.Empty(t, info.InPlaceUpdate.RestrictionMessage)
+			} else {
+				require.NotEmpty(t, info.InPlaceUpdate.RestrictionMessage)
+			}
+		})
+	}
+}
+
+func TestUpdateServiceRejectsUnsupportedInPlaceRuntimeBeforeIO(t *testing.T) {
+	tests := []struct {
+		name    string
+		runtime updateRuntimeInfo
+		wantErr error
+	}{
+		{
+			name:    "container",
+			runtime: updateRuntimeInfo{goos: "linux", containerized: true},
+			wantErr: ErrInPlaceUpdateUnsupportedContainer,
+		},
+		{
+			name:    "platform",
+			runtime: updateRuntimeInfo{goos: "darwin"},
+			wantErr: ErrInPlaceUpdateUnsupportedPlatform,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := NewUpdateService(
+				&updateServiceCacheStub{},
+				&updateServiceGitHubClientStub{},
+				"0.1.132",
+				"release",
+				"example/sub2api",
+			)
+			svc.runtimeInfo = func() updateRuntimeInfo { return tt.runtime }
+
+			for _, operation := range []struct {
+				name string
+				run  func() error
+			}{
+				{name: "update", run: func() error { return svc.PerformUpdate(context.Background()) }},
+				{name: "rollback", run: svc.Rollback},
+				{name: "versioned rollback", run: func() error { return svc.RollbackToVersion(context.Background(), "0.1.131") }},
+			} {
+				t.Run(operation.name, func(t *testing.T) {
+					err := operation.run()
+					require.ErrorIs(t, err, tt.wantErr)
+					require.Equal(t, http.StatusConflict, infraerrors.Code(err))
+					require.NotContains(t, infraerrors.Message(err), "example/sub2api")
+				})
+			}
+		})
+	}
+}
+
+func TestUpdateServiceAssetAndTransportFailuresAreStructured(t *testing.T) {
+	svc := forceLinuxBinaryUpdateRuntime(NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{},
+		"0.1.132",
+		"release",
+		"example/sub2api",
+	))
+
+	err := svc.applyReleaseAssets(context.Background(), nil)
+	require.ErrorIs(t, err, ErrUpdateAssetNotAvailable)
+	require.Equal(t, "UPDATE_ASSET_NOT_AVAILABLE", infraerrors.Reason(err))
+
+	err = svc.applyReleaseAssets(context.Background(), []Asset{{
+		Name:        "sub2api_" + svc.getArchiveName() + ".tar.gz",
+		DownloadURL: "http://untrusted.invalid/sub2api.tar.gz",
+	}})
+	require.ErrorIs(t, err, ErrUpdateAssetInvalid)
+	require.Equal(t, "UPDATE_ASSET_INVALID", infraerrors.Reason(err))
+
+	client := &updateServiceGitHubClientStub{downloadErr: errors.New("proxy-password=secret")}
+	svc.githubClient = client
+	err = svc.downloadFile(context.Background(), "https://github.com/example/asset", filepath.Join(t.TempDir(), "asset"))
+	require.ErrorIs(t, err, ErrUpdateDownloadFailed)
+	require.Equal(t, http.StatusServiceUnavailable, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_DOWNLOAD_FAILED", infraerrors.Reason(err))
+	require.NotContains(t, infraerrors.Message(err), "proxy-password")
+}
+
+func TestUpdateServiceChecksumAndArchiveFailuresAreStructured(t *testing.T) {
+	dir := t.TempDir()
+	assetPath := filepath.Join(dir, "sub2api_linux_amd64.tar.gz")
+	require.NoError(t, os.WriteFile(assetPath, []byte("not-an-archive"), 0600))
+
+	svc := forceLinuxBinaryUpdateRuntime(NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{checksumErr: errors.New("proxy-token=secret")},
+		"0.1.132",
+		"release",
+		"example/sub2api",
+	))
+	err := svc.verifyChecksum(context.Background(), assetPath, "https://github.com/example/checksums.txt")
+	require.ErrorIs(t, err, ErrUpdateChecksumDownloadFailed)
+	require.Equal(t, http.StatusServiceUnavailable, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_CHECKSUM_DOWNLOAD_FAILED", infraerrors.Reason(err))
+	require.NotContains(t, infraerrors.Message(err), "proxy-token")
+
+	svc.githubClient = &updateServiceGitHubClientStub{
+		checksumData: []byte("0000000000000000000000000000000000000000000000000000000000000000  " + filepath.Base(assetPath) + "\n"),
+	}
+	err = svc.verifyChecksum(context.Background(), assetPath, "https://github.com/example/checksums.txt")
+	require.ErrorIs(t, err, ErrUpdateChecksumVerificationFailed)
+	require.Equal(t, http.StatusConflict, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_CHECKSUM_VERIFICATION_FAILED", infraerrors.Reason(err))
+
+	err = svc.extractBinary(assetPath, filepath.Join(dir, "sub2api"))
+	require.ErrorIs(t, err, ErrUpdateArchiveInvalid)
+	require.Equal(t, http.StatusConflict, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_ARCHIVE_INVALID", infraerrors.Reason(err))
+}
+
+func TestUpdateServiceCheckFailureKeepsWarningActionableAndSecretFree(t *testing.T) {
+	svc := forceLinuxBinaryUpdateRuntime(NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{latestErr: errors.New("proxy-password=secret")},
+		"0.1.132",
+		"release",
+		"example/sub2api",
+	))
+
+	info, err := svc.CheckUpdate(context.Background(), true)
+
+	require.NoError(t, err)
+	require.False(t, info.HasUpdate)
+	require.Equal(t, "0.1.132", info.CurrentVersion)
+	require.Equal(t, "0.1.132", info.LatestVersion)
+	require.Contains(t, info.Warning, "network or update-proxy")
+	require.NotContains(t, info.Warning, "proxy-password")
+}
+
 func newRollbackTestService(current string, releases []*GitHubRelease) *UpdateService {
-	return NewUpdateService(
+	return forceLinuxBinaryUpdateRuntime(NewUpdateService(
 		&updateServiceCacheStub{},
 		&updateServiceGitHubClientStub{recentReleases: releases},
 		current,
 		"release",
 		"example/sub2api",
-	)
+	))
 }
 
 func TestUpdateServiceListRollbackVersionsFiltersAndCaps(t *testing.T) {
@@ -163,8 +369,10 @@ func TestUpdateServiceListRollbackVersionsPropagatesFetchError(t *testing.T) {
 
 	_, err := svc.ListRollbackVersions(context.Background())
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "github unavailable")
+	require.ErrorIs(t, err, ErrUpdateReleaseLookupFailed)
+	require.Equal(t, http.StatusServiceUnavailable, infraerrors.Code(err))
+	require.Equal(t, "UPDATE_RELEASE_LOOKUP_FAILED", infraerrors.Reason(err))
+	require.NotContains(t, infraerrors.Message(err), "github unavailable")
 }
 
 func TestUpdateServiceRollbackToVersionRejectsDisallowedTargets(t *testing.T) {
@@ -205,7 +413,8 @@ func TestUpdateServiceRollbackToVersionAcceptsVPrefix(t *testing.T) {
 
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrRollbackVersionNotAllowed)
-	require.Contains(t, err.Error(), "no compatible release found")
+	require.ErrorIs(t, err, ErrUpdateAssetNotAvailable)
+	require.Equal(t, "UPDATE_ASSET_NOT_AVAILABLE", infraerrors.Reason(err))
 }
 
 func TestUpdateServiceUsesConfiguredRepository(t *testing.T) {

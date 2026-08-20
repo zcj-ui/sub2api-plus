@@ -59,33 +59,74 @@ func TestUpstreamModelMismatchThreeStateAndCaseInsensitiveComparison(t *testing.
 	require.True(t, *mismatched)
 }
 
-func TestUpstreamModelMismatchNormalizesMatchingGrokRuntimeAliases(t *testing.T) {
-	for _, tt := range []struct {
-		sent, response string
+func TestUpstreamModelMismatchTreatsGrokBuildRuntimeIDsAsAliases(t *testing.T) {
+	tests := []struct {
+		name          string
+		sentModel     string
+		responseModel string
 	}{
-		{sent: "grok-4.5", response: "grok-4.5-build"},
-		{sent: "grok-4.5-latest", response: "grok-4.5-build"},
-		{sent: "grok-4.6", response: "grok-4.6-build"},
-		{sent: "grok-4.6-latest", response: "grok-4.6-build"},
-	} {
-		t.Run(tt.sent+"/"+tt.response, func(t *testing.T) {
-			mismatch := upstreamModelMismatch(tt.sent, tt.response)
+		{
+			name:          "issue 5634 grok 4.6",
+			sentModel:     "grok-4.6",
+			responseModel: "grok-4.6-build",
+		},
+		{
+			name:          "grok 4.6 latest",
+			sentModel:     "grok-4.6-latest",
+			responseModel: "grok-4.6-build",
+		},
+		{
+			name:          "issue 5647 grok 4.5 latest",
+			sentModel:     "grok-4.5-latest",
+			responseModel: "grok-4.5-build",
+		},
+		{
+			name:          "grok 4.5 canonical",
+			sentModel:     "grok-4.5",
+			responseModel: "GROK-4.5-BUILD",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mismatch := upstreamModelMismatch(tt.sentModel, tt.responseModel)
 			require.NotNil(t, mismatch)
 			require.False(t, *mismatch)
 		})
 	}
 }
 
-func TestUpstreamModelMismatchDoesNotCrossGrokVersionsOrUnknownBuilds(t *testing.T) {
-	for _, tt := range []struct {
-		sent, response string
+func TestUpstreamModelMismatchDoesNotCollapseDifferentModels(t *testing.T) {
+	tests := []struct {
+		name          string
+		sentModel     string
+		responseModel string
 	}{
-		{sent: "grok-4.5", response: "grok-4.6-build"},
-		{sent: "grok-4.6", response: "grok-4.6-custom-build"},
-		{sent: "gpt-5.5", response: "grok-4.5-build"},
-	} {
-		t.Run(tt.sent+"/"+tt.response, func(t *testing.T) {
-			mismatch := upstreamModelMismatch(tt.sent, tt.response)
+		{
+			name:          "different grok versions",
+			sentModel:     "grok-4.5",
+			responseModel: "grok-4.6-build",
+		},
+		{
+			name:          "unrelated build suffix",
+			sentModel:     "gpt-5.5",
+			responseModel: "gpt-5.5-build",
+		},
+		{
+			name:          "different grok runtime",
+			sentModel:     "grok-build-0.1",
+			responseModel: "grok-4.5-build",
+		},
+		{
+			name:          "unknown grok build suffix",
+			sentModel:     "grok-4.6",
+			responseModel: "grok-4.6-custom-build",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mismatch := upstreamModelMismatch(tt.sentModel, tt.responseModel)
 			require.NotNil(t, mismatch)
 			require.True(t, *mismatch)
 		})

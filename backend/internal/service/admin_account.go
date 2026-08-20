@@ -378,9 +378,8 @@ func (s *adminServiceImpl) DuplicateAccount(ctx context.Context, id int64, actor
 	if err != nil {
 		return nil, fmt.Errorf("clone account extra configuration: %w", err)
 	}
-	// A duplicate is a new Codex installation. Never carry the source account's
-	// system-owned seed into the copied record; backup import is the separate
-	// path that intentionally preserves it.
+	// A duplicate is a new Codex installation and must never carry the source
+	// account's system-owned identity state into the copied record.
 	if source.IsOpenAIOAuth() {
 		delete(extra, codexFingerprintSeedExtraKey)
 		delete(extra, "openai_device_id")
@@ -553,6 +552,10 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	delete(accountExtra, OllamaCloudUsageSessionExtraKey)
 	delete(accountExtra, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(accountExtra, OllamaCloudUsageSnapshotExtraKey)
+	// The fingerprint seed is server-owned identity state. A create/import
+	// payload may select a convergence mode, but it must never choose the
+	// identity generated for the new account.
+	delete(accountExtra, codexFingerprintSeedExtraKey)
 	// Imports may carry records created before OAuth-only Codex identity state
 	// was scrubbed on a type transition.  An API-key/setup-token record has no
 	// valid use for this device/session identity, and retaining it would let a
@@ -715,6 +718,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if err != nil {
 		return nil, err
 	}
+	wasOpenAIOAuth := account.IsOpenAIOAuth()
 	explicitCodexFingerprintModeEdit := input != nil && input.CodexFingerprintModeTouched != nil && *input.CodexFingerprintModeTouched
 	if !explicitCodexFingerprintModeEdit && input != nil && input.CodexFingerprintModeTouched == nil && input.Extra != nil {
 		if value, present := input.Extra[codexFingerprintModeExtraKey]; present && value == nil {
@@ -800,6 +804,13 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	if input.Type != "" {
 		account.Type = input.Type
 	}
+	if !wasOpenAIOAuth && account.IsOpenAIOAuth() {
+		// A legacy non-OAuth record may carry stale identity fields. Becoming an
+		// OAuth account must mint a new server-owned seed rather than reviving
+		// any of that historical state.
+		account.Extra = stripCodexFingerprintAccountState(account.Extra)
+		delete(account.Extra, OpenAICodex429GuardEnabledExtraKey)
+	}
 	if input.Notes != nil {
 		account.Notes = normalizeAccountNotes(input.Notes)
 	}
@@ -883,6 +894,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		}
 		ComputeQuotaResetAt(account.Extra)
 		NormalizeFixedQuotaWindows(account.Extra)
+	}
+	if input.Extra == nil {
+		account.Extra = prepareCodexFingerprintExtraForUpdate(account, account.Extra)
 	}
 	if requestedRateSyncEnabledUpdate != nil && *requestedRateSyncEnabledUpdate {
 		if requestedProbeEnabledUpdate != nil && !*requestedProbeEnabledUpdate {
@@ -1101,13 +1115,9 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error {
 	codexFingerprintRequested := codexFingerprintExtraUpdateRequested(updates)
 	codexFingerprintValidation := updates
-	updates = RetireCodexFingerprintExtra(updates)
-	if _, requested := updates[codexFingerprintSeedExtraKey]; requested {
-		// The seed is account-owned state. Keep the stored value on a key-level
-		// edit; enabling a mode below atomically creates it only when absent.
-		updates = cloneCodexFingerprintExtra(updates)
-		delete(updates, codexFingerprintSeedExtraKey)
-	}
+	// A key-level edit must never replace the persisted account seed. The
+	// repository creates a missing seed atomically when an enabled mode is set.
+	updates = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(updates))
 	delete(updates, UpstreamBillingProbeEnabledExtraKey)
 	delete(updates, UpstreamBillingRateSyncEnabledExtraKey)
 	delete(updates, UpstreamBillingProbeExtraKey)
@@ -1173,14 +1183,10 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error) {
 	codexFingerprintRequested := codexFingerprintExtraUpdateRequested(input.Extra)
 	codexFingerprintValidation := input.Extra
-	input.Extra = RetireCodexFingerprintExtra(input.Extra)
-	if _, requested := input.Extra[codexFingerprintSeedExtraKey]; requested {
-		// Bulk edits keep each account's existing seed. The repository creates a
-		// missing seed per eligible row when an enabled mode is selected.
-		input.Extra = cloneCodexFingerprintExtra(input.Extra)
-		delete(input.Extra, codexFingerprintSeedExtraKey)
-	}
 	// Managed probe/session state may only enter through dedicated typed endpoints.
+	// Bulk edits keep each account's existing seed. The repository creates a
+	// missing seed per eligible row when an enabled mode is selected.
+	input.Extra = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(input.Extra))
 	delete(input.Extra, UpstreamBillingProbeEnabledExtraKey)
 	delete(input.Extra, UpstreamBillingRateSyncEnabledExtraKey)
 	delete(input.Extra, UpstreamBillingProbeExtraKey)
@@ -1210,9 +1216,12 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 			return nil, err
 		}
 	}
+	openAISettings, err := normalizeBulkOpenAISettings(input)
+	if err != nil {
+		return nil, err
+	}
 
 	needMixedChannelCheck := input.GroupIDs != nil && !input.SkipMixedChannelCheck
-	_, hasLongContextBillingUpdate := input.Extra[openAILongContextBillingEnabledKey]
 	extraWSSettingChanged := openAIExtraRequiresWSInvalidation(input.Extra)
 	overagesEnabled, hasOveragesUpdate := input.Extra["allow_overages"].(bool)
 	if _, present := input.Extra["allow_overages"]; present && !hasOveragesUpdate {
@@ -1224,7 +1233,7 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 
 	// 预取所有目标账号，供凭据守卫/代理守卫/混合渠道检查共用，避免多次 DB 查询。
 	var cachedTargets []*Account
-	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || hasLongContextBillingUpdate || extraWSSettingChanged || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil || codexFingerprintRequested {
+	if len(input.Credentials) > 0 || input.ProxyID != nil || needMixedChannelCheck || openAISettings.any() || extraWSSettingChanged || hasOveragesUpdate || input.ProbeEnabled != nil || input.RateMultiplier != nil || codexFingerprintRequested {
 		loaded, err := s.accountRepo.GetByIDs(ctx, input.AccountIDs)
 		if err != nil {
 			return nil, err
@@ -1236,6 +1245,13 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 		if account != nil {
 			targetsByID[account.ID] = account
 		}
+	}
+	if openAISettings.any() {
+		inheritedCount, err := validateBulkOpenAISettingsTargets(input, openAISettings, targetsByID)
+		if err != nil {
+			return nil, err
+		}
+		result.LongContextInheritedCount = inheritedCount
 	}
 	if hasOveragesUpdate {
 		for _, account := range cachedTargets {
@@ -1256,17 +1272,6 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 			if !isUpstreamBillingProbeAccount(account) {
 				return nil, ErrUpstreamBillingProbeAccountInvalid
 			}
-		}
-	}
-	if hasLongContextBillingUpdate {
-		for _, account := range cachedTargets {
-			if account == nil || account.Platform != PlatformOpenAI {
-				continue
-			}
-			if err := ValidateOpenAILongContextBillingExtra(account.Platform, input.Extra); err != nil {
-				return nil, err
-			}
-			break
 		}
 	}
 	if codexFingerprintRequested {
@@ -1962,11 +1967,10 @@ func (s *adminServiceImpl) EnsureOpenAIPrivacy(ctx context.Context, account *Acc
 		return ""
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+	if err != nil {
+		logger.LegacyPrintf("service.admin", "ensure_openai_privacy_proxy_unavailable: account_id=%d err=%v", account.ID, err)
+		return ""
 	}
 
 	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)
@@ -1996,11 +2000,10 @@ func (s *adminServiceImpl) ForceOpenAIPrivacy(ctx context.Context, account *Acco
 		return ""
 	}
 
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
-		}
+	proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+	if err != nil {
+		logger.LegacyPrintf("service.admin", "force_openai_privacy_proxy_unavailable: account_id=%d err=%v", account.ID, err)
+		return ""
 	}
 
 	mode := disableOpenAITraining(ctx, s.privacyClientFactory, token, proxyURL)

@@ -8,10 +8,10 @@ const CodexFingerprintRecoveryRequiredExtraKey = "codex_fingerprint_recovery_req
 
 // NormalizeCodexFingerprintExtraForAccount prepares account extra before a
 // create or repository-level full write. Fingerprint convergence remains an
-// explicit OpenAI OAuth opt-in; an enabled mode receives a stable seed when a
-// backup/import did not already supply one.
+// explicit OpenAI OAuth opt-in; an enabled mode receives a fresh, server-owned
+// seed. External create and import payloads never choose an account identity.
 func NormalizeCodexFingerprintExtraForAccount(platform, accountType string, extra map[string]any) map[string]any {
-	prepared := RetireCodexFingerprintExtra(extra)
+	prepared := stripCodexFingerprintSeed(RetireCodexFingerprintExtra(extra))
 	if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
 		return stripCodexFingerprintAccountState(prepared)
 	}
@@ -23,10 +23,12 @@ func NormalizeCodexFingerprintExtraForAccount(platform, accountType string, extr
 // otherwise an enabled mode receives one exactly once.
 func NormalizeCodexFingerprintExtraForExistingAccount(account *Account, extra map[string]any) map[string]any {
 	if account == nil {
-		return RetireCodexFingerprintExtra(extra)
+		return stripCodexFingerprintSeed(RetireCodexFingerprintExtra(extra))
 	}
 
-	prepared := RetireCodexFingerprintExtra(extra)
+	// A full edit may include a stale or user-supplied seed. It is never an
+	// instruction to rotate or initialize an existing account identity.
+	prepared := stripCodexFingerprintSeed(RetireCodexFingerprintExtra(extra))
 	if !account.IsOpenAIOAuth() || account.IsCredentialShadow() {
 		return stripCodexFingerprintAccountState(prepared)
 	}
@@ -42,6 +44,23 @@ func NormalizeCodexFingerprintExtraForExistingAccount(account *Account, extra ma
 }
 
 func codexFingerprintExtraUpdateRequested(extra map[string]any) bool {
+	if extra == nil {
+		return false
+	}
+	for _, key := range []string{
+		codexFingerprintModeExtraKey,
+		CodexFingerprintRecoveryRequiredExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+	} {
+		if _, ok := extra[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func codexFingerprintAccountStatePresent(extra map[string]any) bool {
 	if extra == nil {
 		return false
 	}
@@ -87,7 +106,7 @@ func stripCodexFingerprintAccountState(extra map[string]any) map[string]any {
 	if extra == nil {
 		return nil
 	}
-	if !codexFingerprintExtraUpdateRequested(extra) {
+	if !codexFingerprintAccountStatePresent(extra) {
 		return extra
 	}
 	stripped := cloneCodexFingerprintExtra(extra)

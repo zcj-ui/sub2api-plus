@@ -6,7 +6,28 @@ import (
 	"os"
 	"runtime"
 	"time"
+
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 )
+
+var ErrRestartUnsupportedPlatform = infraerrors.Conflict(
+	"SYSTEM_RESTART_UNSUPPORTED_PLATFORM",
+	"restart through the API is supported only on Linux; restart this deployment using its normal procedure",
+)
+
+// RestartServiceSupported reports whether this process can use the API restart
+// mechanism. The mechanism exits the process and relies on a Linux service
+// manager to start it again, so non-Linux platforms must not report success.
+func RestartServiceSupported() error {
+	return restartServiceSupportError(runtime.GOOS)
+}
+
+func restartServiceSupportError(goos string) error {
+	if goos != "linux" {
+		return infraerrors.Clone(ErrRestartUnsupportedPlatform)
+	}
+	return nil
+}
 
 // RestartService triggers a service restart by gracefully exiting.
 //
@@ -21,9 +42,8 @@ import (
 //   - Linux OS with systemd
 //   - Service configured with Restart=always in systemd unit file
 func RestartService() error {
-	if runtime.GOOS != "linux" {
-		log.Println("Service restart via exit only works on Linux with systemd")
-		return nil
+	if err := RestartServiceSupported(); err != nil {
+		return err
 	}
 
 	log.Println("Initiating service restart by graceful exit...")

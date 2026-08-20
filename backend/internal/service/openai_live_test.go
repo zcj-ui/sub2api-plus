@@ -142,6 +142,69 @@ func TestCreateUpstreamLiveCallPreservesSession(t *testing.T) {
 	require.True(t, HTTPUpstreamRedirectsDisabled(upstream.request.Context()))
 }
 
+func TestCreateUpstreamLiveCallFailsClosedWhenConfiguredProxyIsUnavailable(t *testing.T) {
+	proxyID := int64(701)
+	upstream := &liveHTTPUpstreamStub{}
+	service := &OpenAIGatewayService{
+		cfg:          &config.Config{},
+		httpUpstream: upstream,
+	}
+	account := &Account{
+		ID:          701,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Credentials: map[string]any{
+			"access_token":       "test-access-token",
+			"chatgpt_account_id": "acct_test",
+		},
+	}
+
+	created, err := service.createUpstreamLiveCall(context.Background(), account, &LiveCallRequest{
+		SDP:     "v=offer\\r\\n",
+		Session: json.RawMessage(`{"model":"gpt-live-test"}`),
+	}, `{"v":1,"s":0,"t":"v1.test"}`)
+
+	require.Error(t, err)
+	require.Nil(t, created)
+	require.Nil(t, upstream.request, "configured proxy without a relation must not send a live create request directly")
+}
+
+func TestDialLiveSidebandFailsClosedWhenConfiguredProxyIsUnavailable(t *testing.T) {
+	proxyID := int64(702)
+	account := &Account{
+		ID:          702,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Credentials: map[string]any{
+			"access_token":       "test-access-token",
+			"chatgpt_account_id": "acct_test",
+		},
+	}
+	attestationCipher := newLiveAttestationCipher(&config.Config{JWT: config.JWTConfig{Secret: "live-proxy-fail-closed-test"}})
+	ciphertext, err := attestationCipher.Encrypt(`{"v":1,"s":0,"t":"v1.sideband"}`)
+	require.NoError(t, err)
+	dialer := &liveTestDialer{conn: newLiveTestFrameConn()}
+	service := &OpenAIGatewayService{
+		accountRepo:               &liveTestAccountRepo{account: account},
+		openaiWSPassthroughDialer: dialer,
+		liveAttestationCipher:     attestationCipher,
+	}
+
+	conn, err := service.dialLiveSideband(context.Background(), &LiveCallRecord{
+		AccountID:             account.ID,
+		CallID:                "call_proxy",
+		AttestationCiphertext: ciphertext,
+	})
+
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.Empty(t, dialer.url, "configured proxy without a relation must not dial the live sideband directly")
+}
+
 func TestLiveAttestationCipherRoundTripAndRejectsOtherInstanceKey(t *testing.T) {
 	first := newLiveAttestationCipher(&config.Config{
 		JWT: config.JWTConfig{Secret: "first-live-secret"},

@@ -471,14 +471,8 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	if metadata := strings.TrimSpace(turnMetadata); metadata != "" && strings.TrimSpace(headers.Get(openAIWSTurnMetadataHeader)) == "" {
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
-	// 真实 Codex 的 WS 握手同样携带会话级 x-codex-beta-features
-	// （client.rs build_websocket_headers 复用 build_responses_headers），
-	// 客户端未声明时补成默认形态，与 HTTP 出站保持一致。放在客户端头拷贝
-	// 之外：该头是账号/会话级属性，不依赖入站请求是否存在，也避免预热与
-	// 实际请求因头差异落进不同的连接池兼容分桶。
-	// Preserve only client-supplied beta feature declarations on WebSocket
-	// handshakes; v2 OpenAI-Beta is normalized at the final protocol boundary.
-	// OAuth 账号：将 apiKeyID 混入 session 标识符，防止跨用户会话碰撞。
+	// Preserve only client-supplied beta declarations here; v2 normalizes its
+	// protocol beta at the final boundary below.
 	if account != nil && account.Type == AccountTypeOAuth {
 		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, headers, account); err != nil {
 			return nil, sessionResolution, fmt.Errorf("resolve chatgpt account headers: %w", err)
@@ -499,10 +493,7 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 		applyStagedCodexFingerprintHeaders(c, account, headers)
 	}
 
-	// 终态收口：WS 握手与 HTTP 出站共用同一套身份语义，账号级自定义 UA 同样作为
-	// 管理员显式配置传入（上面写进 headers 的值只在强制统一被关闭时才参与配对）。
-	// 账号级请求头覆写（仅 openai api_key 账号启用时生效；OAuth 路径 no-op）。
-	// 覆盖所有 WS 模式（ctx_pool/dedicated/passthrough）的握手头。
+	// Normalize the protocol beta value after account-specific identity work.
 	betaValue := openAIWSBetaV2Value
 	if decision.Transport == OpenAIUpstreamTransportResponsesWebsocket {
 		betaValue = openAIWSBetaV1Value
@@ -1146,6 +1137,33 @@ func setOpenAIWSPayloadInputSequence(
 		return nil, marshalErr
 	}
 	return sjson.SetRawBytes(payload, "input", inputRaw)
+}
+
+func buildOpenAIWSCurrentTurnRetryPayload(
+	payload []byte,
+	fullInput []json.RawMessage,
+	fullInputExists bool,
+	originalModel string,
+) ([]byte, bool, error) {
+	if !fullInputExists {
+		return nil, false, nil
+	}
+	retryPayload, err := setOpenAIWSPayloadInputSequence(payload, fullInput, true)
+	if err != nil {
+		return nil, false, err
+	}
+	retryPayload = RemovePreviousResponseIDFromBody(retryPayload)
+	if model := strings.TrimSpace(originalModel); model != "" {
+		retryPayload, err = sjson.SetBytes(retryPayload, "model", model)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	coverage := AnalyzeToolCallOutputContextCoverageBytes(retryPayload)
+	if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+		return nil, false, nil
+	}
+	return retryPayload, true, nil
 }
 
 func shouldKeepIngressPreviousResponseID(

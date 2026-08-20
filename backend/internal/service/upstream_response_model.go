@@ -171,14 +171,13 @@ func upstreamModelMismatch(sentModel, responseModel string) *bool {
 	return &mismatch
 }
 
-// upstreamModelsMatchForAudit tolerates provider runtime aliases while keeping
-// the observed response model unchanged for billing and diagnostics. xAI
-// returns a build identifier for the public Grok aliases, so literal
-// comparison would incorrectly flag successful requests as mismatches.
 func upstreamModelsMatchForAudit(sentModel, responseModel string) bool {
 	if strings.EqualFold(sentModel, responseModel) {
 		return true
 	}
+	// xAI reports the runtime build ID for these supported public aliases.
+	// Canonicalize only for mismatch auditing; keep the raw response model for
+	// observability and for the separate response-model billing safeguards.
 	sentGrokModel := canonicalGrokBuildRuntimeModel(sentModel)
 	return sentGrokModel != "" && sentGrokModel == canonicalGrokBuildRuntimeModel(responseModel)
 }

@@ -646,21 +646,21 @@ func TestResolveOpenAIMessagesDispatchMappedModel(t *testing.T) {
 				},
 			},
 		}
-		require.Equal(t, "gpt-5.4-mini", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-sonnet-4-5-20250929"))
-		require.Equal(t, "gpt-5.6-sol", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-fable-5"))
+		require.Equal(t, "gpt-5.4-mini", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-sonnet-4-5-20250929"))
+		require.Equal(t, "gpt-5.6-sol", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-fable-5"))
 	})
 
 	t.Run("uses_family_default_when_no_override", func(t *testing.T) {
 		apiKey := &service.APIKey{Group: &service.Group{}}
-		require.Equal(t, "gpt-5.4", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-opus-4-6"))
-		require.Equal(t, "gpt-5.3-codex", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-sonnet-4-5-20250929"))
-		require.Equal(t, "gpt-5.4-mini", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-haiku-4-5-20251001"))
+		require.Equal(t, "gpt-5.4", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-opus-4-6"))
+		require.Equal(t, "gpt-5.3-codex", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-sonnet-4-5-20250929"))
+		require.Equal(t, "gpt-5.4-mini", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-haiku-4-5-20251001"))
 	})
 
 	t.Run("returns_empty_for_non_claude_or_missing_group", func(t *testing.T) {
-		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, "claude-sonnet-4-5-20250929"))
-		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(&service.APIKey{}, "claude-sonnet-4-5-20250929"))
-		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(&service.APIKey{Group: &service.Group{}}, "gpt-5.4"))
+		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, nil, "claude-sonnet-4-5-20250929"))
+		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, &service.APIKey{}, "claude-sonnet-4-5-20250929"))
+		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, &service.APIKey{Group: &service.Group{}}, "gpt-5.4"))
 	})
 
 	t.Run("grok_group_maps_claude_cli_model_to_grok_default", func(t *testing.T) {
@@ -672,8 +672,8 @@ func TestResolveOpenAIMessagesDispatchMappedModel(t *testing.T) {
 				Platform: service.PlatformGrok,
 			},
 		}
-		require.Equal(t, "grok-4.5", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-sonnet-4-5"))
-		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(apiKey, "grok"))
+		require.Equal(t, "grok-4.5", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-sonnet-4-5"))
+		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "grok"))
 	})
 
 	t.Run("does_not_fall_back_to_group_default_mapped_model", func(t *testing.T) {
@@ -682,8 +682,8 @@ func TestResolveOpenAIMessagesDispatchMappedModel(t *testing.T) {
 				DefaultMappedModel: "gpt-5.4",
 			},
 		}
-		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(apiKey, "gpt-5.4"))
-		require.Equal(t, "gpt-5.3-codex", resolveOpenAIMessagesDispatchMappedModel(apiKey, "claude-sonnet-4-5-20250929"))
+		require.Empty(t, resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "gpt-5.4"))
+		require.Equal(t, "gpt-5.3-codex", resolveOpenAIMessagesDispatchMappedModel(nil, apiKey, "claude-sonnet-4-5-20250929"))
 	})
 }
 
@@ -1943,6 +1943,75 @@ type openAIHTTPPassthroughSSERateLimitUpstream struct {
 	accountIDs []int64
 }
 
+type openAIWSCurrentTurnModelSwitchUpstream struct {
+	service.HTTPUpstream
+	mu                   sync.Mutex
+	firstAccountID       int64
+	replacementAccountID int64
+	accountIDs           []int64
+	bodies               [][]byte
+	firstAccountCalls    int
+}
+
+func (u *openAIWSCurrentTurnModelSwitchUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
+	var payload []byte
+	if req != nil && req.Body != nil {
+		payload, _ = io.ReadAll(req.Body)
+		_ = req.Body.Close()
+	}
+
+	u.mu.Lock()
+	u.accountIDs = append(u.accountIDs, accountID)
+	u.bodies = append(u.bodies, append([]byte(nil), payload...))
+	if accountID == u.firstAccountID {
+		u.firstAccountCalls++
+	}
+	firstAccountCalls := u.firstAccountCalls
+	u.mu.Unlock()
+
+	if accountID == u.firstAccountID && firstAccountCalls == 1 {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"model\":\"gpt-first\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first-ok\"}]},{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"inspect\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+			)),
+		}, nil
+	}
+	if accountID == u.firstAccountID && firstAccountCalls == 2 {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"60"}},
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)),
+		}, nil
+	}
+	if accountID == u.replacementAccountID {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"model\":\"gpt-second\",\"output\":[{\"id\":\"msg_2\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second-ok\"}]}],\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n",
+			)),
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"unexpected test account"}}`)),
+	}, nil
+}
+
+func (u *openAIWSCurrentTurnModelSwitchUpstream) snapshot() ([]int64, [][]byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	accountIDs := append([]int64(nil), u.accountIDs...)
+	bodies := make([][]byte, len(u.bodies))
+	for i := range u.bodies {
+		bodies[i] = append([]byte(nil), u.bodies[i]...)
+	}
+	return accountIDs, bodies
+}
+
 func (u *openAIHTTPPassthroughSSERateLimitUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
 	u.mu.Lock()
 	u.accountIDs = append(u.accountIDs, accountID)
@@ -2551,6 +2620,178 @@ func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T
 	// API-key accounts and semantic-only WebSocket rate-limit events must still
 	// fail over, but they must not enter the OAuth-only account 429 state.
 	require.Empty(t, accountRepo.rateLimitedIDs)
+}
+
+func TestOpenAIResponsesWebSocket_CurrentTurnRetryUsesReplayModelForReplacementScheduling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		firstAccountID       = int64(9918)
+		replacementAccountID = int64(9919)
+	)
+	upstream := &openAIWSCurrentTurnModelSwitchUpstream{
+		firstAccountID:       firstAccountID,
+		replacementAccountID: replacementAccountID,
+	}
+
+	groupID := int64(4208)
+	accounts := []service.Account{
+		{
+			ID:          firstAccountID,
+			Name:        "openai-ws-model-switch-primary",
+			Platform:    service.PlatformOpenAI,
+			Type:        service.AccountTypeAPIKey,
+			Status:      service.StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    1,
+			Credentials: map[string]any{
+				"api_key":  "sk-primary",
+				"base_url": "https://upstream.example",
+				"model_mapping": map[string]string{
+					"gpt-first":  "gpt-first",
+					"gpt-second": "gpt-second",
+				},
+			},
+			Extra: map[string]any{
+				"openai_apikey_responses_websockets_v2_enabled": true,
+				"openai_apikey_responses_websockets_v2_mode":    service.OpenAIWSIngressModeHTTPBridge,
+			},
+		},
+		{
+			ID:          replacementAccountID,
+			Name:        "openai-ws-model-switch-replacement",
+			Platform:    service.PlatformOpenAI,
+			Type:        service.AccountTypeAPIKey,
+			Status:      service.StatusActive,
+			Schedulable: true,
+			Concurrency: 1,
+			Priority:    2,
+			Credentials: map[string]any{
+				"api_key":  "sk-replacement",
+				"base_url": "https://upstream.example",
+				"model_mapping": map[string]string{
+					"gpt-second": "gpt-second",
+				},
+			},
+			Extra: map[string]any{
+				"openai_apikey_responses_websockets_v2_enabled": true,
+				"openai_apikey_responses_websockets_v2_mode":    service.OpenAIWSIngressModeHTTPBridge,
+			},
+		},
+	}
+
+	cfg := &config.Config{}
+	cfg.RunMode = config.RunModeSimple
+	cfg.Default.RateMultiplier = 1
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.ModeRouterV2Enabled = true
+	cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = true
+	cfg.Gateway.OpenAIWS.DialTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
+	cfg.Gateway.MaxAccountSwitches = 3
+
+	accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
+	rateLimitSvc := service.NewRateLimitService(accountRepo, nil, cfg, nil, nil)
+	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+	defer billingCacheSvc.Stop()
+	gatewaySvc := service.NewOpenAIGatewayService(
+		accountRepo,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		cfg,
+		nil,
+		nil,
+		service.NewBillingService(cfg, nil),
+		rateLimitSvc,
+		billingCacheSvc,
+		upstream,
+		&service.DeferredService{},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	cache := &concurrencyCacheMock{
+		acquireUserSlotFn:    func(context.Context, int64, int, string) (bool, error) { return true, nil },
+		acquireAccountSlotFn: func(context.Context, int64, int, string) (bool, error) { return true, nil },
+	}
+	h := &OpenAIGatewayHandler{
+		gatewayService:      gatewaySvc,
+		billingCacheService: billingCacheSvc,
+		apiKeyService:       &service.APIKeyService{},
+		concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(cache), SSEPingFormatNone, time.Second),
+		maxAccountSwitches:  3,
+	}
+
+	apiKey := &service.APIKey{
+		ID:      1808,
+		GroupID: &groupID,
+		User:    &service.User{ID: 1708, Status: service.StatusActive},
+		Group:   &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
+		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		c.Next()
+	})
+	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
+	handlerServer := httptest.NewServer(router)
+	defer handlerServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(
+		dialCtx,
+		"ws"+strings.TrimPrefix(handlerServer.URL, "http")+"/openai/v1/responses",
+		&coderws.DialOptions{CompressionMode: coderws.CompressionContextTakeover},
+	)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-first","input":[{"type":"message","role":"user","content":"first"}]}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 5*time.Second)
+	_, firstCompleted, err := clientConn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	require.Equal(t, "resp_first", gjson.GetBytes(firstCompleted, "response.id").String())
+
+	writeCtx, cancelWrite = context.WithTimeout(context.Background(), 3*time.Second)
+	err = clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-second","previous_response_id":"resp_first","input":[{"type":"function_call_output","call_id":"call_1","output":"second"}]}`))
+	cancelWrite()
+	require.NoError(t, err)
+
+	readCtx, cancelRead = context.WithTimeout(context.Background(), 5*time.Second)
+	_, secondCompleted, err := clientConn.Read(readCtx)
+	cancelRead()
+	require.NoError(t, err)
+	require.Equal(t, "resp_second", gjson.GetBytes(secondCompleted, "response.id").String())
+
+	accountIDs, bodies := upstream.snapshot()
+	require.Equal(t, []int64{firstAccountID, firstAccountID, replacementAccountID}, accountIDs)
+	require.Len(t, bodies, 3)
+	require.Equal(t, "gpt-second", gjson.GetBytes(bodies[2], "model").String())
+	require.False(t, gjson.GetBytes(bodies[2], "previous_response_id").Exists())
+	require.Contains(t, gjson.GetBytes(bodies[2], "input").Raw, "first")
+	require.Contains(t, gjson.GetBytes(bodies[2], "input").Raw, "second")
 }
 
 func TestOpenAIResponsesWebSocket_FirstOutputTimeoutWithoutDownstreamReusesClientForOneFailover(t *testing.T) {

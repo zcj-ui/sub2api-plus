@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { useAppStore } from '@/stores/app'
 import { getPublicSettings } from '@/api/auth'
+import { checkUpdates, type VersionInfo } from '@/api/admin/system'
 import type { PublicSettings } from '@/types'
 
 function createDeferred<T>() {
@@ -63,6 +64,18 @@ function createPublicSettings(overrides: Partial<PublicSettings> = {}): PublicSe
   }
 }
 
+function createVersionInfo(overrides: Partial<VersionInfo> = {}): VersionInfo {
+  return {
+    current_version: '0.2.5',
+    latest_version: '0.2.6',
+    has_update: true,
+    cached: false,
+    build_type: 'release',
+    update_repo: 'owner/sub2api-fork',
+    ...overrides,
+  }
+}
+
 // Mock API 模块
 vi.mock('@/api/admin/system', () => ({
   checkUpdates: vi.fn(),
@@ -78,6 +91,7 @@ describe('useAppStore', () => {
     vi.useFakeTimers()
     localStorage.clear()
     vi.mocked(getPublicSettings).mockReset()
+    vi.mocked(checkUpdates).mockReset()
     // 清除 window.__APP_CONFIG__
     delete (window as any).__APP_CONFIG__
   })
@@ -473,6 +487,88 @@ describe('useAppStore', () => {
       expect((window as any).__APP_CONFIG__.table_page_size_options).toEqual([20, 100, 1000])
       expect(localStorage.getItem('table-page-size')).toBeNull()
       expect(localStorage.getItem('table-page-size-source')).toBeNull()
+    })
+  })
+
+  describe('Version management', () => {
+    it('keeps backend warning, cache status, repository, and update capability', async () => {
+      vi.mocked(checkUpdates).mockResolvedValue(
+        createVersionInfo({
+          cached: true,
+          warning: 'Using cached data: upstream unavailable',
+          in_place_update: {
+            supported: false,
+            restriction_message: 'Current platform cannot replace the running binary.'
+          }
+        })
+      )
+      const store = useAppStore()
+
+      const result = await store.fetchVersion()
+
+      expect(result?.warning).toBe('Using cached data: upstream unavailable')
+      expect(store.versionWarning).toBe('Using cached data: upstream unavailable')
+      expect(store.versionCached).toBe(true)
+      expect(store.updateRepo).toBe('owner/sub2api-fork')
+      expect(store.inPlaceUpdate).toEqual({
+        supported: false,
+        restriction_message: 'Current platform cannot replace the running binary.'
+      })
+
+      const cached = await store.fetchVersion()
+      expect(cached).toMatchObject({
+        cached: true,
+        warning: 'Using cached data: upstream unavailable',
+        update_repo: 'owner/sub2api-fork',
+        in_place_update: { supported: false }
+      })
+      expect(checkUpdates).toHaveBeenCalledTimes(1)
+    })
+
+    it('preserves the last version result and marks a failed refresh as uncertain', async () => {
+      vi.mocked(checkUpdates)
+        .mockResolvedValueOnce(
+          createVersionInfo({
+            current_version: '0.2.5',
+            latest_version: '0.2.6',
+            has_update: true,
+            warning: 'Cached warning'
+          })
+        )
+        .mockRejectedValueOnce(new Error('network unavailable'))
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const store = useAppStore()
+
+      await store.fetchVersion()
+      await expect(store.fetchVersion(true)).resolves.toBeNull()
+
+      expect(store.currentVersion).toBe('0.2.5')
+      expect(store.latestVersion).toBe('0.2.6')
+      expect(store.hasUpdate).toBe(true)
+      expect(store.versionWarning).toBe('Cached warning')
+      expect(store.versionCheckError).toBe('network unavailable')
+      expect(store.versionLoaded).toBe(true)
+      consoleError.mockRestore()
+    })
+
+    it('clears update cache metadata after a completed update', async () => {
+      vi.mocked(checkUpdates).mockResolvedValue(
+        createVersionInfo({
+          cached: true,
+          warning: 'Cached warning',
+          in_place_update: { supported: true }
+        })
+      )
+      const store = useAppStore()
+      await store.fetchVersion()
+
+      store.clearVersionCache()
+
+      expect(store.versionLoaded).toBe(false)
+      expect(store.versionWarning).toBe('')
+      expect(store.versionCached).toBe(false)
+      expect(store.versionCheckError).toBe('')
+      expect(store.inPlaceUpdate).toBeNull()
     })
   })
 })

@@ -79,7 +79,7 @@ git push origin v0.2.0
 SUB2API_UPDATE_REPO=zcj-ui/sub2api-plus ./sub2api
 ```
 
-开发编译版和正式版都属于可更新二进制；源码直接运行版显示源码更新提示。
+开发编译版和正式版都会显示更新信息，但面板原地更新及回滚只支持 Linux 非容器二进制服务。Docker 镜像必须通过 `docker compose pull` 与 `docker compose up -d` 更新；Windows、macOS 和源码运行版请使用相应发布包或部署工具。界面会根据后端返回的部署能力禁用不适用的原地更新操作。
 
 ## 同步上游
 

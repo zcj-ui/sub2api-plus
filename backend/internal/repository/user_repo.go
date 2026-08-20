@@ -71,9 +71,10 @@ func (r *userRepository) create(ctx context.Context, userIn *service.User, guard
 	// 统一使用 ent 的事务：保证用户与允许分组的更新原子化，
 	// 并避免基于 *sql.Tx 手动构造 ent client 导致的 ExecQuerier 断言错误。
 	//
-	// ent 的 Client.Tx 不会从 context 自动复用已有事务。显式检查
-	// TxFromContext，确保注册流程的“建用户 + 占邀请码”共享同一事务；否则
-	// 用户写入会自行提交，外层事务回滚时留下可登录的孤儿账号。
+	// 注意：ent 的 Client.Tx 不感知上下文中的事务（只检查 driver 类型），
+	// 因此必须显式检查 TxFromContext：当调用方已开启外部事务（如注册时的
+	// “建用户 + 占用邀请码”原子事务），直接复用其 client，由调用方统一提交/回滚，
+	// 否则用户写入会落入独立事务并自行提交，导致外层事务无法回滚（孤儿用户）。
 	var txClient *dbent.Client
 	txCtx := ctx
 	var ownedTx *dbent.Tx
@@ -83,9 +84,8 @@ func (r *userRepository) create(ctx context.Context, userIn *service.User, guard
 		tx, err := r.client.Tx(ctx)
 		switch {
 		case errors.Is(err, dbent.ErrTxStarted):
-			// A transaction-bound Ent client is already owned by the caller
-			// (common in integration fixtures); reuse it instead of failing or
-			// opening a nested transaction.
+			// r.client 本身已是事务绑定 client（client 注入式事务，如集成测试
+			// 夹具 tx.Client()）：直接复用，提交/回滚由 client 的持有方负责。
 			txClient = r.client
 		case err != nil:
 			return err

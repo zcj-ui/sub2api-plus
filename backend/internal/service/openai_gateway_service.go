@@ -347,8 +347,9 @@ type OpenAIForwardResult struct {
 	// AudioUsage carries Voice billing units when present.
 	AudioUsage *AudioUsage
 
-	wsReplayInput       []json.RawMessage
-	wsReplayInputExists bool
+	wsReplayInput                []json.RawMessage
+	wsReplayInputExists          bool
+	wsAccountFailoverReplayInput []json.RawMessage
 	// wsConnectionBroken records a terminal upstream failure that was already
 	// visible to the client. Ingress must close rather than reuse the same
 	// client session, because replaying a partially visible turn is unsafe.

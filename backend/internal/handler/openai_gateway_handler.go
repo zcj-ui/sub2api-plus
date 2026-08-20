@@ -296,9 +296,17 @@ func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bo
 	return result.SucceededForScheduling()
 }
 
-func resolveOpenAIMessagesDispatchMappedModel(apiKey *service.APIKey, requestedModel string) string {
+func resolveOpenAIMessagesDispatchMappedModel(c *gin.Context, apiKey *service.APIKey, requestedModel string) string {
 	if apiKey == nil || apiKey.Group == nil {
 		return ""
+	}
+	// composite 解析到 grok/CN 目标时调度级映射不适用（Group 级映射的 gpt-5.x
+	// 默认值是 openai 专属,发给这些上游必错）,模型改写交给账号级 model_mapping。
+	if apiKey.Group.Platform == service.PlatformComposite && c != nil && c.Request != nil {
+		if platform, ok := service.ResolvedTargetPlatformFromContext(c.Request.Context()); ok &&
+			(platform == service.PlatformGrok || service.IsCNProvider(platform)) {
+			return ""
+		}
 	}
 	return strings.TrimSpace(apiKey.Group.ResolveMessagesDispatchModel(requestedModel))
 }
@@ -387,7 +395,7 @@ func openAIResponsesRequiredCapabilityForRequest(imageIntent bool, needsResponse
 	return openAIResponsesRequiredCapability(imageIntent, platform)
 }
 
-func allowOpenAICompatibleMessagesDispatch(apiKey *service.APIKey) bool {
+func allowOpenAICompatibleMessagesDispatch(c *gin.Context, apiKey *service.APIKey) bool {
 	if apiKey == nil || apiKey.Group == nil {
 		return true
 	}
@@ -401,6 +409,15 @@ func allowOpenAICompatibleMessagesDispatch(apiKey *service.APIKey) bool {
 	if service.IsCNProvider(apiKey.Group.Platform) {
 		return true
 	}
+	// composite 分组解析到 grok/CN 目标时与对应独立分组同语义豁免：sanitize
+	// 对 composite 同样恒置 false,不豁免则这些目标的 /v1/messages 永远 403；
+	// 解析到 openai 目标仍受开关控制,维持现状。
+	if apiKey.Group.Platform == service.PlatformComposite && c != nil && c.Request != nil {
+		if platform, ok := service.ResolvedTargetPlatformFromContext(c.Request.Context()); ok &&
+			(platform == service.PlatformGrok || service.IsCNProvider(platform)) {
+			return true
+		}
+	}
 	return apiKey.Group.AllowMessagesDispatch
 }
 
@@ -408,6 +425,19 @@ func openAICompatibleTextTargetAllowed(c *gin.Context, apiKey *service.APIKey, m
 	return compositeTargetPlatformAllowed(c, apiKey, model,
 		service.PlatformOpenAI, service.PlatformGrok,
 		service.PlatformKimi, service.PlatformZhipu, service.PlatformDeepseek)
+}
+
+// isResponsesWebSocketCompositePlatform 限定 composite 分组在 Responses WebSocket
+// 上可服务的目标平台。CN 供应商（kimi/zhipu/deepseek）刻意排除：其账号无法通过
+// WSv2 ingress 的 transport 过滤，且 WS HTTP 桥没有面向 CN 的 Responses 转换，
+// 放行只会把明确的策略拒绝变成误导性的 "no available account"。
+func isResponsesWebSocketCompositePlatform(platform string) bool {
+	switch platform {
+	case service.PlatformOpenAI, service.PlatformGrok:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewOpenAIGatewayHandler creates a new OpenAIGatewayHandler
@@ -530,7 +560,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
-	if !compositeTargetPlatformAllowed(c, apiKey, reqModel, service.PlatformOpenAI, service.PlatformGrok) {
+	if !openAICompatibleTextTargetAllowed(c, apiKey, reqModel) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
 	}
@@ -771,7 +801,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// Forward request
 		service.SetOpsLatencyMs(c, service.OpsRoutingLatencyMsKey, time.Since(routingStart).Milliseconds())
 		forwardStart := time.Now()
-		// 用扣除 compact 心跳字节的口径快照：心跳注释不构成语义响应，
+		// 用扣除非语义心跳字节的口径快照：心跳注释不构成语义响应，
 		// 不能因心跳字节变化而放弃 failover 换号（#3887）。
 		writerSizeBeforeForward := service.OpenAICompactKeepaliveAdjustedWrittenSize(c)
 		// 跨 passthrough 边界的 failover：从 Kiro 等透传账号切到 Bedrock 等非透传账号前，
@@ -866,7 +896,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 						h.handleFailoverExhausted(c, failoverErr, true)
 						return
 					}
-					if failoverErr.SafeToFailoverAfterWrite && c.Writer.Written() {
+					// openAIForwardMayFailover 已确认写出的字节不含语义输出，
+					// 但重试耗尽时仍须按已提交的 SSE 响应返回流内错误。
+					if c.Writer.Written() {
 						streamStarted = true
 					}
 					if failoverErr.ShouldReportAccountScheduleFailure() {
@@ -1158,7 +1190,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	)
 
 	// 检查分组是否允许 /v1/messages 调度
-	if !allowOpenAICompatibleMessagesDispatch(apiKey) {
+	if !allowOpenAICompatibleMessagesDispatch(c, apiKey) {
 		h.anthropicErrorResponse(c, http.StatusForbidden, "permission_error",
 			"This group does not allow /v1/messages dispatch")
 		return
@@ -1201,7 +1233,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	}
 	bindOpenAIReasoningEffortPolicyForMessagesRequest(c, apiKey, body)
 	routingModel := service.NormalizeOpenAICompatRequestedModel(reqModel)
-	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(apiKey, reqModel)
+	preferredMappedModel := resolveOpenAIMessagesDispatchMappedModel(c, apiKey, reqModel)
 	reqStream := gjson.GetBytes(body, "stream").Bool()
 
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
@@ -1662,12 +1694,10 @@ const (
 // 由 BeforeTurn 在每个 turn 开始时冻结，AfterTurn 的用量提交读取它；turn 在
 // 连接内串行推进，互斥锁只为跨用量提交 goroutine 的读取安全。
 //
-// 零值语义（重要）：ws_v2 passthrough ingress 只实现了 AfterTurn，没有任何
-// turn 起始回调，BeforeTurn 永远不会被调用。此时本值保持零，RecordUsage 经
-// openAIUsagePricingAt 回退到记录时刻——与引入分组利润控制前的基线一致。
-// 绝不能用建连时刻初始化：那会把透传连接的所有 turn 钉死在建连时的高峰因子，
-// 客户端只要峰前一分钟建连并保活，整条连接就能全程按谷价结算，正是利润控制
-// 想堵的漏洞。透传 ingress 目前不做 turn 级利润复核，只有建连时的准入门。
+// ws_v2 passthrough ingress 没有 BeforeTurn，因此本值会保持零；AfterTurn 必须
+// 以 TurnStarted 已记录的所属 turn 开始时刻为回退，而不是用建连或记录时刻。
+// 这样每个 passthrough turn 都按自己的开始时刻计价，但不改变其仅在建连时执行
+// 准入门、没有 turn 级利润复核的既有行为。
 type openAIWSTurnPricing struct {
 	mu sync.Mutex
 	at time.Time
@@ -1679,10 +1709,13 @@ func (p *openAIWSTurnPricing) freeze(at time.Time) {
 	p.mu.Unlock()
 }
 
-func (p *openAIWSTurnPricing) current() time.Time {
+func (p *openAIWSTurnPricing) currentOr(fallback time.Time) time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.at
+	if !p.at.IsZero() {
+		return p.at
+	}
+	return fallback
 }
 
 // recordOpenAIProfitVeto 记录 OpenAI 侧选号循环的一次利润门终检否决：把账号
@@ -1945,6 +1978,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "missing first response.create message")
 		return
 	}
+	firstTurnStartedAt := time.Now()
 	if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "unsupported websocket message type")
 		return
@@ -2018,7 +2052,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	ctx = c.Request.Context()
 	if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
 		platform, ok := service.ResolvedTargetPlatformFromContext(ctx)
-		if !ok || (platform != service.PlatformOpenAI && platform != service.PlatformGrok) {
+		if !ok || !isResponsesWebSocketCompositePlatform(platform) {
 			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "Responses WebSocket API only supports OpenAI-compatible models for composite groups")
 			return
 		}
@@ -2116,8 +2150,9 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
 	subscriptionTurnLeases := newOpenAIWSSubscriptionTurnLeaseState()
 	defer subscriptionTurnLeases.abortUnsettled()
-	subscriptionTurnLeaseEnabled := apiKey != nil && apiKey.User != nil && apiKey.Group != nil &&
+	subscriptionTurnLeaseConfigured := apiKey != nil && apiKey.User != nil && apiKey.Group != nil &&
 		apiKey.Group.IsSubscriptionType() && subscription != nil
+	subscriptionTurnLeaseEnabled := subscriptionTurnLeaseConfigured
 	subscriptionTurnGroupID := int64(0)
 	if apiKey != nil && apiKey.GroupID != nil {
 		subscriptionTurnGroupID = *apiKey.GroupID
@@ -2148,12 +2183,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	// The turn lease is an OpenAI subscription safeguard. Keep the existing
 	// Grok/other-compatible WebSocket paths unchanged, including their normal
 	// per-turn billing behavior.
-	subscriptionTurnLeaseEnabled = subscriptionTurnLeaseEnabled && requestPlatform == service.PlatformOpenAI
-	if h.cfg != nil && h.cfg.RunMode == config.RunModeSimple {
-		// Simple mode intentionally bypasses billing and quota enforcement; do
-		// not introduce a distributed admission dependency into that mode.
-		subscriptionTurnLeaseEnabled = false
-	}
+	subscriptionTurnLeaseEnabled = openAIWSSubscriptionTurnLeaseEnabled(subscriptionTurnLeaseConfigured, requestPlatform, h.cfg)
 	requiredTransport := service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
 	if requestPlatform == service.PlatformGrok {
 		requiredTransport = service.OpenAIUpstreamTransportHTTPSSE
@@ -2182,6 +2212,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	failedAccountIDs := make(map[int64]struct{})
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
+	wsAttemptMessage := append([]byte(nil), firstMessage...)
 	handleWSFailover := func(account *service.Account, failoverErr *service.UpstreamFailoverError) bool {
 		if ctx.Err() != nil {
 			return false
@@ -2228,6 +2259,59 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage) && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
+	applyWSCurrentTurnRetryPayload := func(retryPayload []byte) bool {
+		payload, model, coverage, ok := openAIWSCurrentTurnRetryPayloadState(retryPayload)
+		if !ok {
+			return false
+		}
+
+		nextCtx := ctx
+		nextRequestCtx := c.Request.Context()
+		if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
+			platform, detected := service.DetectModelPlatform(model)
+			if !detected || !isResponsesWebSocketCompositePlatform(platform) {
+				return false
+			}
+			// ensureCompositeTargetPlatform intentionally preserves an existing
+			// target. A current-turn replay may legitimately change models, so
+			// replace the composite target rather than retaining the first turn's.
+			nextCtx = service.WithResolvedTargetPlatform(nextCtx, platform)
+			nextRequestCtx = service.WithResolvedTargetPlatform(nextRequestCtx, platform)
+		}
+
+		nextPlatform := openAICompatibleRequestPlatform(nextCtx, apiKey)
+		nextImageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", model, payload)
+		if nextImageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
+			return false
+		}
+		nextTransport := service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
+		if nextPlatform == service.PlatformGrok {
+			nextTransport = service.OpenAIUpstreamTransportHTTPSSE
+		}
+		nextCapability := service.OpenAIEndpointCapabilityChatCompletions
+		if nextImageIntent && nextPlatform == service.PlatformOpenAI {
+			nextCapability = service.OpenAIEndpointCapabilityResponses
+		}
+		nextChannelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(nextCtx, apiKey.GroupID, model)
+
+		firstMessage = append([]byte(nil), payload...)
+		wsAttemptMessage = append([]byte(nil), payload...)
+		reqModel = model
+		previousResponseID = ""
+		previousResponseIDKind = service.OpenAIPreviousResponseIDKindEmpty
+		firstMessageToolCoverage = coverage
+		previousResponseCanMove = true
+		imageIntent = nextImageIntent
+		requestPlatform = nextPlatform
+		subscriptionTurnLeaseEnabled = openAIWSSubscriptionTurnLeaseEnabled(subscriptionTurnLeaseConfigured, nextPlatform, h.cfg)
+		requiredTransport = nextTransport
+		requiredCapability = nextCapability
+		channelMappingWS = nextChannelMapping
+		ctx = nextCtx
+		c.Request = c.Request.WithContext(nextRequestCtx)
+		setOpsRequestContext(c, reqModel, true)
+		return true
+	}
 	applyWSResume := func(resume *service.OpenAIWSResumeState) bool {
 		if resume == nil || len(resume.ReplayPayload) == 0 {
 			return false
@@ -2253,7 +2337,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return false
 		}
 
-		firstMessage = payload
+		firstMessage = append([]byte(nil), payload...)
+		// The failover loop sends wsAttemptMessage, not firstMessage. Keep both
+		// snapshots aligned so a verified guard resume reaches the replacement
+		// account without the old previous_response_id.
+		wsAttemptMessage = append([]byte(nil), payload...)
 		reqModel = model
 		previousResponseID = ""
 		previousResponseIDKind = service.OpenAIPreviousResponseIDKindEmpty
@@ -2354,6 +2442,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return
 			}
 			firstMessage = mergedFirst
+			// Retry attempts must use the same merged prelude payload as the
+			// first attempt. Keeping the pre-merge frame here drops client state
+			// after an account failover.
+			wsAttemptMessage = append([]byte(nil), mergedFirst...)
 			initialPassthroughFrames = nil
 		}
 		accountMaxConcurrency := account.Concurrency
@@ -2453,13 +2545,29 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 		maxReasoningEffort, reasoningEffortMappings, _ := openAIReasoningEffortPolicyForRequest(c, apiKey)
 		var requestPayloadHash string
+		var turnStartsMu sync.Mutex
+		turnStarts := make(map[int]time.Time, 4)
+		recordTurnStart := func(turn int, startedAt time.Time) {
+			if turn <= 0 || startedAt.IsZero() {
+				return
+			}
+			turnStartsMu.Lock()
+			turnStarts[turn] = startedAt
+			turnStartsMu.Unlock()
+		}
+		getTurnStart := func(turn int) time.Time {
+			turnStartsMu.Lock()
+			startedAt := turnStarts[turn]
+			delete(turnStarts, turn)
+			turnStartsMu.Unlock()
+			return startedAt
+		}
 		// Passthrough rejects overlapping response.create frames, so one immutable
 		// turn-tagged slot preserves the exact mapping used for the in-flight request.
 		var turnChannelMapping atomic.Pointer[openAIWSTurnChannelMappingSnapshot]
 		turnChannelMapping.Store(&openAIWSTurnChannelMappingSnapshot{turn: 1, mapping: channelMappingWS})
-		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号，
-		// AfterTurn 的计费读取所属 turn 的时刻。零值起步的语义见
-		// openAIWSTurnPricing 的注释——绝不能用建连时刻初始化。
+		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号；
+		// passthrough 没有 BeforeTurn 时，AfterTurn 回退到 TurnStarted 的所属 turn 时刻。
 		var turnPricing openAIWSTurnPricing
 		reacquirePassthroughTurnSlots := func(turn int) error {
 			// The initial turn keeps the handler's admission slots. Later
@@ -2506,12 +2614,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:     clientLifecycleCtx,
 			InitialRequestModel:        reqModel,
+			InitialTurnStartedAt:       firstTurnStartedAt,
 			InitialPassthroughFrames:   initialPassthroughFrames,
 			InitialResponseMessageType: msgType,
 			SessionHash:                sessionHash,
 			Force429GuardContinuation:  scheduleDecision.ContinuationLease,
 			MaxReasoningEffort:         maxReasoningEffort,
 			ReasoningEffortMappings:    reasoningEffortMappings,
+			TurnStarted:                recordTurnStart,
 			BeforePassthroughTurn:      reacquirePassthroughTurnSlots,
 			BeforeRequest: func(turn int, payload []byte, originalModel string) error {
 				c.Set(securityAuditWSTurnContextKey, turn)
@@ -2618,6 +2728,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return nil
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
+				turnStart := getTurnStart(turn)
 				// F1: cyber 标记按 turn 生命周期清理——defer 保证任意早返回路径都执行；
 				// CyberBlocked 必须在 submit 前同步预捕获（task 闭包由 worker 池异步执行，
 				// 届时 defer 已清除标记）。
@@ -2691,7 +2802,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				upstreamEndpoint := resolveOpenAIUpstreamEndpoint(c, account, result)
 				quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
 				sessionID := service.ExtractClientSessionID(c)
-				turnRecordPricingAt := turnPricing.current()
+				turnRecordPricingAt := turnPricing.currentOr(turnStart)
 				cyberBlocked := service.GetOpsCyberPolicy(c) != nil
 				turnLease := subscriptionTurnLeases.beginSettlement(turn)
 				settlementOwned = turnLease != nil
@@ -2740,7 +2851,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			},
 		}
 
-		wsFirstMessage := firstMessage
+		wsFirstMessage := wsAttemptMessage
 		// A previous_response_id is scoped to the upstream account/session that
 		// created it. If the scheduler cannot prove the response binding belongs
 		// to the selected account, stripping the id would turn a continuation
@@ -2779,6 +2890,25 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			subscriptionTurnLeases.abortUnsettled()
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
+				retryPayload, retryCurrentTurn := service.OpenAIWSCurrentTurnRetryPayload(err)
+				nextAttemptMessage, retrySafe := openAIWSNextAttemptMessage(wsAttemptMessage, retryPayload, retryCurrentTurn)
+				if !retrySafe {
+					closeOpenAIWSFailoverExhausted(wsConn, failoverErr)
+					return
+				}
+				if retryCurrentTurn {
+					if !applyWSCurrentTurnRetryPayload(nextAttemptMessage) {
+						closeOpenAIWSFailoverExhausted(wsConn, failoverErr)
+						return
+					}
+					reqLog.Warn("openai.websocket_current_turn_failover_retry",
+						zap.Int64("account_id", account.ID),
+						zap.Int("upstream_status", failoverErr.StatusCode),
+						zap.Int("retry_payload_bytes", len(retryPayload)),
+					)
+				} else {
+					wsAttemptMessage = nextAttemptMessage
+				}
 				if handleWSFailover(account, failoverErr) {
 					if failoverErr.WSResume != nil {
 						if !applyWSResume(failoverErr.WSResume) {
@@ -3431,6 +3561,46 @@ func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason s
 	}
 	_ = conn.Close(status, reason)
 	_ = conn.CloseNow()
+}
+
+func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn bool) ([]byte, bool) {
+	if !retryCurrentTurn {
+		return append([]byte(nil), current...), true
+	}
+	if len(retryPayload) == 0 {
+		return nil, false
+	}
+	return append([]byte(nil), retryPayload...), true
+}
+
+// openAIWSCurrentTurnRetryPayloadState validates the full replay payload that
+// the HTTP bridge creates for a later failed turn. The model belongs to this
+// payload, not to the connection's first response.create frame.
+func openAIWSCurrentTurnRetryPayloadState(payload []byte) ([]byte, string, service.ToolCallOutputContextCoverage, bool) {
+	if !gjson.ValidBytes(payload) {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	if messageType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); messageType != "response.create" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	model := gjson.GetBytes(payload, "model")
+	if !model.Exists() || model.Type != gjson.String || strings.TrimSpace(model.String()) == "" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
+	if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	return append([]byte(nil), payload...), strings.TrimSpace(model.String()), coverage, true
+}
+
+func openAIWSSubscriptionTurnLeaseEnabled(configured bool, platform string, cfg *config.Config) bool {
+	if !configured || platform != service.PlatformOpenAI {
+		return false
+	}
+	// Simple mode intentionally bypasses billing and quota enforcement; do not
+	// introduce a distributed admission dependency into that mode.
+	return cfg == nil || cfg.RunMode != config.RunModeSimple
 }
 
 func closeOpenAIWSFailoverExhausted(conn *coderws.Conn, failoverErr *service.UpstreamFailoverError) {
