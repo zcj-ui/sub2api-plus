@@ -113,9 +113,6 @@ const (
 	openAIProbeCacheTTL = 10 * time.Minute
 	grokProbeRetryTTL   = 1 * time.Minute
 	grokFreeQuotaWindow = 24 * time.Hour
-	// Kept as a compatibility alias for existing tests/config snapshots; probe
-	// requests resolve the live canonical version at request time below.
-	openAICodexProbeVersion = codexCLIVersion
 )
 
 // UsageCache 封装账户使用量相关的缓存

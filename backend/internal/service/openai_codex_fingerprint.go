@@ -1189,10 +1189,6 @@ func stripCodexFingerprintSeed(extra map[string]any) map[string]any {
 	return stripped
 }
 
-func prepareCodexFingerprintExtraForCreate(platform, accountType string, extra map[string]any) map[string]any {
-	return NormalizeCodexFingerprintExtraForAccount(platform, accountType, extra)
-}
-
 func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]any) map[string]any {
 	return NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
 }
