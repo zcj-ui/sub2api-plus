@@ -633,12 +633,16 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 		return nil, err
 	}
 	accountExtra, err = normalizeGrokMediaEligibilityExtra(input.Platform, accountExtra)
-	if err != nil {
-		return nil, err
-	}
-	if input.Platform == PlatformAntigravity && overagesEnabledInExtra(accountExtra) && !input.ConfirmOveragesRisk {
-		return nil, ErrOveragesConfirmationRequired
-	}
+		if err != nil {
+			return nil, err
+		}
+		if input.Platform == PlatformAntigravity && overagesEnabledInExtra(accountExtra) && !input.ConfirmOveragesRisk {
+			return nil, ErrOveragesConfirmationRequired
+		}
+		accountExtra, err = normalizeOpenAIAutoResetCreditExtra(input.Platform, input.Type, false, accountExtra)
+		if err != nil {
+			return nil, err
+		}
 
 	// 绑定分组
 	groupIDs := input.GroupIDs
@@ -748,11 +752,15 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			return nil, err
 		}
 		normalizedExtra, err = normalizeGrokMediaEligibilityUpdateExtra(account, input, normalizedExtra)
-		if err != nil {
-			return nil, err
+			if err != nil {
+				return nil, err
+			}
+			normalizedExtra = RetireCodexFingerprintExtra(normalizedExtra)
+			normalizedExtra, err = normalizeOpenAIAutoResetCreditExtra(account.Platform, effectiveType, account.IsShadow(), normalizedExtra)
+			if err != nil {
+				return nil, err
+			}
 		}
-		normalizedExtra = RetireCodexFingerprintExtra(normalizedExtra)
-	}
 	previousProbeIdentity := upstreamBillingProbeIdentity(account)
 	previousOllamaUsageIdentity := ollamaCloudUsageIdentity(account)
 	// 安全/身份不变量(影子账号):通用更新路径被 edit/re-auth/refresh/batch 共用,
@@ -866,6 +874,7 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 			OllamaCloudUsageSessionExtraKey,
 			OllamaCloudUsageAutoRefreshExtraKey,
 			OllamaCloudUsageSnapshotExtraKey,
+			OpenAIAutoResetCreditStateExtraKey,
 		} {
 			if v, ok := account.Extra[key]; ok {
 				normalizedExtra[key] = v
@@ -1113,12 +1122,13 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 // UpdateAccountExtra 仅对 Extra JSONB 做 key 级合并，避免覆盖其它运行态键
 // （如 model_rate_limits / passive_usage_* 等）。
 func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, updates map[string]any) error {
-	codexFingerprintRequested := codexFingerprintExtraUpdateRequested(updates)
-	codexFingerprintValidation := updates
-	// A key-level edit must never replace the persisted account seed. The
-	// repository creates a missing seed atomically when an enabled mode is set.
-	updates = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(updates))
-	delete(updates, UpstreamBillingProbeEnabledExtraKey)
+		codexFingerprintRequested := codexFingerprintExtraUpdateRequested(updates)
+		codexFingerprintValidation := updates
+		// A key-level edit must never replace the persisted account seed. The
+		// repository creates a missing seed atomically when an enabled mode is set.
+		updates = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(updates))
+		updates = stripOpenAIAutoResetCreditManagedExtra(updates, true)
+		delete(updates, UpstreamBillingProbeEnabledExtraKey)
 	delete(updates, UpstreamBillingRateSyncEnabledExtraKey)
 	delete(updates, UpstreamBillingProbeExtraKey)
 	delete(updates, OllamaCloudUsageSessionExtraKey)
@@ -1183,11 +1193,12 @@ func (s *adminServiceImpl) UpdateAccountExtra(ctx context.Context, id int64, upd
 func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUpdateAccountsInput) (*BulkUpdateAccountsResult, error) {
 	codexFingerprintRequested := codexFingerprintExtraUpdateRequested(input.Extra)
 	codexFingerprintValidation := input.Extra
-	// Managed probe/session state may only enter through dedicated typed endpoints.
-	// Bulk edits keep each account's existing seed. The repository creates a
-	// missing seed per eligible row when an enabled mode is selected.
-	input.Extra = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(input.Extra))
-	delete(input.Extra, UpstreamBillingProbeEnabledExtraKey)
+		// Managed probe/session state may only enter through dedicated typed endpoints.
+		// Bulk edits keep each account's existing seed. The repository creates a
+		// missing seed per eligible row when an enabled mode is selected.
+		input.Extra = sanitizedCodexFingerprintExtraUpdates(RetireCodexFingerprintExtra(input.Extra))
+		input.Extra = stripOpenAIAutoResetCreditManagedExtra(input.Extra, true)
+		delete(input.Extra, UpstreamBillingProbeEnabledExtraKey)
 	delete(input.Extra, UpstreamBillingRateSyncEnabledExtraKey)
 	delete(input.Extra, UpstreamBillingProbeExtraKey)
 	delete(input.Extra, OllamaCloudUsageSessionExtraKey)

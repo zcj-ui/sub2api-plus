@@ -7,7 +7,7 @@
 [![Release](https://img.shields.io/github/v/release/zcj-ui/sub2api-plus)](https://github.com/zcj-ui/sub2api-plus/releases)
 [![Dev Build](https://github.com/zcj-ui/sub2api-plus/actions/workflows/dev-build.yml/badge.svg?branch=dev)](https://github.com/zcj-ui/sub2api-plus/actions/workflows/dev-build.yml)
 [![License](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8)](backend/go.mod)
+[![Go](https://img.shields.io/badge/Go-1.27.0-00ADD8)](backend/go.mod)
 [![Vue](https://img.shields.io/badge/Vue-3.4-4FC08D)](frontend/package.json)
 
 > **测试版本警告：** `0.2.x` 只用于开发、兼容性测试和隔离验收，尚未完成独立安全审计、长期压力测试、灾难恢复演练及生产级验证，不应直接用于生产环境，也不应承载真实付费用户、不可替代数据或高价值凭据。运行前必须阅读仓库级[使用、部署与风险免责声明](DISCLAIMER.md)及[部署与运营合规承诺](docs/legal/admin-compliance.zh.md)。这些成熟度说明不对 LGPL 协议增加额外限制。

@@ -7,7 +7,7 @@ English | [中文](README_CN.md) | [日本語](README_JA.md)
 [![Release](https://img.shields.io/github/v/release/zcj-ui/sub2api-plus)](https://github.com/zcj-ui/sub2api-plus/releases)
 [![Dev Build](https://github.com/zcj-ui/sub2api-plus/actions/workflows/dev-build.yml/badge.svg?branch=dev)](https://github.com/zcj-ui/sub2api-plus/actions/workflows/dev-build.yml)
 [![License](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue)](LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8)](backend/go.mod)
+[![Go](https://img.shields.io/badge/Go-1.27.0-00ADD8)](backend/go.mod)
 [![Vue](https://img.shields.io/badge/Vue-3.4-4FC08D)](frontend/package.json)
 
 > **Technical preview:** `0.2.x` is for development, compatibility testing, and isolated acceptance only. It has not completed an independent security audit, sustained load test, or disaster-recovery qualification and should not be used directly in production or with irreplaceable data, paid users, or high-value credentials. Read the repository-wide [use, deployment, and risk disclaimer](DISCLAIMER.md) and the [deployment commitment](docs/legal/admin-compliance.en.md) before running it. These maturity notices do not add restrictions to the LGPL license.

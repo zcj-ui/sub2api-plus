@@ -312,15 +312,15 @@ func TestHandlePassthroughSSEToJSON_CompactRawOutputItemDoneRepairsEmptyTerminal
 		`data: {"type":"response.completed","response":{"id":"resp_compact_pt_raw","object":"response","status":"completed","output":[],"usage":{"input_tokens":6,"output_tokens":2,"total_tokens":8}}}`,
 		``,
 	}, "\n")
-	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
-	}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+		}
 
-	result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, &Account{ID: 1, Type: AccountTypeOAuth}, "gpt-5.5", "")
-	require.NoError(t, err)
-	require.NotNil(t, result)
+		result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, &Account{ID: 1, Type: AccountTypeOAuth}, "gpt-5.5", "")
+		require.NoError(t, err)
+		require.NotNil(t, result)
 
 	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	events := parseCompactBridgeSSE(t, rec.Body.String())
@@ -509,12 +509,12 @@ func TestHandleNonStreamingResponsePassthrough_CompactClientStreamBridgesToSSE(t
 			"id":"resp_compact_pt",
 			"output":[{"id":"cmp_pt_1","type":"compaction","encrypted_content":"compact-pt-payload"}],
 			"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
-		}`)),
-	}
+			}`)),
+		}
 
-	result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, &Account{ID: 1, Type: AccountTypeOAuth}, "gpt-5.5", "")
-	require.NoError(t, err)
-	require.NotNil(t, result)
+		result, err := svc.handleNonStreamingResponsePassthrough(context.Background(), resp, c, &Account{ID: 1, Type: AccountTypeOAuth}, "gpt-5.5", "")
+		require.NoError(t, err)
+		require.NotNil(t, result)
 
 	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
 	events := parseCompactBridgeSSE(t, rec.Body.String())

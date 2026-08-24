@@ -101,7 +101,7 @@ func stageCodexFingerprintIDs(c *gin.Context, ids *codexFingerprintIDs) {
 // 非透传与透传两个请求构造器共用本函数，防止应用语义漂移。仅 OAuth 账号
 // 生效（stale 键在账号类型混合 failover 下由该门挡住）。
 func stagedCodexFingerprintIDs(c *gin.Context, account *Account) *codexFingerprintIDs {
-	if c == nil || account == nil || account.Type != AccountTypeOAuth {
+	if c == nil || account == nil || !account.UsesOpenAICodexProtocol() {
 		return nil
 	}
 	value, ok := c.Get(codexFingerprintIDsContextKey)
@@ -1176,22 +1176,54 @@ func codexFingerprintSeed(extra map[string]any) (string, bool) {
 	return canonicalCodexFingerprintSeed(extraStringValue(extra, codexFingerprintSeedExtraKey))
 }
 
-func newCodexFingerprintSeed() string {
-	return uuid.NewString()
-}
-
-func stripCodexFingerprintSeed(extra map[string]any) map[string]any {
-	if extra == nil {
-		return nil
+	func newCodexFingerprintSeed() string {
+		return uuid.NewString()
 	}
-	stripped := cloneCodexFingerprintExtra(extra)
-	delete(stripped, codexFingerprintSeedExtraKey)
-	return stripped
-}
 
-func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]any) map[string]any {
-	return NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
-}
+	func stripCodexFingerprintSeed(extra map[string]any) map[string]any {
+		if extra == nil {
+			return nil
+		}
+		stripped := cloneCodexFingerprintExtra(extra)
+		delete(stripped, codexFingerprintSeedExtraKey)
+		return stripped
+	}
+
+	func prepareCodexFingerprintExtraForCreate(platform, accountType string, extra map[string]any) map[string]any {
+		prepared := stripCodexFingerprintSeed(extra)
+		if platform != PlatformOpenAI || (accountType != AccountTypeOAuth && accountType != AccountTypeSetupToken) || !codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
+			return prepared
+		}
+		if prepared == nil {
+			prepared = make(map[string]any, 1)
+		}
+		prepared[codexFingerprintSeedExtraKey] = newCodexFingerprintSeed()
+		return prepared
+	}
+
+	func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]any) map[string]any {
+		if account != nil && account.IsOpenAIOAuth() {
+			return NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
+		}
+		prepared := stripCodexFingerprintSeed(extra)
+		if account == nil || !account.IsOpenAIOAuthLike() {
+			return prepared
+		}
+		if seed, ok := codexFingerprintSeed(account.Extra); ok {
+			if prepared == nil {
+				prepared = make(map[string]any, 1)
+			}
+			prepared[codexFingerprintSeedExtraKey] = seed
+			return prepared
+		}
+		if codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
+			if prepared == nil {
+				prepared = make(map[string]any, 1)
+			}
+			prepared[codexFingerprintSeedExtraKey] = newCodexFingerprintSeed()
+		}
+		return prepared
+	}
 
 func sanitizedCodexFingerprintExtraUpdates(updates map[string]any) map[string]any {
 	if updates == nil {
@@ -1214,7 +1246,7 @@ func sanitizedCodexFingerprintExtraUpdates(updates map[string]any) map[string]an
 // 的 A/B 实测。上游的配额判定策略不可观测，因此这里取兼容安全的一侧：
 // 不显式 opt-in 就保持 v0.1.175 之前的客户端身份（#5610）。
 func (a *Account) GetCodexFingerprintMode() codexFingerprintMode {
-	if a == nil || !a.IsOpenAIOAuth() {
+	if a == nil || !a.IsOpenAIOAuthLike() {
 		return codexFingerprintOff
 	}
 	raw := strings.ToLower(strings.TrimSpace(a.GetExtraString(codexFingerprintModeExtraKey)))

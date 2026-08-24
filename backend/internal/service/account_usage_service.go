@@ -727,18 +727,21 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 			// Extra keys and immediately reflected in the returned UsageInfo.
 			if s.openAIQuotaService != nil {
 				if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
-					if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
-						if persistErr := s.persistOpenAICodexProbeSnapshot(ctx, account.ID, updates); persistErr == nil {
-							mergeAccountExtra(account, updates)
-							if usage.UpdatedAt == nil {
-								usage.UpdatedAt = &now
+						if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
+							if persistErr := s.persistOpenAICodexProbeSnapshot(ctx, account.ID, updates); persistErr == nil {
+								mergeAccountExtra(account, updates)
+								if account.ParentAccountID != nil {
+									notifyOpenAIAutoReset(*account.ParentAccountID)
+								}
+								if usage.UpdatedAt == nil {
+									usage.UpdatedAt = &now
+								}
+								applyExtraToUsage(usage, account.Extra, now)
+								probeSucceeded = true
 							}
-							applyExtraToUsage(usage, account.Extra, now)
+						} else {
 							probeSucceeded = true
 						}
-					} else {
-						probeSucceeded = true
-					}
 				}
 			}
 		} else if s.openAIQuotaService != nil {
@@ -955,11 +958,12 @@ func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(ctx context.Contex
 	if len(updates) == 0 {
 		return nil
 	}
-	if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
-		return fmt.Errorf("persist openai codex snapshot: %w", err)
+		if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
+			return fmt.Errorf("persist openai codex snapshot: %w", err)
+		}
+		notifyOpenAIAutoReset(accountID)
+		return nil
 	}
-	return nil
-}
 
 func extractOpenAICodexProbeUpdates(resp *http.Response) (map[string]any, error) {
 	if resp == nil {

@@ -6,6 +6,13 @@
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
 
+## 0.2.6+ 官方同步至 `e2d9b823f6`（本地合并，尚未发版）
+
+- 在保留 Plus 定制语义的前提下合并官方 `upstream/main` `32a0d9ba2d..e2d9b823f6`（213 提交 / 142 非合并提交）。
+- 纳入官方 Go 1.27、OAuth 出站 plugin、自动用卡、`service_tier`、SetupToken 协议路由、Grok 4.6 / Realtime / 同号 429 重试、渠道分时计价和模型广场展示。
+- 冲突按兼容处理：两次明确 429、Credit 跳过本地自动停调、`proxy_id` fail-closed、指纹默认 off / seed 隔离、卡429 不进 Claude/CC 均保留；官方新能力与 Plus 字段并存。
+- Plus 版本号保持 `0.2.6`，不采用官方 `0.1.181`。README / 发布文档继续使用本仓库地址与免责声明。
+
 ## 0.2.6 官方同步、OpenAI/Codex 稳定性与更新链路修复
 
 - 同步官方 `upstream/main` 至 `32a0d9ba2d`，纳入近期渠道监控配额、分时定价、中国供应商路由、Responses/Chat 兼容、Grok 工具协议、WebSocket 续接和前端管理界面改进。
