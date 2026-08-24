@@ -115,9 +115,16 @@ func openAICodexBetaFeatureHeaderValues(h http.Header) []string {
 	return values
 }
 
-// hasOpenAICodexBetaFeaturesHeader 报告出站头里是否已存在非空的
-// x-codex-beta-features（即客户端自己声明过能力集）。
-// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
+	func hasOpenAICodexBetaFeaturesHeader(h http.Header) bool {
+		for _, value := range openAICodexBetaFeatureHeaderValues(h) {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
 // Native remote compaction v2 is the only wire shape that requires the
 // gateway to add its explicit capability token.
 //

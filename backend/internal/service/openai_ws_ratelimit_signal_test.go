@@ -240,22 +240,23 @@ func TestOpenAIGatewayService_ForwardWSv2Confirmed429StatusOnlyKeepsLease(t *tes
 			"input":                []any{map[string]any{"type": "input_text", "text": "hello"}},
 		}
 		agentTaskRecoveryTried := false
-		result, err := svc.forwardOpenAIWSV2(
-			context.Background(),
-			c,
-			account,
-			requestBody,
-			"access-token",
-			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
-			true,
-			false,
-			"gpt-5.1",
-			"gpt-5.1",
-			time.Now(),
-			1,
-			"",
-			&agentTaskRecoveryTried,
-		)
+			result, err := svc.forwardOpenAIWSV2(
+				context.Background(),
+				c,
+				account,
+				requestBody,
+				"access-token",
+				"",
+				OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+				true,
+				false,
+				"gpt-5.1",
+				"gpt-5.1",
+				time.Now(),
+				1,
+				"",
+				&agentTaskRecoveryTried,
+			)
 		return result, rec, err
 	}
 
@@ -319,22 +320,23 @@ func TestOpenAIGatewayService_ForwardWSv2GuardAcquireQueueFullKeepsBinding(t *te
 		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
 		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
 		recoveryTried := false
-		return svc.forwardOpenAIWSV2(
-			context.Background(),
-			c,
-			account,
-			body,
-			"access-token",
-			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
-			true,
-			false,
-			"gpt-5.1",
-			"gpt-5.1",
-			time.Now(),
-			1,
-			"",
-			&recoveryTried,
-		)
+			return svc.forwardOpenAIWSV2(
+				context.Background(),
+				c,
+				account,
+				body,
+				"access-token",
+				"",
+				OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+				true,
+				false,
+				"gpt-5.1",
+				"gpt-5.1",
+				time.Now(),
+				1,
+				"",
+				&recoveryTried,
+			)
 	}
 
 	seed, err := invoke(map[string]any{

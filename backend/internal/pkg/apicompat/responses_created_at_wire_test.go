@@ -54,8 +54,8 @@ func TestChatCompletionsResponseToResponses_CarriesCreatedAt(t *testing.T) {
 			Created: 1700000000,
 			Model:   "deepseek-v4-flash",
 			Choices: []ChatChoice{{Message: ChatMessage{Role: "assistant", Content: json.RawMessage(`"hi"`)}}},
-		}, "deepseek-v4-flash", nil, false, nil)
-		require.EqualValues(t, 1700000000, out.CreatedAt, "上游给了 created 就照搬，不要另起时间")
+			}, "deepseek-v4-flash", nil, nil, false, nil)
+			require.EqualValues(t, 1700000000, out.CreatedAt, "上游给了 created 就照搬，不要另起时间")
 	})
 
 	t.Run("stamps_now_when_upstream_omits_created", func(t *testing.T) {
@@ -63,12 +63,12 @@ func TestChatCompletionsResponseToResponses_CarriesCreatedAt(t *testing.T) {
 			ID:      "chatcmpl_2",
 			Model:   "deepseek-v4-flash",
 			Choices: []ChatChoice{{Message: ChatMessage{Role: "assistant", Content: json.RawMessage(`"hi"`)}}},
-		}, "deepseek-v4-flash", nil, false, nil)
-		require.Greater(t, out.CreatedAt, int64(0))
+			}, "deepseek-v4-flash", nil, nil, false, nil)
+			require.Greater(t, out.CreatedAt, int64(0))
 	})
 
 	t.Run("nil_upstream_response_still_stamps", func(t *testing.T) {
-		out := ChatCompletionsResponseToResponses(nil, "deepseek-v4-flash", nil, false, nil)
+			out := ChatCompletionsResponseToResponses(nil, "deepseek-v4-flash", nil, nil, false, nil)
 		require.Greater(t, out.CreatedAt, int64(0), "空上游响应也必须产出可解析的对象")
 	})
 }
