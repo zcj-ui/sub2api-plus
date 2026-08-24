@@ -1503,14 +1503,16 @@ func (s *TokenRefreshService) ensureAntigravityPrivacy(ctx context.Context, acco
 
 	projectID, _ := account.Credentials["project_id"].(string)
 
-	var proxyURL string
-	if account.ProxyID != nil && s.proxyRepo != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
+		proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+		if err != nil {
+			slog.Warn("token_refresh.antigravity_privacy_proxy_unavailable",
+				"account_id", account.ID,
+				"error", err,
+			)
+			return
 		}
-	}
 
-	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
+		mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
 	if mode == "" {
 		return
 	}

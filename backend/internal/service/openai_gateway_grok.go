@@ -94,13 +94,13 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, err
 	}
 
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
-	defer releaseUpstreamCtx()
+		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		defer releaseUpstreamCtx()
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
+		proxyURL, err := resolveConfiguredProxyURL(account)
+		if err != nil {
+			return nil, err
+		}
 
 	upstreamStart := time.Now()
 	var resp *http.Response
@@ -1155,15 +1155,15 @@ func (s *OpenAIGatewayService) describeGrokComposerImage(
 		return "", OpenAIUsage{}, fmt.Errorf("build grok composer image bridge request: %w", err)
 	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
+		proxyURL, err := resolveConfiguredProxyURL(account)
+		if err != nil {
+			return "", OpenAIUsage{}, err
+		}
 
-	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	if err != nil {
-		return "", OpenAIUsage{}, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
-	}
+		resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		if err != nil {
+			return "", OpenAIUsage{}, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+		}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {

@@ -2647,15 +2647,12 @@ func (s *OpenAIGatewayService) SnapshotOpenAIAccountSchedulerMetrics() OpenAIAcc
 	return scheduler.SnapshotMetrics()
 }
 
-func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
-	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds > 0 {
-		return time.Duration(s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds) * time.Second
+	func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
+		if s != nil {
+			return s.openAIStickySessionIdleTTL(context.Background())
+		}
+		return openaiStickySessionIdleTTLDefault
 	}
-	if s != nil {
-		return s.openAIStickySessionIdleTTL(context.Background())
-	}
-	return openaiStickySessionIdleTTLDefault
-}
 
 func (s *OpenAIGatewayService) openAIWSLBTopK() int {
 	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.LBTopK > 0 {

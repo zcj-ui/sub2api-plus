@@ -77,11 +77,10 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
 		return nil, err
 	}
 
-	// 代理 URL
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
+		proxyURL, err := resolveConfiguredProxyURL(account)
+		if err != nil {
+			return nil, s.writeClaudeError(c, http.StatusBadGateway, "api_error", err.Error())
+		}
 
 	// 获取转换选项
 	// Antigravity 上游要求必须包含身份提示词，否则会返回 429

@@ -2326,7 +2326,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.retry_total_budget_ms", 5000)
 	viper.SetDefault("gateway.openai_ws.payload_log_sample_rate", 0.2)
 	viper.SetDefault("gateway.openai_ws.lb_top_k", 7)
-	viper.SetDefault("gateway.openai_ws.sticky_session_ttl_seconds", 3600)
+		viper.SetDefault("gateway.openai_ws.sticky_session_ttl_seconds", 60)
 	viper.SetDefault("gateway.openai_ws.session_hash_read_old_fallback", true)
 	viper.SetDefault("gateway.openai_ws.session_hash_dual_write_old", true)
 	viper.SetDefault("gateway.openai_ws.metadata_bridge_enabled", true)

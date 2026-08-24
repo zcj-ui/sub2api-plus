@@ -55,7 +55,10 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 		if err != nil {
 			return nil, nil, err
 		}
-		targetURL = s.buildCustomRelayURL(validatedURL, "/v1/messages", account)
+			targetURL, err = s.buildCustomRelayURL(validatedURL, "/v1/messages", account)
+			if err != nil {
+				return nil, nil, err
+			}
 	}
 
 	clientHeaders := http.Header{}
@@ -904,16 +907,20 @@ func truncateForLog(b []byte, maxBytes int) string {
 
 // buildCustomRelayURL 构建自定义中继转发 URL
 // 在 path 后附加 beta=true 和可选的 proxy 查询参数
-func (s *GatewayService) buildCustomRelayURL(baseURL, path string, account *Account) string {
-	u := strings.TrimRight(baseURL, "/") + path + "?beta=true"
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL := account.Proxy.URL()
+	func (s *GatewayService) buildCustomRelayURL(baseURL, path string, account *Account) (string, error) {
+		u := strings.TrimRight(baseURL, "/") + path + "?beta=true"
+		if account == nil || account.ProxyID == nil {
+			return u, nil
+		}
+		proxyURL, err := resolveConfiguredProxyURL(account)
+		if err != nil {
+			return "", err
+		}
 		if proxyURL != "" {
 			u += "&proxy=" + url.QueryEscape(proxyURL)
 		}
+		return u, nil
 	}
-	return u
-}
 
 func (s *GatewayService) validateUpstreamBaseURL(raw string) (string, error) {
 	if s.cfg != nil && !s.cfg.Security.URLAllowlist.Enabled {

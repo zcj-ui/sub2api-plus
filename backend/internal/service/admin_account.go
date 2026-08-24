@@ -2035,29 +2035,28 @@ func (s *adminServiceImpl) EnsureAntigravityPrivacy(ctx context.Context, account
 		}
 	}
 
-	token, _ := account.Credentials["access_token"].(string)
-	if token == "" {
-		return ""
-	}
-
-	projectID, _ := account.Credentials["project_id"].(string)
-
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
+		token, _ := account.Credentials["access_token"].(string)
+		if token == "" {
+			return ""
 		}
-	}
 
-	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
-	if mode == "" {
-		return ""
-	}
+		projectID, _ := account.Credentials["project_id"].(string)
 
-	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
-		logger.LegacyPrintf("service.admin", "update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
-		return mode
-	}
+		proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+		if err != nil {
+			logger.LegacyPrintf("service.admin", "antigravity_privacy_proxy_unavailable: account_id=%d err=%v", account.ID, err)
+			return ""
+		}
+
+		mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
+		if mode == "" {
+			return ""
+		}
+
+		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
+			logger.LegacyPrintf("service.admin", "update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
+			return mode
+		}
 	applyAntigravityPrivacyMode(account, mode)
 	return mode
 }
@@ -2068,29 +2067,28 @@ func (s *adminServiceImpl) ForceAntigravityPrivacy(ctx context.Context, account 
 		return ""
 	}
 
-	token, _ := account.Credentials["access_token"].(string)
-	if token == "" {
-		return ""
-	}
-
-	projectID, _ := account.Credentials["project_id"].(string)
-
-	var proxyURL string
-	if account.ProxyID != nil {
-		if p, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && p != nil {
-			proxyURL = p.URL()
+		token, _ := account.Credentials["access_token"].(string)
+		if token == "" {
+			return ""
 		}
-	}
 
-	mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
-	if mode == "" {
-		return ""
-	}
+		projectID, _ := account.Credentials["project_id"].(string)
 
-	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
-		logger.LegacyPrintf("service.admin", "force_update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
-		return mode
-	}
+		proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+		if err != nil {
+			logger.LegacyPrintf("service.admin", "force_antigravity_privacy_proxy_unavailable: account_id=%d err=%v", account.ID, err)
+			return ""
+		}
+
+		mode := setAntigravityPrivacy(ctx, token, projectID, proxyURL)
+		if mode == "" {
+			return ""
+		}
+
+		if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{"privacy_mode": mode}); err != nil {
+			logger.LegacyPrintf("service.admin", "force_update_antigravity_privacy_mode_failed: account_id=%d err=%v", account.ID, err)
+			return mode
+		}
 	applyAntigravityPrivacyMode(account, mode)
 	return mode
 }

@@ -178,7 +178,7 @@ const embeddedUrl = computed(() => {
   return buildEmbeddedUrl(
     menuItem.value.url,
     authStore.user?.id,
-    authStore.token,
+    null,
     pageTheme.value,
     locale.value,
   )
@@ -208,6 +208,29 @@ function isRelativeMarkdownAsset(src: string): boolean {
     .split('/')
     .filter((part) => part && part !== '.')
     .every((part) => part !== '..' && !part.includes('\\'))
+}
+
+async function rewriteAdminPageImages(html: string, slug: string): Promise<string> {
+  if (!authStore.isAdmin || !authStore.token) return html
+  const prefix = buildPageImageUrl(slug, 'x').replace(/x$/, '')
+  const urls = new Set<string>()
+  html.replace(/<img[^>]+src="([^"]+)"/gi, (_match, src: string) => {
+    if (src.startsWith(prefix)) urls.add(src)
+    return _match
+  })
+  let rewritten = html
+  for (const src of urls) {
+    try {
+      const resp = await fetch(src, {
+        headers: { Authorization: `Bearer ${authStore.token}` },
+      })
+      if (!resp.ok) continue
+      rewritten = rewritten.split(src).join(URL.createObjectURL(await resp.blob()))
+    } catch {
+      // Leave the original src when the authenticated fetch fails.
+    }
+  }
+  return rewritten
 }
 
 function buildPageImageUrl(slug: string, src: string): string {
@@ -260,7 +283,7 @@ async function fetchAndRenderMarkdown(slug: string) {
       }
     )
 
-    renderedHtml.value = withIds
+    renderedHtml.value = await rewriteAdminPageImages(withIds, slug)
     tocItems.value = toc
   } catch {
     renderedHtml.value = '<p class="text-red-500">Failed to load page</p>'

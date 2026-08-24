@@ -451,7 +451,10 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		if err != nil {
 			return nil, nil, err
 		}
-		targetURL = s.buildCustomRelayURL(validatedURL, "/v1/messages/count_tokens", account)
+			targetURL, err = s.buildCustomRelayURL(validatedURL, "/v1/messages/count_tokens", account)
+			if err != nil {
+				return nil, nil, err
+			}
 	}
 
 	clientHeaders := http.Header{}

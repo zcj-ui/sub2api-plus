@@ -52,6 +52,7 @@
       </div>
 
       <div
+        v-if="importHasOpenAIOAuth"
         class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 dark:border-dark-700 dark:bg-dark-800"
       >
         <div class="min-w-0">
@@ -157,6 +158,11 @@ const selectedFilesLabel = computed(() => {
   return t('admin.accounts.selectedCount', { count: files.value.length })
 })
 const fileListTitle = computed(() => files.value.map((item) => item.name).join(', '))
+const parsedImportAccounts = ref<AdminDataPayload['accounts']>([])
+
+const importHasOpenAIOAuth = computed(() =>
+  parsedImportAccounts.value.some((account) => account.platform === 'openai' && account.type === 'oauth')
+)
 
 const errorItems = computed(() => result.value?.errors || [])
 
@@ -168,6 +174,7 @@ watch(
       dragDepth.value = 0
       hasCreatedData.value = false
       result.value = null
+      parsedImportAccounts.value = []
       codex429GuardEnabled.value = false
       codex429GuardOverride.value = false
       if (fileInput.value) {
@@ -216,6 +223,8 @@ const setSelectedFiles = (sourceFiles: FileList | File[] | null | undefined) => 
   }
   files.value = picked
   result.value = null
+  parsedImportAccounts.value = []
+  void previewImportAccounts(picked)
 }
 
 const handleDragEnter = () => {
@@ -249,6 +258,20 @@ const readFileAsText = async (sourceFile: File): Promise<string> => {
     reader.onerror = () => reject(reader.error || new Error('Failed to read file'))
     reader.readAsText(sourceFile)
   })
+}
+
+const previewImportAccounts = async (sourceFiles: File[]) => {
+  const accounts: AdminDataPayload['accounts'] = []
+  for (const sourceFile of sourceFiles) {
+    try {
+      const parsed = JSON.parse(await readFileAsText(sourceFile))
+      if (!isValidDataPayload(parsed)) continue
+      accounts.push(...parsed.accounts)
+    } catch {
+      // Preview is best-effort; import still validates the file later.
+    }
+  }
+  parsedImportAccounts.value = accounts
 }
 
 const SUPPORTED_DATA_TYPES = ['sub2api-data', 'sub2api-bundle']

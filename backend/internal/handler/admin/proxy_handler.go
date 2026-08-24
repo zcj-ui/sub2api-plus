@@ -75,11 +75,13 @@ func (h *ProxyHandler) List(c *gin.Context) {
 		return
 	}
 
-	out := make([]dto.AdminProxyWithAccountCount, 0, len(proxies))
-	for i := range proxies {
-		out = append(out, *dto.ProxyWithAccountCountFromServiceAdmin(&proxies[i]))
-	}
-	response.Paginated(c, out, total, page, pageSize)
+		out := make([]dto.AdminProxyWithAccountCount, 0, len(proxies))
+		for i := range proxies {
+			item := *dto.ProxyWithAccountCountFromServiceAdmin(&proxies[i])
+			item.Password = ""
+			out = append(out, item)
+		}
+		response.Paginated(c, out, total, page, pageSize)
 }
 
 // GetAll handles getting all active proxies without pagination
@@ -94,26 +96,30 @@ func (h *ProxyHandler) GetAll(c *gin.Context) {
 			response.ErrorFrom(c, err)
 			return
 		}
-		out := make([]dto.AdminProxyWithAccountCount, 0, len(proxies))
+			out := make([]dto.AdminProxyWithAccountCount, 0, len(proxies))
+			for i := range proxies {
+				item := *dto.ProxyWithAccountCountFromServiceAdmin(&proxies[i])
+				item.Password = ""
+				out = append(out, item)
+			}
+			response.Success(c, out)
+			return
+		}
+
+		proxies, err := h.adminService.GetAllProxies(c.Request.Context())
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+
+		out := make([]dto.AdminProxy, 0, len(proxies))
 		for i := range proxies {
-			out = append(out, *dto.ProxyWithAccountCountFromServiceAdmin(&proxies[i]))
+			item := *dto.ProxyFromServiceAdmin(&proxies[i])
+			item.Password = ""
+			out = append(out, item)
 		}
 		response.Success(c, out)
-		return
 	}
-
-	proxies, err := h.adminService.GetAllProxies(c.Request.Context())
-	if err != nil {
-		response.ErrorFrom(c, err)
-		return
-	}
-
-	out := make([]dto.AdminProxy, 0, len(proxies))
-	for i := range proxies {
-		out = append(out, *dto.ProxyFromServiceAdmin(&proxies[i]))
-	}
-	response.Success(c, out)
-}
 
 // GetByID handles getting a proxy by ID
 // GET /api/v1/admin/proxies/:id
@@ -124,16 +130,20 @@ func (h *ProxyHandler) GetByID(c *gin.Context) {
 		return
 	}
 
-	proxy, err := h.adminService.GetProxy(c.Request.Context(), proxyID)
-	if err != nil {
-		response.ErrorFrom(c, err)
-		return
+		proxy, err := h.adminService.GetProxy(c.Request.Context(), proxyID)
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+
+		redacted := dto.ProxyFromServiceAdmin(proxy)
+		if redacted != nil {
+			redacted.Password = ""
+		}
+		response.Success(c, redacted)
 	}
 
-	response.Success(c, dto.ProxyFromServiceAdmin(proxy))
-}
-
-// Create handles creating a new proxy
+	// Create handles creating a new proxy
 // POST /api/v1/admin/proxies
 func (h *ProxyHandler) Create(c *gin.Context) {
 	var req CreateProxyRequest

@@ -36,8 +36,8 @@ const (
 	openaiQuotaSecFetchSite     = "none"
 	openaiQuotaSecFetchMode     = "no-cors"
 	openaiQuotaSecFetchDest     = "empty"
-	openaiQuotaResetCreditsKey  = "codex_reset_credit_snapshot"
-	openaiQuotaCreditBalanceKey = "codex_credit_snapshot"
+		openaiQuotaResetCreditsKey  = OpenAIQuotaResetCreditsExtraKey
+		openaiQuotaCreditBalanceKey = OpenAIQuotaCreditBalanceExtraKey
 )
 
 // OpenAIRateLimitWindow describes a single rate-limit window returned by
@@ -757,34 +757,34 @@ func buildCodexRateLimitWindowExtraUpdates(rateLimit *OpenAIRateLimit, now time.
 	}
 
 	updates := make(map[string]any)
-	if normalized.Used5hPercent != nil {
-		updates["codex_5h_used_percent"] = *normalized.Used5hPercent
-	}
-	if normalized.Reset5hSeconds != nil {
-		updates["codex_5h_reset_after_seconds"] = *normalized.Reset5hSeconds
-	}
-	if normalized.Window5hMinutes != nil {
-		updates["codex_5h_window_minutes"] = *normalized.Window5hMinutes
-	}
-	if normalized.Used7dPercent != nil {
-		updates["codex_7d_used_percent"] = *normalized.Used7dPercent
-	}
-	if normalized.Reset7dSeconds != nil {
-		updates["codex_7d_reset_after_seconds"] = *normalized.Reset7dSeconds
-	}
-	if normalized.Window7dMinutes != nil {
-		updates["codex_7d_window_minutes"] = *normalized.Window7dMinutes
-	}
-	if r := codexResetAtRFC3339(now, normalized.Reset5hSeconds); r != nil {
-		updates["codex_5h_reset_at"] = *r
-	}
-	if r := codexResetAtRFC3339(now, normalized.Reset7dSeconds); r != nil {
-		updates["codex_7d_reset_at"] = *r
-	}
-	if len(updates) == 0 {
-		return nil
-	}
-	updates["codex_usage_updated_at"] = now.Format(time.RFC3339)
+		if normalized.Used5hPercent != nil {
+			updates[OpenAIQuotaUsed5hPercentExtraKey] = *normalized.Used5hPercent
+		}
+		if normalized.Reset5hSeconds != nil {
+			updates[OpenAIQuotaReset5hSecondsExtraKey] = *normalized.Reset5hSeconds
+		}
+		if normalized.Window5hMinutes != nil {
+			updates[OpenAIQuotaWindow5hMinutesExtraKey] = *normalized.Window5hMinutes
+		}
+		if normalized.Used7dPercent != nil {
+			updates[OpenAIQuotaUsed7dPercentExtraKey] = *normalized.Used7dPercent
+		}
+		if normalized.Reset7dSeconds != nil {
+			updates[OpenAIQuotaReset7dSecondsExtraKey] = *normalized.Reset7dSeconds
+		}
+		if normalized.Window7dMinutes != nil {
+			updates[OpenAIQuotaWindow7dMinutesExtraKey] = *normalized.Window7dMinutes
+		}
+		if r := codexResetAtRFC3339(now, normalized.Reset5hSeconds); r != nil {
+			updates[OpenAIQuotaReset5hAtExtraKey] = *r
+		}
+		if r := codexResetAtRFC3339(now, normalized.Reset7dSeconds); r != nil {
+			updates[OpenAIQuotaReset7dAtExtraKey] = *r
+		}
+		if len(updates) == 0 {
+			return nil
+		}
+		updates[OpenAIQuotaUsageUpdatedAtExtraKey] = now.Format(time.RFC3339)
 	return updates
 }
 

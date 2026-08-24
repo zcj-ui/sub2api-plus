@@ -247,18 +247,34 @@ func (h *PageHandler) checkSlugVisibility(c *gin.Context, slug string) bool {
 	return true
 }
 
-// checkImageSlugVisibility checks visibility for image requests (no JWT available).
-// Only allows user-visible pages; admin-only pages are blocked.
-func (h *PageHandler) checkImageSlugVisibility(c *gin.Context, slug string) bool {
-	visibility, found := h.findSlugVisibility(c, slug)
-	if !found {
-		return false
+	// checkImageSlugVisibility checks visibility for image requests.
+	// User-visible pages stay public so <img> tags work. Admin-only pages
+	// require a verified admin JWT on the same request (the frontend fetches
+	// those images with Authorization and rewrites them to blob URLs).
+	func (h *PageHandler) checkImageSlugVisibility(c *gin.Context, slug string) bool {
+		visibility, found := h.findSlugVisibility(c, slug)
+		if !found {
+			return false
+		}
+		if visibility == "admin" {
+			role, _ := middleware2.GetUserRoleFromContext(c)
+			return role == "admin"
+		}
+		return true
 	}
-	return visibility != "admin"
-}
 
-// RegisterPageRoutes registers page routes on a router group.
-func RegisterPageRoutes(v1 *gin.RouterGroup, dataDir string, jwtAuth gin.HandlerFunc, adminAuth gin.HandlerFunc, settingService *service.SettingService) {
+	func optionalPageImageJWT(jwtAuth gin.HandlerFunc) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			if strings.TrimSpace(c.GetHeader("Authorization")) == "" {
+				c.Next()
+				return
+			}
+			jwtAuth(c)
+		}
+	}
+
+	// RegisterPageRoutes registers page routes on a router group.
+	func RegisterPageRoutes(v1 *gin.RouterGroup, dataDir string, jwtAuth gin.HandlerFunc, adminAuth gin.HandlerFunc, settingService *service.SettingService) {
 	h := NewPageHandler(dataDir, settingService)
 
 	// Authenticated page content (JWT required + visibility check)
@@ -268,11 +284,13 @@ func RegisterPageRoutes(v1 *gin.RouterGroup, dataDir string, jwtAuth gin.Handler
 		pages.GET("/:slug", h.GetPageContent)
 	}
 
-	// Images: no JWT (browser img tags can't carry tokens), visibility check in handler
-	pageImages := v1.Group("/pages")
-	{
-		pageImages.GET("/:slug/images/*filename", h.ServePageImage)
-	}
+		// Images: public pages stay unauthenticated; admin-only slugs accept an
+		// optional Bearer token so the markdown viewer can fetch them.
+		pageImages := v1.Group("/pages")
+		pageImages.Use(optionalPageImageJWT(jwtAuth))
+		{
+			pageImages.GET("/:slug/images/*filename", h.ServePageImage)
+		}
 
 	// Admin-only: list all available pages
 	adminPages := v1.Group("/pages")

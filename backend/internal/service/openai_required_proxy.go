@@ -69,11 +69,21 @@ func resolveRequiredOpenAIProxyURL(account *Account) (string, error) {
 	return resolveConfiguredProxyURL(account)
 }
 
-// resolveOpenAIAccountProxyURL applies configured-proxy pinning to OpenAI while
-// preserving the existing direct behavior of accounts without ProxyID.
-func resolveOpenAIAccountProxyURL(account *Account) (string, error) {
-	if account == nil {
-		return "", fmt.Errorf("account is unavailable")
+	// resolveOpenAIAccountProxyURL applies configured-proxy pinning to OpenAI while
+	// preserving the existing direct behavior of accounts without ProxyID.
+	func resolveOpenAIAccountProxyURL(account *Account) (string, error) {
+		if account == nil {
+			return "", fmt.Errorf("account is unavailable")
+		}
+		return resolveConfiguredProxyURL(account)
 	}
-	return resolveConfiguredProxyURL(account)
-}
+
+	// resolveProxyIDURL looks up an explicitly selected proxy. A missing or
+	// invalid proxy is a routing failure; nil proxyID stays direct.
+	func resolveProxyIDURL(ctx context.Context, proxyRepo ProxyRepository, proxyID *int64) (string, error) {
+		if proxyID == nil {
+			return "", nil
+		}
+		account := &Account{ProxyID: proxyID}
+		return resolveConfiguredProxyURLWithLookup(ctx, account, proxyRepo)
+	}

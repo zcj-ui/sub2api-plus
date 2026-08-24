@@ -111,11 +111,10 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		return nil, err
 	}
 
-	// 代理 URL
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
+		proxyURL, err := resolveConfiguredProxyURL(account)
+		if err != nil {
+			return nil, s.writeGoogleError(c, http.StatusBadGateway, err.Error())
+		}
 
 	// Antigravity 上游要求必须包含身份提示词，注入到请求中
 	injectedBody, err := injectIdentityPatchToGeminiRequest(body)

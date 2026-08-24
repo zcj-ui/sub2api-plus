@@ -158,6 +158,42 @@ func TestInventoryOpenAIAccountReportsQuotaPersistenceFailure(t *testing.T) {
 	require.Contains(t, result.Reason, "could not be persisted")
 }
 
+func TestInventoryOpenAIAccountHidesParentCreditsForSparkShadow(t *testing.T) {
+	parentID := int64(7)
+	shadow := &Account{
+		ID:              8,
+		Name:            "spark inventory",
+		Platform:        PlatformOpenAI,
+		Type:            AccountTypeOAuth,
+		ParentAccountID: &parentID,
+		QuotaDimension:  QuotaDimensionSpark,
+	}
+	repo := &healthProbeRepo{mockAccountRepoForGemini: mockAccountRepoForGemini{accountsByID: map[int64]*Account{8: shadow}}}
+	usage := &OpenAIQuotaUsage{
+		Credits: &OpenAICodexCredits{HasCredits: true, Balance: "250"},
+		RateLimit: &OpenAIRateLimit{
+			PrimaryWindow: &OpenAIRateLimitWindow{UsedPercent: 90},
+		},
+		AdditionalRateLimits: []OpenAIAdditionalRateLimit{
+			{
+				MeteredFeature: "codex_bengalfox",
+				RateLimit:      &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{UsedPercent: 12}},
+			},
+		},
+	}
+	quota := &inventoryQuotaStub{healthQuotaStub: &healthQuotaStub{usage: usage}}
+	svc := &AccountTestService{accountRepo: repo, openAIQuotaService: quota}
+
+	result := svc.InventoryOpenAIAccount(context.Background(), 8)
+
+	require.True(t, result.Healthy)
+	require.NotNil(t, result.Quota)
+	require.Nil(t, result.Quota.Credits)
+	require.NotNil(t, result.Quota.RateLimit)
+	require.InDelta(t, 12.0, result.Quota.RateLimit.PrimaryWindow.UsedPercent, 1e-9)
+	require.Equal(t, []int64{8}, quota.usageCacheIDs)
+}
+
 func TestInventoryOpenAIAccountSkipsQuotaCacheForUnsupportedAccount(t *testing.T) {
 	account := &Account{ID: 9, Name: "claude", Platform: PlatformAnthropic, Type: AccountTypeOAuth}
 	repo := &healthProbeRepo{mockAccountRepoForGemini: mockAccountRepoForGemini{accountsByID: map[int64]*Account{9: account}}}
