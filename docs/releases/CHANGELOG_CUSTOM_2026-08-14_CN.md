@@ -6,6 +6,12 @@
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
 
+## 0.2.6+ 官方同步至 `aa2c4e8d13` / `0.1.182`（本地合并，尚未发版）
+
+- 继续同步官方 `upstream/main` `e2d9b823f6..aa2c4e8d13`（22 提交 / 14 非合并提交）。
+- 纳入 Responses Lite 并行工具约束与大整数精度、WS HTTP 桥 Lite 规范化、OpenCode Go 用量重置文案解析、OAuth 图片 prompt 原样转发、Antigravity Sonnet 4.5/4.6 路由、Kimi K3 复合路由、支付完成后余额刷新、Anthropic cache TTL 去重计费、监控复合组平台解析。
+- 冲突按兼容处理：Plus 版本号保持 `0.2.6`，不采用官方 `0.1.182`；完整官方 CLI 快照 / device 模式指纹透传、两次明确 429、卡429 不进 Claude/CC、`proxy_id` fail-closed 均保留。
+
 ## 0.2.6+ 官方同步至 `e2d9b823f6`（本地合并，尚未发版）
 
 - 在保留 Plus 定制语义的前提下合并官方 `upstream/main` `32a0d9ba2d..e2d9b823f6`（213 提交 / 142 非合并提交）。

@@ -896,13 +896,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				firstClientMessage = withContextPair
 			}
 		}
-		if account.IsOpenAIOAuthLike() && isOpenAIResponsesLiteWebSocketPayload(firstClientMessage) {
-		liteFirstMessage, _, liteErr := normalizeOpenAIResponsesLiteToolsPayload(firstClientMessage)
-		if liteErr != nil {
-			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
-		}
-		firstClientMessage = liteFirstMessage
-	}
+			if isOpenAIResponsesLiteWebSocketPayload(firstClientMessage) {
+				liteFirstMessage, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(firstClientMessage, account)
+				if liteErr != nil {
+					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
+				}
+				firstClientMessage = liteFirstMessage
+			}
 	if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 		if capped, changed := ApplyOpenAIReasoningEffortPolicy(firstClientMessage, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 			firstClientMessage = capped
@@ -952,7 +952,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if capturedSessionModel != "" && capturedSessionModel != strings.TrimSpace(gjson.GetBytes(firstClientMessage, "model").String()) {
 		firstClientMessage = s.ReplaceModelInBody(firstClientMessage, capturedSessionModel)
 	}
-	if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(firstClientMessage, account); normalizeErr != nil {
+	firstMessageResponsesLite := isOpenAIResponsesLiteWebSocketPayload(firstClientMessage)
+	if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(firstClientMessage, account, firstMessageResponsesLite); normalizeErr != nil {
 		return fmt.Errorf("normalize first websocket response.create: %w", normalizeErr)
 	} else if compatibilityChanged {
 		firstClientMessage = normalized
@@ -1275,12 +1276,8 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					}
 				}()
 			}
+				responsesLite := isResponseCreate && isOpenAIResponsesLiteWebSocketPayload(payload)
 				if isResponseCreate {
-					if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-						if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
-							payload = capped
-						}
-					}
 					if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(payload) {
 						withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(payload)
 						if appendErr != nil {
@@ -1290,7 +1287,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 							payload = withContextPair
 						}
 					}
-					if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(payload, account); normalizeErr != nil {
+					if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(payload, account, responsesLite); normalizeErr != nil {
 						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeErr)
 					} else if compatibilityChanged {
 						payload = normalized
@@ -1306,25 +1303,30 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 						payload = aliasedBody
 					}
 				}
-					if (isResponseCreate || eventType == "session.update") &&
-						!shouldSkipCodexAccountIdentityRewrite(c, account, payload) {
-						accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-						if scopeErr != nil {
-							return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
-						}
-						if accountScoped {
-							payload = accountScopedPayload
-						}
+				if (isResponseCreate || eventType == "session.update") &&
+					!shouldSkipCodexAccountIdentityRewrite(c, account, payload) {
+					accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+					if scopeErr != nil {
+						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
 					}
-				if isResponseCreate {
-					if account.IsOpenAIOAuthLike() && isOpenAIResponsesLiteWebSocketPayload(payload) {
-					litePayload, _, liteErr := normalizeOpenAIResponsesLiteToolsPayload(payload)
-					if liteErr != nil {
-						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
+					if accountScoped {
+						payload = accountScopedPayload
 					}
-					payload = litePayload
 				}
-			}
+				if isResponseCreate {
+					if responsesLite {
+						litePayload, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(payload, account)
+						if liteErr != nil {
+							return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
+						}
+						payload = litePayload
+					}
+					if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
+						if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+							payload = capped
+						}
+					}
+				}
 			turnNo := int(completedTurns.Load()) + 1
 			if turnNo < 2 {
 				turnNo = 2
