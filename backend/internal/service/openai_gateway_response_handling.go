@@ -1711,16 +1711,19 @@ func bodyHasSSEFraming(body []byte) bool {
 func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
-	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
-		msg := extractOpenAISSEErrorMessage(terminalPayload)
-		if msg == "" {
-			msg = "Upstream compact response failed"
+		if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+			msg := extractOpenAISSEErrorMessage(terminalPayload)
+			if msg == "" {
+				msg = "Upstream compact response failed"
+			}
+			if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
+				return nil, compactErr
+			}
+			if failoverErr := s.nonStreamingFailedEventFailover(c, account, false, resp, terminalPayload, msg); failoverErr != nil {
+				return nil, failoverErr
+			}
+			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
-		if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
-			return nil, compactErr
-		}
-		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
-	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
 
 	usage := s.parseSSEUsageFromBody(bodyText)

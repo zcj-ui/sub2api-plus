@@ -247,10 +247,11 @@ func TestOfficialCodexIdentityUsesCanonicalOnWebSocketHandshake(t *testing.T) {
 	requireCanonicalCodexWSHandshakeIdentity(t, headers)
 }
 
-func TestOfficialCodexWSMovesClientTurnStateAndResponsesLiteIntoPayload(t *testing.T) {
-	c, account, body := newCompleteOfficialCodexIdentityContext(t)
-	c.Request.Header.Set("X-Codex-Turn-State", "client-state")
-	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	func TestOfficialCodexWSMovesClientTurnStateAndResponsesLiteIntoPayload(t *testing.T) {
+		c, account, body := newCompleteOfficialCodexIdentityContext(t)
+		c.Request.Header.Set("X-Codex-Turn-State", "client-state")
+		require.True(t, captureCodexClientIdentityPassthrough(c, account, c.Request.Header, body))
+		svc := &OpenAIGatewayService{cfg: &config.Config{}}
 
 	headers, _, err := svc.buildOpenAIWSHeadersWithBody(
 		context.Background(), c, account, "oauth-token",

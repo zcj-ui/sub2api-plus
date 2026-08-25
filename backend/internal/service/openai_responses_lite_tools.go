@@ -1,11 +1,10 @@
 package service
 
-import (
-	"encoding/json"
-	"fmt"
-	"reflect"
-	"strings"
-)
+	import (
+		"fmt"
+		"reflect"
+		"strings"
+	)
 
 type openAIResponsesLiteValidationError struct {
 	param   string
@@ -252,11 +251,11 @@ func openAIResponsesLiteToolIdentityForError(rawTool any) string {
 	return fmt.Sprintf("tool type %q name %q", strings.TrimSpace(firstNonEmptyString(tool["type"])), strings.TrimSpace(firstNonEmptyString(tool["name"])))
 }
 
-func normalizeOpenAIResponsesLiteToolsPayload(body []byte) ([]byte, bool, error) {
-	var requestBody map[string]any
-	if err := json.Unmarshal(body, &requestBody); err != nil {
-		return body, false, fmt.Errorf("decode responses Lite request body: %w", err)
-	}
+	func normalizeOpenAIResponsesLiteToolsPayload(body []byte) ([]byte, bool, error) {
+		var requestBody map[string]any
+		if err := decodeOpenAIJSONUseNumber(body, &requestBody); err != nil {
+			return body, false, fmt.Errorf("decode responses Lite request body: %w", err)
+		}
 	changed, err := normalizeOpenAIResponsesLiteTools(requestBody)
 	if err != nil || !changed {
 		return body, false, err

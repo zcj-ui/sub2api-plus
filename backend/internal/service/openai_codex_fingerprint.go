@@ -159,14 +159,19 @@ func normalizeOpenAIOAuthSessionHeadersForIsolation(
 	rawThreadID string,
 	rawRequestID string,
 	rawConversationID string,
+	account ...*Account,
 ) {
 	if h == nil {
 		return
 	}
+	var identity *Account
+	if len(account) > 0 {
+		identity = account[0]
+	}
 
 	sessionID := ""
 	if rawSessionID = strings.TrimSpace(rawSessionID); rawSessionID != "" {
-		sessionID = isolateOpenAISessionID(apiKeyID, rawSessionID)
+		sessionID = isolateOpenAIOAuthSessionValue(apiKeyID, identity, rawSessionID)
 	} else {
 		sessionID = strings.TrimSpace(h.Get("session_id"))
 		if sessionID == "" {
@@ -180,7 +185,7 @@ func normalizeOpenAIOAuthSessionHeadersForIsolation(
 
 	threadID := ""
 	if rawThreadID = strings.TrimSpace(rawThreadID); rawThreadID != "" {
-		threadID = isolateOpenAISessionID(apiKeyID, rawThreadID)
+		threadID = isolateOpenAIOAuthSessionValue(apiKeyID, identity, rawThreadID)
 	} else {
 		threadID = strings.TrimSpace(h.Get("thread_id"))
 		if threadID == "" {
@@ -193,13 +198,13 @@ func normalizeOpenAIOAuthSessionHeadersForIsolation(
 	}
 
 	if rawRequestID = strings.TrimSpace(rawRequestID); rawRequestID != "" {
-		h.Set("x-client-request-id", isolateOpenAISessionID(apiKeyID, rawRequestID))
+		h.Set("x-client-request-id", isolateOpenAIOAuthSessionValue(apiKeyID, identity, rawRequestID))
 	} else if threadID != "" {
 		h.Set("x-client-request-id", threadID)
 	}
 
 	if rawConversationID = strings.TrimSpace(rawConversationID); rawConversationID != "" {
-		h.Set("conversation_id", isolateOpenAISessionID(apiKeyID, rawConversationID))
+		h.Set("conversation_id", isolateOpenAIOAuthSessionValue(apiKeyID, identity, rawConversationID))
 	}
 }
 
@@ -470,6 +475,54 @@ func shouldPreserveCodexClientSessionIdentityForRequest(c *gin.Context, account 
 		codexFingerprintRuntimeMode(ids.mode) == codexFingerprintDevice &&
 		!ids.projectionMalformed &&
 		strings.TrimSpace(ids.installationID) != ""
+}
+
+func inboundCodexIdentityHeaders(c *gin.Context) http.Header {
+	if c != nil && c.Request != nil {
+		return c.Request.Header
+	}
+	return nil
+}
+
+func frozenCodexClientIdentityPassthrough(c *gin.Context, account *Account) bool {
+	if account == nil || !account.IsOpenAIOAuth() || c == nil {
+		return false
+	}
+	if isOpenAIResponsesCompactPath(c) {
+		return false
+	}
+	value, exists := c.Get(codexClientIdentityPassthroughContextKey)
+	preserve, ok := value.(bool)
+	return exists && ok && preserve
+}
+
+// shouldSkipCodexAccountIdentityRewrite reports whether official UUIDv4 account
+// namespacing must leave identity fields alone. A frozen official CLI snapshot
+// is a true pass-through. Device mode never uses that overlay: well-formed
+// device requests keep the caller session/thread, and malformed ones use
+// API-key isolation instead of a second account-scoped UUID.
+func shouldSkipCodexAccountIdentityRewrite(c *gin.Context, account *Account, body []byte) bool {
+	_ = body
+	if account == nil || !account.IsOpenAIOAuth() {
+		return false
+	}
+	if c != nil && isOpenAIResponsesCompactPath(c) {
+		return false
+	}
+	return frozenCodexClientIdentityPassthrough(c, account) ||
+		shouldPreserveCodexClientSessionIdentity(account)
+}
+
+func shouldPreserveOutboundCodexClientSession(c *gin.Context, account *Account) bool {
+	return frozenCodexClientIdentityPassthrough(c, account) ||
+		shouldPreserveCodexClientSessionIdentityForRequest(c, account)
+}
+
+func isolateOpenAIOAuthSessionValue(apiKeyID int64, account *Account, raw string) string {
+	if shouldPreserveCodexClientSessionIdentity(account) {
+		return isolateOpenAISessionID(apiKeyID, raw)
+	}
+	return isolateOpenAIUpstreamSessionID(apiKeyID, account, raw)
 }
 
 // hasValidStagedCodexFingerprint reports whether this request already has an

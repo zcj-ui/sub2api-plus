@@ -188,13 +188,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				}
 			}
 
-			accountScopedBody, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(body, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-			if scopeErr != nil {
-				return nil, scopeErr
-			}
-			if accountScoped {
-				body = accountScopedBody
-			}
+				if !isOpenAIResponsesCompactPath(c) && !shouldSkipCodexAccountIdentityRewrite(c, account, body) {
+					accountScopedBody, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(body, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+					if scopeErr != nil {
+						return nil, scopeErr
+					}
+					if accountScoped {
+						body = accountScopedBody
+					}
+				}
 			reqStream = gjson.GetBytes(body, "stream").Bool()
 		}
 	if account != nil && account.IsOpenAI() {
@@ -699,10 +701,9 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		clientSessionID := strings.TrimSpace(req.Header.Get("session_id"))
 		clientConversationID = strings.TrimSpace(req.Header.Get("conversation_id"))
 		clientCanonicalSessionID := firstHeaderValue(req.Header, "session-id", "session_id")
-		clientCanonicalThreadID = firstHeaderValue(req.Header, "thread-id", "thread_id")
-		clientCanonicalRequestID = firstHeaderValue(req.Header, "x-client-request-id")
-		preserveCodexSession := shouldPreserveCodexClientSessionIdentityForRequest(c, account)
-		if isOpenAIResponsesCompactPath(c) {
+			clientCanonicalThreadID = firstHeaderValue(req.Header, "thread-id", "thread_id")
+			clientCanonicalRequestID = firstHeaderValue(req.Header, "x-client-request-id")
+			if isOpenAIResponsesCompactPath(c) {
 			req.Header.Set("accept", "application/json")
 			if req.Header.Get("version") == "" {
 				req.Header.Set("version", canonical.version)
@@ -722,25 +723,29 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 		if clientConversationID == "" {
 			clientConversationID = promptCacheKey
 		}
-		if clientSessionID != "" {
-			req.Header.Set("session_id", isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), clientSessionID))
-		}
-		if clientConversationID != "" {
-			req.Header.Set("conversation_id", isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), clientConversationID))
-		}
-		if preserveCodexSession {
-			if clientCanonicalSessionID != "" {
-				req.Header.Set("session-id", clientCanonicalSessionID)
-				req.Header.Set("session_id", clientCanonicalSessionID)
+			preserveSession := shouldPreserveOutboundCodexClientSession(c, account)
+			if clientSessionID != "" && !preserveSession {
+				req.Header.Set("session_id", isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), clientSessionID))
 			}
-			if clientCanonicalThreadID != "" {
-				req.Header.Set("thread-id", clientCanonicalThreadID)
-				req.Header.Set("thread_id", clientCanonicalThreadID)
+			if clientConversationID != "" && !preserveSession {
+				req.Header.Set("conversation_id", isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), clientConversationID))
 			}
-			if clientCanonicalRequestID != "" {
-				req.Header.Set("x-client-request-id", clientCanonicalRequestID)
+			if preserveSession {
+				if clientCanonicalSessionID != "" {
+					req.Header.Set("session-id", clientCanonicalSessionID)
+					req.Header.Set("session_id", clientCanonicalSessionID)
+				}
+				if clientCanonicalThreadID != "" {
+					req.Header.Set("thread-id", clientCanonicalThreadID)
+					req.Header.Set("thread_id", clientCanonicalThreadID)
+				}
+				if clientCanonicalRequestID != "" {
+					req.Header.Set("x-client-request-id", clientCanonicalRequestID)
+				}
+				if frozenCodexClientIdentityPassthrough(c, account) && clientConversationID != "" {
+					req.Header.Set("conversation_id", clientConversationID)
+				}
 			}
-		}
 	} else if isOpenAIResponsesCompactPath(c) {
 		req.Header.Set("accept", "application/json")
 	}
@@ -751,17 +756,20 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		req.Header.Set("user-agent", CodexCanonicalUserAgent())
 	}
-		if account.UsesOpenAICodexProtocol() && !shouldPreserveCodexClientSessionIdentityForRequest(c, account) {
-			normalizeOpenAIOAuthSessionHeadersForIsolation(
-				req.Header,
-				apiKeyID,
-				firstHeaderValue(c.Request.Header, "session-id", "session_id"),
-				clientCanonicalThreadID,
-				clientCanonicalRequestID,
-				clientConversationID,
-			)
-		}
-		applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+			if account.UsesOpenAICodexProtocol() && !shouldPreserveOutboundCodexClientSession(c, account) {
+				normalizeOpenAIOAuthSessionHeadersForIsolation(
+					req.Header,
+					apiKeyID,
+					firstHeaderValue(c.Request.Header, "session-id", "session_id"),
+					clientCanonicalThreadID,
+					clientCanonicalRequestID,
+					clientConversationID,
+					codexAccountIdentitySource(c, account),
+				)
+			}
+			if !shouldSkipCodexAccountIdentityRewrite(c, account, body) {
+				applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+			}
 
 		// 指纹收敛：使用 forwardOpenAIPassthrough 中预计算的收敛 ID 改写出站头，
 		// 与请求体 client_metadata 共享同一份 IDs（与非透传路径相同的相对位置：
@@ -2282,16 +2290,19 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
 	bodyText := string(body)
 	terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
-	if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
-		msg := extractOpenAISSEErrorMessage(terminalPayload)
-		if msg == "" {
-			msg = "Upstream compact response failed"
+		if terminalOK && (terminalType == "response.failed" || terminalType == "error") {
+			msg := extractOpenAISSEErrorMessage(terminalPayload)
+			if msg == "" {
+				msg = "Upstream compact response failed"
+			}
+			if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
+				return nil, compactErr
+			}
+			if failoverErr := s.nonStreamingFailedEventFailover(c, account, true, resp, terminalPayload, msg); failoverErr != nil {
+				return nil, failoverErr
+			}
+			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
-		if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
-			return nil, compactErr
-		}
-		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
-	}
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
 
 	usage := s.parseSSEUsageFromBody(bodyText)

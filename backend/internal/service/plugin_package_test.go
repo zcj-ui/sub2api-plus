@@ -10,9 +10,10 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"os"
-	"path/filepath"
-	"testing"
+		"os"
+		"path/filepath"
+		"runtime"
+		"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	pluginv1 "github.com/Wei-Shaw/sub2api/pkg/pluginapi/v1"
@@ -27,15 +28,22 @@ func TestPluginPackageInstallerInstallUnsignedDevelopmentPackage(t *testing.T) {
 
 	installation, err := installer.Install(context.Background(), bytes.NewReader(archive), nil)
 
-	require.NoError(t, err)
-	assert.Equal(t, PluginStateDisabled, installation.State)
-	assert.Equal(t, PluginSignatureUnsigned, installation.SignatureStatus)
-	assert.FileExists(t, installation.ArtifactPath)
-	info, statErr := os.Stat(installation.BinaryPath)
-	require.NoError(t, statErr)
-	assert.NotZero(t, info.Mode()&0o100)
-	assert.Contains(t, installation.InstallPath, filepath.Join("installed", "com.example.openai-transport"))
-}
+		require.NoError(t, err)
+		assert.Equal(t, PluginStateDisabled, installation.State)
+		assert.Equal(t, PluginSignatureUnsigned, installation.SignatureStatus)
+		assert.FileExists(t, installation.ArtifactPath)
+		info, statErr := os.Stat(installation.BinaryPath)
+		require.NoError(t, statErr)
+		require.False(t, info.IsDir())
+		if runtime.GOOS != "windows" {
+			assert.NotZero(t, info.Mode()&0o100)
+		}
+		assert.Contains(t, installation.InstallPath, filepath.Join("installed", "com.example.openai-transport"))
+		t.Cleanup(func() {
+			_ = os.RemoveAll(installation.InstallPath)
+			_ = os.Remove(installation.ArtifactPath)
+		})
+	}
 
 func TestPluginPackageInstallerAllowsRepeatedIdenticalUpload(t *testing.T) {
 	cfg := testPluginConfig(t.TempDir(), true)
@@ -49,9 +57,15 @@ func TestPluginPackageInstallerAllowsRepeatedIdenticalUpload(t *testing.T) {
 
 	assert.NotEqual(t, first.InstallPath, second.InstallPath)
 	assert.NotEqual(t, first.ArtifactPath, second.ArtifactPath)
-	assert.FileExists(t, first.BinaryPath)
-	assert.FileExists(t, second.BinaryPath)
-}
+		assert.FileExists(t, first.BinaryPath)
+		assert.FileExists(t, second.BinaryPath)
+		t.Cleanup(func() {
+			_ = os.RemoveAll(first.InstallPath)
+			_ = os.RemoveAll(second.InstallPath)
+			_ = os.Remove(first.ArtifactPath)
+			_ = os.Remove(second.ArtifactPath)
+		})
+	}
 
 func TestPluginPackageInstallerRejectsUnsignedPackageByDefault(t *testing.T) {
 	cfg := testPluginConfig(t.TempDir(), false)

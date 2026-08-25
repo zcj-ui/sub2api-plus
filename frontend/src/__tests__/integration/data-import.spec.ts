@@ -361,6 +361,7 @@ describe('ImportDataModal', () => {
       makeJsonFile('codex.json', JSON.stringify({ exported_at: '2026-08-13T00:00:00Z', proxies: [], accounts: [makeAccount('codex')] }))
     ])
     await input.trigger('change')
+    await flushPromises()
     await wrapper.get('[data-test="codex-429-guard-toggle"]').trigger('click')
     await wrapper.find('form').trigger('submit')
     await flushPromises()

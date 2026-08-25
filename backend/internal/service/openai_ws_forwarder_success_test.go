@@ -466,14 +466,14 @@ func TestOpenAIGatewayService_BuildOpenAIWSHeadersDeviceModePreservesNamespacedC
 		"",
 	)
 
-	require.NoError(t, err)
-	require.Equal(t, ids.installationID, headers.Get("x-codex-installation-id"))
-	require.NotEqual(t, "client-installation", headers.Get("x-codex-installation-id"))
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "window", "client-window"), headers.Get("x-codex-window-id"))
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "session", "client-session"), headers.Get("session-id"))
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "thread", "client-thread"), headers.Get("thread-id"))
-	require.Equal(t, scopeCodexAccountIdentityValue(account, 0, "request", "client-request"), headers.Get("x-client-request-id"))
-}
+		require.NoError(t, err)
+		require.Equal(t, ids.installationID, headers.Get("x-codex-installation-id"))
+		require.NotEqual(t, "client-installation", headers.Get("x-codex-installation-id"))
+		require.Equal(t, "client-window", headers.Get("x-codex-window-id"))
+		require.Equal(t, "client-session", headers.Get("session-id"))
+		require.Equal(t, "client-thread", headers.Get("thread-id"))
+		require.Equal(t, "client-request", headers.Get("x-client-request-id"))
+	}
 
 func TestLogOpenAIWSBindResponseAccountWarn(t *testing.T) {
 	require.NotPanics(t, func() {

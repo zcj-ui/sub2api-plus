@@ -515,15 +515,19 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if !isCompactRequest && applyCodexClientMetadata(decoded, account) {
 				markDecodedModified()
 			}
-			if currentClientPromptCacheKey, ok := decoded["prompt_cache_key"].(string); ok {
-				clientPromptCacheKey = currentClientPromptCacheKey
-			}
-			// Account namespace is orthogonal to fingerprint convergence: preserve
-			// each client's identity cardinality, but never reuse it across OAuth
-			// credentials after scheduler failover.
-			if !isCompactRequest && applyCodexAccountIdentityClientMetadataMap(decoded, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c)) {
-				markDecodedModified()
-			}
+				if currentClientPromptCacheKey, ok := decoded["prompt_cache_key"].(string); ok {
+					clientPromptCacheKey = currentClientPromptCacheKey
+				}
+				// Account namespace is orthogonal to fingerprint convergence: preserve
+				// each client's identity cardinality, but never reuse it across OAuth
+				// credentials after scheduler failover. Complete official snapshots and
+				// well-formed device-mode requests keep the client-owned lifecycle.
+				identityBody, _ := marshalOpenAIUpstreamJSON(decoded)
+				if !isCompactRequest &&
+					!shouldSkipCodexAccountIdentityRewrite(c, account, identityBody) &&
+					applyCodexAccountIdentityClientMetadataMap(decoded, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c)) {
+					markDecodedModified()
+				}
 			// 指纹收敛：一次性解析收敛 ID，请求体和出站头共享同一份快照，
 			// 保证 turn_id / timestamp 在不同载体中一致。
 			stageCodexFingerprintIDs(c, nil)
@@ -1422,26 +1426,30 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		} else {
 			req.Header.Set("accept", "text/event-stream")
 		}
-		if promptCacheKey != "" {
-			isolated := isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey)
-			req.Header.Set("session_id", isolated)
-			if !compatMessagesBridge || clientConversationID != "" {
-				req.Header.Set("conversation_id", isolated)
+			preserveSession := shouldPreserveOutboundCodexClientSession(c, account)
+			if promptCacheKey != "" && !preserveSession {
+				isolated := isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey)
+				req.Header.Set("session_id", isolated)
+				if !compatMessagesBridge || clientConversationID != "" {
+					req.Header.Set("conversation_id", isolated)
+				}
 			}
-		}
-		if shouldPreserveCodexClientSessionIdentityForRequest(c, account) {
-			if clientSessionID != "" {
-				req.Header.Set("session-id", clientSessionID)
-				req.Header.Set("session_id", clientSessionID)
+			if preserveSession {
+				if clientSessionID != "" {
+					req.Header.Set("session-id", clientSessionID)
+					req.Header.Set("session_id", clientSessionID)
+				}
+				if clientThreadID != "" {
+					req.Header.Set("thread-id", clientThreadID)
+					req.Header.Set("thread_id", clientThreadID)
+				}
+				if clientRequestID != "" {
+					req.Header.Set("x-client-request-id", clientRequestID)
+				}
+				if frozenCodexClientIdentityPassthrough(c, account) && clientConversationID != "" {
+					req.Header.Set("conversation_id", clientConversationID)
+				}
 			}
-			if clientThreadID != "" {
-				req.Header.Set("thread-id", clientThreadID)
-				req.Header.Set("thread_id", clientThreadID)
-			}
-			if clientRequestID != "" {
-				req.Header.Set("x-client-request-id", clientRequestID)
-			}
-		}
 	} else if isOpenAIResponsesCompactPath(c) {
 		// Compact is a unary JSON endpoint even for API-key accounts.
 		req.Header.Set("accept", "application/json")
@@ -1457,19 +1465,22 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		req.Header.Set("user-agent", CodexCanonicalUserAgent())
 	}
 
-		if account.UsesOpenAICodexProtocol() && !shouldPreserveCodexClientSessionIdentityForRequest(c, account) {
-			normalizeOpenAIOAuthSessionHeadersForIsolation(
-				req.Header,
-				apiKeyID,
-				clientSessionID,
-				clientThreadID,
-				clientRequestID,
-				clientConversationID,
-			)
-		}
-		// 账号 namespace 不改变客户端身份基数，但确保 scheduler failover 后不会把
-		// 同一组 Codex IDs 发送给另一份 OAuth 凭据。可选指纹收敛随后仍可覆盖这些值。
-		applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+			if account.UsesOpenAICodexProtocol() && !shouldPreserveOutboundCodexClientSession(c, account) {
+				normalizeOpenAIOAuthSessionHeadersForIsolation(
+					req.Header,
+					apiKeyID,
+					clientSessionID,
+					clientThreadID,
+					clientRequestID,
+					clientConversationID,
+					codexAccountIdentitySource(c, account),
+				)
+			}
+			// 账号 namespace 不改变客户端身份基数，但确保 scheduler failover 后不会把
+			// 同一组 Codex IDs 发送给另一份 OAuth 凭据。可选指纹收敛随后仍可覆盖这些值。
+			if !shouldSkipCodexAccountIdentityRewrite(c, account, body) {
+				applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+			}
 		// Header and body projections must consume the same staged lifecycle
 		// snapshot. Apply them after generic tenant isolation so session/full modes
 		// cannot be overwritten by the client's raw aliases.

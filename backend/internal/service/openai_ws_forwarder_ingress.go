@@ -232,10 +232,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 
 		// 仅在确实需要修改 payload 且 sjson 失败时，退回 map 路径确保兼容性。
-		payload := make(map[string]any)
-		if unmarshalErr := json.Unmarshal(current, &payload); unmarshalErr != nil {
-			return nil, err
-		}
+			payload := make(map[string]any)
+			if unmarshalErr := decodeOpenAIJSONUseNumber(current, &payload); unmarshalErr != nil {
+				return nil, err
+			}
 		switch path {
 		case "type", "model":
 			payload[path] = value
@@ -244,10 +244,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		default:
 			return nil, err
 		}
-		rebuilt, marshalErr := json.Marshal(payload)
-		if marshalErr != nil {
-			return nil, marshalErr
-		}
+			rebuilt, marshalErr := marshalOpenAIUpstreamJSON(payload)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
 		return rebuilt, nil
 	}
 
@@ -345,14 +345,16 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				normalized = withContextPair
 			}
 		}
-		accountIdentitySourceRaw := append([]byte(nil), normalized...)
-		accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(normalized, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-		if scopeErr != nil {
-			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
-		}
-		if accountScoped {
-			normalized = accountScopedPayload
-		}
+			accountIdentitySourceRaw := append([]byte(nil), normalized...)
+			if !shouldSkipCodexAccountIdentityRewrite(c, account, normalized) {
+				accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(normalized, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+				if scopeErr != nil {
+					return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
+				}
+				if accountScoped {
+					normalized = accountScopedPayload
+				}
+			}
 		if account.IsOpenAIOAuthLike() && isOpenAIResponsesLiteWebSocketPayload(normalized) {
 			litePayload, _, liteErr := normalizeOpenAIResponsesLiteToolsPayload(normalized)
 			if liteErr != nil {
@@ -396,13 +398,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				bridgeModified = true
 				logOpenAIWSModeInfo("ingress_ws_codex_image_bridge_instructions_added account_id=%d", account.ID)
 			}
-			if bridgeModified {
-				rebuilt, marshalErr := json.Marshal(payloadMap)
-				if marshalErr != nil {
-					return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", marshalErr)
+				if bridgeModified {
+					rebuilt, marshalErr := marshalOpenAIUpstreamJSON(payloadMap)
+					if marshalErr != nil {
+						return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", marshalErr)
+					}
+					normalized = rebuilt
 				}
-				normalized = rebuilt
-			}
 		}
 		requestModel := originalModel
 		if hooks != nil && hooks.MapRequestModel != nil {

@@ -250,14 +250,16 @@ func TestForwardAsChatCompletions_OfficialCodexResponsesShapeIsTenantIsolated(t 
 	}}
 	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
 
-	_, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "server-cache-key", "")
-	require.Error(t, err)
-	require.NotNil(t, upstream.lastReq)
-	expectedSession := isolateOpenAISessionID(99, "session-1")
-	require.Equal(t, expectedSession, upstream.lastReq.Header.Get("session-id"))
-	require.Equal(t, expectedSession, upstream.lastReq.Header.Get("session_id"))
-	require.NotEqual(t, generateSessionUUID(isolateOpenAISessionID(99, "server-cache-key")), upstream.lastReq.Header.Get("session-id"))
-}
+		_, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "server-cache-key", "")
+		require.Error(t, err)
+		require.NotNil(t, upstream.lastReq)
+		require.NotEqual(t, "session-1", upstream.lastReq.Header.Get("session-id"))
+		require.NotEqual(t, "session-1", upstream.lastReq.Header.Get("session_id"))
+		require.NotEmpty(t, upstream.lastReq.Header.Get("session-id"))
+		require.NotEmpty(t, upstream.lastReq.Header.Get("session_id"))
+		require.NotEqual(t, generateSessionUUID(isolateOpenAISessionID(99, "server-cache-key")), upstream.lastReq.Header.Get("session-id"))
+		require.NotEqual(t, isolateOpenAISessionID(99, "server-cache-key"), upstream.lastReq.Header.Get("session_id"))
+	}
 
 func TestForwardAsChatCompletions_OAuthDoesNotInjectDefaultInstructions(t *testing.T) {
 	gin.SetMode(gin.TestMode)

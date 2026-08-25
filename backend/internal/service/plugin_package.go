@@ -103,15 +103,15 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 	}
 	artifactSHA := hex.EncodeToString(hasher.Sum(nil))
 
-	archive, err := zip.OpenReader(tempPath)
-	if err != nil {
-		return nil, fmt.Errorf("插件包不是有效的 ZIP: %w", err)
-	}
-	defer func() { _ = archive.Close() }()
-	manifest, _, signatureStatus, err := i.inspectArchive(&archive.Reader)
-	if err != nil {
-		return nil, err
-	}
+		archive, err := zip.OpenReader(tempPath)
+		if err != nil {
+			return nil, fmt.Errorf("插件包不是有效的 ZIP: %w", err)
+		}
+		manifest, _, signatureStatus, err := i.inspectArchive(&archive.Reader)
+		if err != nil {
+			_ = archive.Close()
+			return nil, err
+		}
 	compatibility := EvaluatePluginCompatibility(manifest, i.hostInfo)
 	initialState := PluginStateDisabled
 	if !compatibility.Compatible {
@@ -134,19 +134,23 @@ func (i *PluginPackageInstaller) Install(ctx context.Context, reader io.Reader, 
 			_ = os.RemoveAll(extractPath)
 		}
 	}()
-	if err := i.extractArchive(ctx, &archive.Reader, manifest, extractPath); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(extractPath, installPath); err != nil {
-		return nil, fmt.Errorf("提交插件安装目录: %w", err)
-	}
-	extracted = true
+			if err := i.extractArchive(ctx, &archive.Reader, manifest, extractPath); err != nil {
+				_ = archive.Close()
+				return nil, err
+			}
+			if err := archive.Close(); err != nil {
+				return nil, fmt.Errorf("关闭插件包: %w", err)
+			}
+		if err := renameOrCopyPluginPath(extractPath, installPath); err != nil {
+			return nil, fmt.Errorf("提交插件安装目录: %w", err)
+		}
+		extracted = true
 
-	artifactPath := filepath.Join(packagesDir, manifest.ID+"-"+manifest.Version+"-"+artifactSHA[:12]+"-"+installNonce+".s2plugin")
-	if err := os.Rename(tempPath, artifactPath); err != nil {
-		_ = os.RemoveAll(installPath)
-		return nil, fmt.Errorf("保存插件包: %w", err)
-	}
+		artifactPath := filepath.Join(packagesDir, manifest.ID+"-"+manifest.Version+"-"+artifactSHA[:12]+"-"+installNonce+".s2plugin")
+		if err := renameOrCopyPluginPath(tempPath, artifactPath); err != nil {
+			_ = os.RemoveAll(installPath)
+			return nil, fmt.Errorf("保存插件包: %w", err)
+		}
 	committed = true
 	artifactData, err := os.ReadFile(artifactPath)
 	if err != nil {
@@ -342,10 +346,13 @@ func (i *PluginPackageInstaller) extractArchive(ctx context.Context, archive *zi
 		if extractedBytes > extractLimit {
 			return errors.New("插件包实际解压体积超过限制")
 		}
-		if actual := hex.EncodeToString(hasher.Sum(nil)); actual != expectedHash {
-			return fmt.Errorf("插件文件哈希不匹配: %s", path)
+			if actual := hex.EncodeToString(hasher.Sum(nil)); actual != expectedHash {
+				return fmt.Errorf("插件文件哈希不匹配: %s", path)
+			}
+			if err := os.Chmod(destination, mode); err != nil {
+				return fmt.Errorf("设置插件文件权限 %s: %w", path, err)
+			}
 		}
-	}
 	return nil
 }
 
@@ -384,4 +391,87 @@ func readPluginZipFile(file *zip.File, limit int64) ([]byte, error) {
 		return nil, errors.New("插件文件超过读取限制")
 	}
 	return data, nil
+}
+
+func renameOrCopyPluginPath(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if !pluginRenameNeedsCopy(err) {
+		return err
+	}
+	info, statErr := os.Stat(src)
+	if statErr != nil {
+		return statErr
+	}
+	if info.IsDir() {
+		if err := copyPluginDir(src, dst); err != nil {
+			_ = os.RemoveAll(dst)
+			return err
+		}
+		return os.RemoveAll(src)
+	}
+	if err := copyPluginFile(src, dst); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
+}
+
+	func pluginRenameNeedsCopy(err error) bool {
+		if err == nil {
+			return false
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return true
+		}
+		msg := strings.ToLower(err.Error())
+		return strings.Contains(msg, "being used by another process") ||
+			strings.Contains(msg, "access is denied") ||
+			strings.Contains(msg, "directory is not empty") ||
+			strings.Contains(msg, "cross-device") ||
+			strings.Contains(msg, "exdev")
+	}
+
+func copyPluginFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func copyPluginDir(src, dst string) error {
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return err
+	}
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(src, path)
+		if relErr != nil {
+			return relErr
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o700)
+		}
+		return copyPluginFile(path, target)
+	})
 }
