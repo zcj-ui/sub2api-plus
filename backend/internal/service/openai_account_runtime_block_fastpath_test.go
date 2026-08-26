@@ -15,7 +15,7 @@ import (
 )
 
 type oauth429RateLimitRepo struct {
-	AccountRepository
+	mockAccountRepoForGemini
 	setRateLimitedCalls  int
 	lastRateLimitedUntil time.Time
 }

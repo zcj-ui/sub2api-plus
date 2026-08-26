@@ -63,6 +63,49 @@ type OpenAIOAuth429FailoverState struct {
 	grokOAuth429FollowupPending bool
 }
 
+type openAIOAuth429Disposition uint8
+
+const (
+	openAIOAuth429Transient openAIOAuth429Disposition = iota
+	openAIOAuth429Quota5h
+	openAIOAuth429Quota7d
+	openAIOAuth429QuotaReset
+)
+
+// classifyOpenAIOAuth429 区分账号配额耗尽信号与普通瞬时 429。明确窗口达到
+// 100% 时以该窗口为准；没有 100% 标记但包含重置头时，沿用 v179 的兼容语义，
+// 仍视为配额限流信号。
+func classifyOpenAIOAuth429(headers http.Header, responseBody []byte) (openAIOAuth429Disposition, *time.Time) {
+	if snapshot := ParseCodexRateLimitHeaders(headers); snapshot != nil {
+		if normalized := snapshot.Normalize(); normalized != nil {
+			if normalized.Used7dPercent != nil && *normalized.Used7dPercent >= 100 {
+				if normalized.Reset7dSeconds != nil {
+					now := time.Now()
+					resetAt := now.Add(time.Duration(*normalized.Reset7dSeconds) * time.Second)
+					return openAIOAuth429Quota7d, &resetAt
+				}
+				return openAIOAuth429Quota7d, nil
+			}
+			if normalized.Used5hPercent != nil && *normalized.Used5hPercent >= 100 {
+				if normalized.Reset5hSeconds != nil {
+					now := time.Now()
+					resetAt := now.Add(time.Duration(*normalized.Reset5hSeconds) * time.Second)
+					return openAIOAuth429Quota5h, &resetAt
+				}
+				return openAIOAuth429Quota5h, nil
+			}
+		}
+	}
+	if resetAt := calculateOpenAI429ResetTime(headers); resetAt != nil {
+		return openAIOAuth429QuotaReset, resetAt
+	}
+	if resetUnix := parseOpenAIRateLimitResetTime(responseBody); resetUnix != nil {
+		resetAt := time.Unix(*resetUnix, 0)
+		return openAIOAuth429QuotaReset, &resetAt
+	}
+	return openAIOAuth429Transient, nil
+}
+
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	base := context.Background()
 	if ctx != nil {
@@ -356,6 +399,8 @@ func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context
 			return
 		}
 		s.recordOpenAIOAuth429()
+		disposition, resetAt := classifyOpenAIOAuth429(headers, responseBody)
+		_ = disposition
 		// A confirmed two-strike 429 must freeze immediately. The official same-account
 		// retry window only delays an unconfirmed mark (stream/direct callers).
 		if !openAIOAuth429AlreadyConfirmed(ctx) && s.openAIOAuth429RetryWindowActive(account) {
@@ -363,14 +408,10 @@ func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context
 		}
 
 	cooldownUntil := time.Now().Add(openAIOAuth429FallbackCooldown)
-	if s.rateLimitService != nil {
-		if resetAt := s.rateLimitService.calculateOpenAI429ResetTime(headers); resetAt != nil && resetAt.After(time.Now()) {
-			cooldownUntil = *resetAt
-		} else if resetUnix := parseOpenAIRateLimitResetTime(responseBody); resetUnix != nil {
-			if resetAt := time.Unix(*resetUnix, 0); resetAt.After(time.Now()) {
-				cooldownUntil = resetAt
-			}
-		} else if cooldown, ok := s.rateLimitService.get429FallbackCooldown(ctx, account); ok && cooldown > 0 {
+	if resetAt != nil && resetAt.After(time.Now()) {
+		cooldownUntil = *resetAt
+	} else if s.rateLimitService != nil {
+		if cooldown, ok := s.rateLimitService.get429FallbackCooldown(ctx, account); ok && cooldown > 0 {
 			cooldownUntil = time.Now().Add(cooldown)
 		}
 	}
@@ -379,9 +420,15 @@ func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context
 }
 
 func (s *OpenAIGatewayService) shouldRetryOpenAIOAuth429OnSameAccount(account *Account, statusCode int, shouldDisable bool) bool {
+	return s.shouldRetryOpenAIOAuth429OnSameAccountWithResponse(account, statusCode, shouldDisable, nil, nil)
+}
+
+func (s *OpenAIGatewayService) shouldRetryOpenAIOAuth429OnSameAccountWithResponse(account *Account, statusCode int, shouldDisable bool, headers http.Header, responseBody []byte) bool {
 	if shouldDisable || statusCode != http.StatusTooManyRequests || !isOpenAIOAuthAccount(account) || account.IsShadow() {
 		return false
 	}
+	_ = headers
+	_ = responseBody
 	// markOpenAIOAuth429RateLimited parks the account once the window expires.
 	// Do not accidentally create a fresh window after that transition.
 	if s.isOpenAIAccountRuntimeBlocked(account) {
@@ -392,10 +439,12 @@ func (s *OpenAIGatewayService) shouldRetryOpenAIOAuth429OnSameAccount(account *A
 
 // ShouldRetryOpenAIOAuth429 lets RateLimitService defer persistent account
 // cooldown until the gateway's same-account retry window is exhausted.
-func (s *OpenAIGatewayService) ShouldRetryOpenAIOAuth429(account *Account, _ http.Header, _ []byte) bool {
+func (s *OpenAIGatewayService) ShouldRetryOpenAIOAuth429(account *Account, headers http.Header, responseBody []byte) bool {
 	if s == nil || !isOpenAIOAuthAccount(account) || account.IsShadow() || s.isOpenAIAccountRuntimeBlocked(account) {
 		return false
 	}
+	_ = headers
+	_ = responseBody
 	return s.openAIOAuth429RetryWindowActive(account)
 }
 
