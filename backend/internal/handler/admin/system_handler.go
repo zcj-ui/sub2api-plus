@@ -234,25 +234,25 @@ func (h *SystemHandler) RestartService(c *gin.Context) {
 
 	operationID := buildSystemOperationID(c, "restart")
 	payload := gin.H{"operation_id": operationID}
-		executeAdminIdempotentJSON(c, "admin.system.restart", payload, service.DefaultSystemOperationIdempotencyTTL(), func(ctx context.Context) (any, error) {
-			lock, _, err := h.acquireSystemLock(ctx, operationID)
-			if err != nil {
-				return nil, err
-			}
+	executeAdminIdempotentJSON(c, "admin.system.restart", payload, service.DefaultSystemOperationIdempotencyTTL(), func(ctx context.Context) (any, error) {
+		lock, _, err := h.acquireSystemLock(ctx, operationID)
+		if err != nil {
+			return nil, err
+		}
 
-			// Keep the global system lock until the process exits so an in-place
-			// update cannot rename the binary while restart is pending. Linux
-			// systemd Restart=always starts a new process that does not inherit
-			// this lease; the old lease expires after its TTL.
-			go func() {
-				time.Sleep(500 * time.Millisecond)
-				sysutil.RestartServiceAsync()
-			}()
-			return gin.H{
-				"message":      "Service restart initiated",
-				"operation_id": lock.OperationID(),
-			}, nil
-		})
+		// Keep the global system lock until the process exits so an in-place
+		// update cannot rename the binary while restart is pending. Linux
+		// systemd Restart=always starts a new process that does not inherit
+		// this lease; the old lease expires after its TTL.
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			sysutil.RestartServiceAsync()
+		}()
+		return gin.H{
+			"message":      "Service restart initiated",
+			"operation_id": lock.OperationID(),
+		}, nil
+	})
 }
 
 func (h *SystemHandler) acquireSystemLock(

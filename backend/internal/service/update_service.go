@@ -871,7 +871,7 @@ func compareVersions(current, latest string) int {
 	return 0
 }
 
-	func normalizeUpdateRepo(repo string) string {
+func normalizeUpdateRepo(repo string) string {
 	repo = strings.TrimSpace(repo)
 	parts := strings.Split(repo, "/")
 	if len(parts) != 2 || !validGitHubRepoPart(parts[0]) || !validGitHubRepoPart(parts[1]) {

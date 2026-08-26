@@ -1219,48 +1219,48 @@ func TestOpenAISelectAccountWithLoadAwareness_StickyWaitPlan(t *testing.T) {
 	}
 }
 
-	func TestOpenAISelectAccountWithLoadAwareness_StickyWaitsWhenQueueSaturated(t *testing.T) {
-		sessionHash := "sticky-saturated"
-		groupID := int64(1)
-		repo := stubOpenAIAccountRepo{
-			accounts: []Account{
-				{ID: 1, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID}},
-				{ID: 2, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID}},
-			},
-		}
-		cache := &stubGatewayCache{
-			sessionBindings: map[string]int64{"openai:" + sessionHash: 1},
-		}
-		concurrencyCache := stubConcurrencyCache{
-			acquireResults: map[int64]bool{1: false, 2: true},
-			waitCounts:     map[int64]int{1: 999},
-			loadMap: map[int64]*AccountLoadInfo{
-				1: {AccountID: 1, CurrentConcurrency: 1, LoadRate: 1},
-				2: {AccountID: 2, CurrentConcurrency: 0, LoadRate: 0},
-			},
-		}
-		svc := &OpenAIGatewayService{
-			accountRepo:        repo,
-			cache:              cache,
-			concurrencyService: NewConcurrencyService(concurrencyCache),
-		}
-
-		selection, err := svc.SelectAccountWithLoadAwareness(context.Background(), &groupID, sessionHash, "gpt-4", nil)
-		if err != nil {
-			t.Fatalf("SelectAccountWithLoadAwareness error: %v", err)
-		}
-		if selection == nil || selection.Account == nil || selection.Account.ID != 1 {
-			t.Fatalf("expected sticky account 1 to wait instead of switching")
-		}
-		if selection.WaitPlan == nil || selection.WaitPlan.AccountID != 1 {
-			t.Fatalf("expected wait plan on sticky account 1")
-		}
-		if cache.sessionBindings["openai:"+sessionHash] != 1 {
-			t.Fatalf("expected sticky binding to stay on account 1")
-		}
+func TestOpenAISelectAccountWithLoadAwareness_StickyWaitsWhenQueueSaturated(t *testing.T) {
+	sessionHash := "sticky-saturated"
+	groupID := int64(1)
+	repo := stubOpenAIAccountRepo{
+		accounts: []Account{
+			{ID: 1, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1, GroupIDs: []int64{groupID}},
+			{ID: 2, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 0, GroupIDs: []int64{groupID}},
+		},
+	}
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{"openai:" + sessionHash: 1},
+	}
+	concurrencyCache := stubConcurrencyCache{
+		acquireResults: map[int64]bool{1: false, 2: true},
+		waitCounts:     map[int64]int{1: 999},
+		loadMap: map[int64]*AccountLoadInfo{
+			1: {AccountID: 1, CurrentConcurrency: 1, LoadRate: 1},
+			2: {AccountID: 2, CurrentConcurrency: 0, LoadRate: 0},
+		},
+	}
+	svc := &OpenAIGatewayService{
+		accountRepo:        repo,
+		cache:              cache,
+		concurrencyService: NewConcurrencyService(concurrencyCache),
 	}
 
-	func TestOpenAISelectAccountWithLoadAwareness_PrefersActiveAccountWithCapacity(t *testing.T) {
+	selection, err := svc.SelectAccountWithLoadAwareness(context.Background(), &groupID, sessionHash, "gpt-4", nil)
+	if err != nil {
+		t.Fatalf("SelectAccountWithLoadAwareness error: %v", err)
+	}
+	if selection == nil || selection.Account == nil || selection.Account.ID != 1 {
+		t.Fatalf("expected sticky account 1 to wait instead of switching")
+	}
+	if selection.WaitPlan == nil || selection.WaitPlan.AccountID != 1 {
+		t.Fatalf("expected wait plan on sticky account 1")
+	}
+	if cache.sessionBindings["openai:"+sessionHash] != 1 {
+		t.Fatalf("expected sticky binding to stay on account 1")
+	}
+}
+
+func TestOpenAISelectAccountWithLoadAwareness_PrefersActiveAccountWithCapacity(t *testing.T) {
 	groupID := int64(1)
 	repo := stubOpenAIAccountRepo{
 		accounts: []Account{

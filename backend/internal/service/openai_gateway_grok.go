@@ -93,13 +93,13 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		return nil, err
 	}
 
-		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
-		defer releaseUpstreamCtx()
+	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+	defer releaseUpstreamCtx()
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return nil, err
+	}
 
 	upstreamStart := time.Now()
 	var resp *http.Response
@@ -950,104 +950,104 @@ func grokResponsesToolDedupKey(tool gjson.Result) string {
 	return "json:" + normalizeCompatSeedJSON(json.RawMessage(tool.Raw))
 }
 
-	// sanitizeGrokReasoningNullContent drops explicit JSON nulls from Responses
-	// input items. xAI's untagged ModelInput decoder 422s on those fields
-	// (including status and encrypted_content on tool and message items).
-	// Compaction items stay unmodified per the compact contract.
-	func sanitizeGrokReasoningNullContent(body []byte) ([]byte, error) {
-		return stripExplicitNullsFromGrokResponsesInput(body)
+// sanitizeGrokReasoningNullContent drops explicit JSON nulls from Responses
+// input items. xAI's untagged ModelInput decoder 422s on those fields
+// (including status and encrypted_content on tool and message items).
+// Compaction items stay unmodified per the compact contract.
+func sanitizeGrokReasoningNullContent(body []byte) ([]byte, error) {
+	return stripExplicitNullsFromGrokResponsesInput(body)
+}
+
+func stripExplicitNullsFromGrokResponsesInput(body []byte) ([]byte, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || (!input.IsArray() && !input.IsObject()) {
+		return body, nil
 	}
 
-	func stripExplicitNullsFromGrokResponsesInput(body []byte) ([]byte, error) {
-		input := gjson.GetBytes(body, "input")
-		if !input.Exists() || (!input.IsArray() && !input.IsObject()) {
-			return body, nil
-		}
-
-		var decoded map[string]any
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.UseNumber()
-		if err := decoder.Decode(&decoded); err != nil {
-			return body, nil
-		}
-		rawInput, ok := decoded["input"]
-		if !ok {
-			return body, nil
-		}
-		cleaned, changed := stripExplicitNullsFromGrokInput(rawInput)
-		if !changed {
-			return body, nil
-		}
-		decoded["input"] = cleaned
-		out, err := marshalOpenAIUpstreamJSON(decoded)
-		if err != nil {
-			return nil, err
-		}
-		return out, nil
+	var decoded map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
+		return body, nil
 	}
+	rawInput, ok := decoded["input"]
+	if !ok {
+		return body, nil
+	}
+	cleaned, changed := stripExplicitNullsFromGrokInput(rawInput)
+	if !changed {
+		return body, nil
+	}
+	decoded["input"] = cleaned
+	out, err := marshalOpenAIUpstreamJSON(decoded)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
-	func stripExplicitNullsFromGrokInput(value any) (any, bool) {
-		switch node := value.(type) {
-		case []any:
-			changed := false
-			for i, item := range node {
-				itemMap, ok := item.(map[string]any)
-				if !ok {
-					next, childChanged := stripExplicitNullsFromGrokInput(item)
-					if childChanged {
-						node[i] = next
-						changed = true
-					}
-					continue
-				}
-				if isOpenAICompactionType(stringValue(itemMap["type"])) {
-					continue
-				}
-				next, childChanged := stripExplicitNullsFromJSONObject(itemMap)
+func stripExplicitNullsFromGrokInput(value any) (any, bool) {
+	switch node := value.(type) {
+	case []any:
+		changed := false
+		for i, item := range node {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				next, childChanged := stripExplicitNullsFromGrokInput(item)
 				if childChanged {
 					node[i] = next
 					changed = true
 				}
-			}
-			return node, changed
-		case map[string]any:
-			if isOpenAICompactionType(stringValue(node["type"])) {
-				return node, false
-			}
-			return stripExplicitNullsFromJSONObject(node)
-		default:
-			return value, false
-		}
-	}
-
-	func stripExplicitNullsFromJSONObject(node map[string]any) (map[string]any, bool) {
-		if node == nil {
-			return node, false
-		}
-		changed := false
-		for key, child := range node {
-			if child == nil {
-				delete(node, key)
-				changed = true
 				continue
 			}
-			switch typed := child.(type) {
-			case map[string]any:
-				next, childChanged := stripExplicitNullsFromJSONObject(typed)
-				if childChanged {
-					node[key] = next
-					changed = true
-				}
-			case []any:
-				next, childChanged := stripExplicitNullsFromGrokInput(typed)
-				if childChanged {
-					node[key] = next
-					changed = true
-				}
+			if isOpenAICompactionType(stringValue(itemMap["type"])) {
+				continue
+			}
+			next, childChanged := stripExplicitNullsFromJSONObject(itemMap)
+			if childChanged {
+				node[i] = next
+				changed = true
 			}
 		}
 		return node, changed
+	case map[string]any:
+		if isOpenAICompactionType(stringValue(node["type"])) {
+			return node, false
+		}
+		return stripExplicitNullsFromJSONObject(node)
+	default:
+		return value, false
 	}
+}
+
+func stripExplicitNullsFromJSONObject(node map[string]any) (map[string]any, bool) {
+	if node == nil {
+		return node, false
+	}
+	changed := false
+	for key, child := range node {
+		if child == nil {
+			delete(node, key)
+			changed = true
+			continue
+		}
+		switch typed := child.(type) {
+		case map[string]any:
+			next, childChanged := stripExplicitNullsFromJSONObject(typed)
+			if childChanged {
+				node[key] = next
+				changed = true
+			}
+		case []any:
+			next, childChanged := stripExplicitNullsFromGrokInput(typed)
+			if childChanged {
+				node[key] = next
+				changed = true
+			}
+		}
+	}
+	return node, changed
+}
 
 var grokResponsesSupportedToolTypes = map[string]struct{}{
 	"code_execution":     {},
@@ -1355,15 +1355,15 @@ func (s *OpenAIGatewayService) describeGrokComposerImage(
 		return "", OpenAIUsage{}, fmt.Errorf("build grok composer image bridge request: %w", err)
 	}
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return "", OpenAIUsage{}, err
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return "", OpenAIUsage{}, err
+	}
 
-		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
-		if err != nil {
-			return "", OpenAIUsage{}, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
-		}
+	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
+	if err != nil {
+		return "", OpenAIUsage{}, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {

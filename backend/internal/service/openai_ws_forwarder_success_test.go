@@ -466,14 +466,14 @@ func TestOpenAIGatewayService_BuildOpenAIWSHeadersDeviceModePreservesNamespacedC
 		"",
 	)
 
-		require.NoError(t, err)
-		require.Equal(t, ids.installationID, headers.Get("x-codex-installation-id"))
-		require.NotEqual(t, "client-installation", headers.Get("x-codex-installation-id"))
-		require.Equal(t, "client-window", headers.Get("x-codex-window-id"))
-		require.Equal(t, "client-session", headers.Get("session-id"))
-		require.Equal(t, "client-thread", headers.Get("thread-id"))
-		require.Equal(t, "client-request", headers.Get("x-client-request-id"))
-	}
+	require.NoError(t, err)
+	require.Equal(t, ids.installationID, headers.Get("x-codex-installation-id"))
+	require.NotEqual(t, "client-installation", headers.Get("x-codex-installation-id"))
+	require.Equal(t, "client-window", headers.Get("x-codex-window-id"))
+	require.Equal(t, "client-session", headers.Get("session-id"))
+	require.Equal(t, "client-thread", headers.Get("thread-id"))
+	require.Equal(t, "client-request", headers.Get("x-client-request-id"))
+}
 
 func TestLogOpenAIWSBindResponseAccountWarn(t *testing.T) {
 	require.NotPanics(t, func() {
@@ -982,17 +982,17 @@ func TestOpenAIGatewayService_Forward_WSv2_OAuthStoreFalseByDefault(t *testing.T
 	require.Equal(t, "native-wsv2", gjson.Get(requestJSON, "input.0.namespace").String(), "OAuth WSv2 应保留原生 namespace")
 	require.Equal(t, openAIWSBetaV2Value, captureDialer.lastHeaders.Get("OpenAI-Beta"))
 	require.Equal(t, "remote_compaction_v2", captureDialer.lastHeaders.Get("x-codex-beta-features"))
-		// Session mode derives a stable account-scoped session/thread graph from
-		// the supplied conversation aliases; it must not forward raw tenant IDs.
-		// Isolation also mixes apiKeyID + credential namespace, so the raw aliases
-		// cannot survive even if fingerprint projection is skipped.
-		require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
-		require.NotEqual(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
-		require.NotEqual(t, isolateOpenAIUpstreamSessionID(0, account, "sess-oauth-1"), "sess-oauth-1")
-		require.NotEmpty(t, captureDialer.lastHeaders.Get("conversation_id"))
-		require.NotEqual(t, "conv-oauth-1", captureDialer.lastHeaders.Get("conversation_id"))
-		require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
-		require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
+	// Session mode derives a stable account-scoped session/thread graph from
+	// the supplied conversation aliases; it must not forward raw tenant IDs.
+	// Isolation also mixes apiKeyID + credential namespace, so the raw aliases
+	// cannot survive even if fingerprint projection is skipped.
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, "sess-oauth-1", captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, isolateOpenAIUpstreamSessionID(0, account, "sess-oauth-1"), "sess-oauth-1")
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("conversation_id"))
+	require.NotEqual(t, "conv-oauth-1", captureDialer.lastHeaders.Get("conversation_id"))
+	require.Equal(t, resolveConvergedInstallationID(account), captureDialer.lastHeaders.Get("x-codex-installation-id"))
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("x-client-request-id"))
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_OAuthSanitizesInvalidNativeToolItemID(t *testing.T) {
@@ -1283,12 +1283,12 @@ func TestOpenAIGatewayService_Forward_WSv2_HeaderSessionFallbackFromPromptCacheK
 	require.NotNil(t, result)
 	require.Equal(t, "resp_prompt_cache_key", result.RequestID)
 
-		require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
-		require.NotEqual(t, "pcache_123", captureDialer.lastHeaders.Get("session_id"))
-		// A prompt_cache_key is a cache/session anchor, not an independent
-		// conversation identifier; session convergence must not invent this alias.
-		// Isolation still mixes apiKeyID + credential namespace when the raw key
-		// is used as a session fallback.
+	require.NotEmpty(t, captureDialer.lastHeaders.Get("session_id"))
+	require.NotEqual(t, "pcache_123", captureDialer.lastHeaders.Get("session_id"))
+	// A prompt_cache_key is a cache/session anchor, not an independent
+	// conversation identifier; session convergence must not invent this alias.
+	// Isolation still mixes apiKeyID + credential namespace when the raw key
+	// is used as a session fallback.
 	require.Empty(t, captureDialer.lastHeaders.Get("conversation_id"))
 	require.NotNil(t, captureConn.lastWrite)
 	require.True(t, gjson.Get(requestToJSONString(captureConn.lastWrite), "stream").Exists())

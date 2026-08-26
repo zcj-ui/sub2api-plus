@@ -727,21 +727,21 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 			// Extra keys and immediately reflected in the returned UsageInfo.
 			if s.openAIQuotaService != nil {
 				if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
-						if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
-							if persistErr := s.persistOpenAICodexProbeSnapshot(ctx, account.ID, updates); persistErr == nil {
-								mergeAccountExtra(account, updates)
-								if account.ParentAccountID != nil {
-									notifyOpenAIAutoReset(*account.ParentAccountID)
-								}
-								if usage.UpdatedAt == nil {
-									usage.UpdatedAt = &now
-								}
-								applyExtraToUsage(usage, account.Extra, now)
-								probeSucceeded = true
+					if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
+						if persistErr := s.persistOpenAICodexProbeSnapshot(ctx, account.ID, updates); persistErr == nil {
+							mergeAccountExtra(account, updates)
+							if account.ParentAccountID != nil {
+								notifyOpenAIAutoReset(*account.ParentAccountID)
 							}
-						} else {
+							if usage.UpdatedAt == nil {
+								usage.UpdatedAt = &now
+							}
+							applyExtraToUsage(usage, account.Extra, now)
 							probeSucceeded = true
 						}
+					} else {
+						probeSucceeded = true
+					}
 				}
 			}
 		} else if s.openAIQuotaService != nil {
@@ -958,12 +958,12 @@ func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(ctx context.Contex
 	if len(updates) == 0 {
 		return nil
 	}
-		if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
-			return fmt.Errorf("persist openai codex snapshot: %w", err)
-		}
-		notifyOpenAIAutoReset(accountID)
-		return nil
+	if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
+		return fmt.Errorf("persist openai codex snapshot: %w", err)
 	}
+	notifyOpenAIAutoReset(accountID)
+	return nil
+}
 
 func extractOpenAICodexProbeUpdates(resp *http.Response) (map[string]any, error) {
 	if resp == nil {
@@ -1103,17 +1103,17 @@ func (s *AccountUsageService) getAntigravityUsage(ctx context.Context, account *
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
 
-			proxyURL, proxyErr := s.antigravityQuotaFetcher.GetProxyURL(fetchCtx, account)
-			if proxyErr != nil {
-				degraded := buildAntigravityDegradedUsage(proxyErr)
-				enrichUsageWithAccountError(degraded, account)
-				s.cache.antigravityCache.Store(account.ID, &antigravityUsageCache{
-					usageInfo: degraded,
-					timestamp: time.Now(),
-				})
-				return degraded, nil
-			}
-			fetchResult, err := s.antigravityQuotaFetcher.FetchQuota(fetchCtx, account, proxyURL)
+		proxyURL, proxyErr := s.antigravityQuotaFetcher.GetProxyURL(fetchCtx, account)
+		if proxyErr != nil {
+			degraded := buildAntigravityDegradedUsage(proxyErr)
+			enrichUsageWithAccountError(degraded, account)
+			s.cache.antigravityCache.Store(account.ID, &antigravityUsageCache{
+				usageInfo: degraded,
+				timestamp: time.Now(),
+			})
+			return degraded, nil
+		}
+		fetchResult, err := s.antigravityQuotaFetcher.FetchQuota(fetchCtx, account, proxyURL)
 		if err != nil {
 			degraded := buildAntigravityDegradedUsage(err)
 			enrichUsageWithAccountError(degraded, account)
@@ -1612,10 +1612,10 @@ func (s *AccountUsageService) fetchOAuthUsageRaw(ctx context.Context, account *A
 		return nil, fmt.Errorf("no access token available")
 	}
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return nil, err
+	}
 
 	// 构建完整的选项
 	opts := &ClaudeUsageFetchOptions{

@@ -240,23 +240,23 @@ func TestOpenAIGatewayService_ForwardWSv2Confirmed429StatusOnlyKeepsLease(t *tes
 			"input":                []any{map[string]any{"type": "input_text", "text": "hello"}},
 		}
 		agentTaskRecoveryTried := false
-			result, err := svc.forwardOpenAIWSV2(
-				context.Background(),
-				c,
-				account,
-				requestBody,
-				"access-token",
-				"",
-				OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
-				true,
-				false,
-				"gpt-5.1",
-				"gpt-5.1",
-				time.Now(),
-				1,
-				"",
-				&agentTaskRecoveryTried,
-			)
+		result, err := svc.forwardOpenAIWSV2(
+			context.Background(),
+			c,
+			account,
+			requestBody,
+			"access-token",
+			"",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			true,
+			false,
+			"gpt-5.1",
+			"gpt-5.1",
+			time.Now(),
+			1,
+			"",
+			&agentTaskRecoveryTried,
+		)
 		return result, rec, err
 	}
 
@@ -320,23 +320,23 @@ func TestOpenAIGatewayService_ForwardWSv2GuardAcquireQueueFullKeepsBinding(t *te
 		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
 		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
 		recoveryTried := false
-			return svc.forwardOpenAIWSV2(
-				context.Background(),
-				c,
-				account,
-				body,
-				"access-token",
-				"",
-				OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
-				true,
-				false,
-				"gpt-5.1",
-				"gpt-5.1",
-				time.Now(),
-				1,
-				"",
-				&recoveryTried,
-			)
+		return svc.forwardOpenAIWSV2(
+			context.Background(),
+			c,
+			account,
+			body,
+			"access-token",
+			"",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			true,
+			false,
+			"gpt-5.1",
+			"gpt-5.1",
+			time.Now(),
+			1,
+			"",
+			&recoveryTried,
+		)
 	}
 
 	seed, err := invoke(map[string]any{
@@ -784,80 +784,80 @@ func TestOpenAIWSErrorHTTPStatusFromRaw_UsageLimitReachedIs429(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRaw("rate_limit_exceeded", ""))
 }
 
-	func TestIsOpenAIWSRateLimitErrorRecognizesExplicit429TransportText(t *testing.T) {
-		message := "exceeded retry limit, last status: 429 Too Many Requests"
-		require.True(t, isOpenAIWSRateLimitError("", "", message))
-		require.True(t, isOpenAIWSRateLimitError("", "", "429 Too Many Requests"))
-		require.False(t, isOpenAIWSRateLimitError("", "", "retry attempt 429 exhausted"))
-		require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRawWithMessage("", "", message))
+func TestIsOpenAIWSRateLimitErrorRecognizesExplicit429TransportText(t *testing.T) {
+	message := "exceeded retry limit, last status: 429 Too Many Requests"
+	require.True(t, isOpenAIWSRateLimitError("", "", message))
+	require.True(t, isOpenAIWSRateLimitError("", "", "429 Too Many Requests"))
+	require.False(t, isOpenAIWSRateLimitError("", "", "retry attempt 429 exhausted"))
+	require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRawWithMessage("", "", message))
+}
+
+func TestIsOpenAIWSRateLimitSignalPrefersExplicitStatus(t *testing.T) {
+	require.True(t, isOpenAIWSRateLimitSignal(http.StatusTooManyRequests, "", "", ""))
+	require.True(t, isOpenAIWSRateLimitSignal(0, "rate_limit_exceeded", "", ""))
+	require.False(t, isOpenAIWSRateLimitSignal(http.StatusBadGateway, "rate_limit_exceeded", "", ""))
+	require.False(t, isOpenAIWSRateLimitSignal(http.StatusServiceUnavailable, "", "usage_limit_reached", ""))
+}
+
+func TestOpenAIWSPayloadUpstreamStatusIncludesTopLevelFields(t *testing.T) {
+	require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status_code":429}`)))
+	require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status":429}`)))
+	require.Equal(t, http.StatusBadGateway, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","error":{"status_code":502}}`)))
+}
+
+func TestPersistOpenAIWSRateLimitSignalWithoutRateLimitServiceConfirmsOAuth429(t *testing.T) {
+	account := &Account{ID: 9911, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{}
+
+	for range 2 {
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, []byte(`{"status":429}`), "rate_limit_exceeded", "", "quota reached")
 	}
 
-	func TestIsOpenAIWSRateLimitSignalPrefersExplicitStatus(t *testing.T) {
-		require.True(t, isOpenAIWSRateLimitSignal(http.StatusTooManyRequests, "", "", ""))
-		require.True(t, isOpenAIWSRateLimitSignal(0, "rate_limit_exceeded", "", ""))
-		require.False(t, isOpenAIWSRateLimitSignal(http.StatusBadGateway, "rate_limit_exceeded", "", ""))
-		require.False(t, isOpenAIWSRateLimitSignal(http.StatusServiceUnavailable, "", "usage_limit_reached", ""))
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
+
+func TestPersistOpenAIWSRateLimitSignalIgnoresSemanticCodeWithoutExplicit429(t *testing.T) {
+	account := &Account{ID: 9912, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{}
+
+	for range 3 {
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, nil, "rate_limit_exceeded", "rate_limit_error", "quota reached")
 	}
 
-	func TestOpenAIWSPayloadUpstreamStatusIncludesTopLevelFields(t *testing.T) {
-		require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status_code":429}`)))
-		require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status":429}`)))
-		require.Equal(t, http.StatusBadGateway, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","error":{"status_code":502}}`)))
-	}
+	require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
 
-	func TestPersistOpenAIWSRateLimitSignalWithoutRateLimitServiceConfirmsOAuth429(t *testing.T) {
-		account := &Account{ID: 9911, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
-		svc := &OpenAIGatewayService{}
+func TestIsOpenAIWSExplicit429SignalRequiresStatusEvidence(t *testing.T) {
+	require.True(t, isOpenAIWSExplicit429Signal(http.StatusTooManyRequests, "usage_limit_reached", "", "", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "", "", "last status: 429 Too Many Requests", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "", []byte(`{"error":{"status":429}}`)))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "usage_limit_reached", "", "quota reached", nil))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "retry attempt 429 exhausted", nil))
+}
 
-		for range 2 {
-			svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, []byte(`{"status":429}`), "rate_limit_exceeded", "", "quota reached")
-		}
+func TestOpenAIWSRateLimitFailoverError_OAuthKeepsSameAccountDeadline(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	headers := http.Header{"Retry-After": []string{"30"}}
+	body := []byte(`{"error":{"type":"rate_limit_error","message":"limited"}}`)
 
-		require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
-	}
+	oauthErr := svc.newOpenAIWSRateLimitFailoverError(&Account{
+		ID:       904,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+	}, headers, body, "limited")
+	require.True(t, oauthErr.RetryableOnSameAccount)
+	require.False(t, oauthErr.SameAccountRetryDeadline.IsZero())
+	require.Positive(t, oauthErr.SameAccountRetryDelay)
+	require.LessOrEqual(t, oauthErr.SameAccountRetryDelay, openAIOAuth429MaxRetryDelay)
+	require.Equal(t, body, oauthErr.ResponseBody)
+	require.Equal(t, "30", oauthErr.ResponseHeaders.Get("Retry-After"))
 
-	func TestPersistOpenAIWSRateLimitSignalIgnoresSemanticCodeWithoutExplicit429(t *testing.T) {
-		account := &Account{ID: 9912, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
-		svc := &OpenAIGatewayService{}
-
-		for range 3 {
-			svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, nil, "rate_limit_exceeded", "rate_limit_error", "quota reached")
-		}
-
-		require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account))
-	}
-
-	func TestIsOpenAIWSExplicit429SignalRequiresStatusEvidence(t *testing.T) {
-		require.True(t, isOpenAIWSExplicit429Signal(http.StatusTooManyRequests, "usage_limit_reached", "", "", nil))
-		require.True(t, isOpenAIWSExplicit429Signal(0, "", "", "last status: 429 Too Many Requests", nil))
-		require.True(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "", []byte(`{"error":{"status":429}}`)))
-		require.False(t, isOpenAIWSExplicit429Signal(0, "usage_limit_reached", "", "quota reached", nil))
-		require.False(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "retry attempt 429 exhausted", nil))
-	}
-
-	func TestOpenAIWSRateLimitFailoverError_OAuthKeepsSameAccountDeadline(t *testing.T) {
-		svc := &OpenAIGatewayService{}
-		headers := http.Header{"Retry-After": []string{"30"}}
-		body := []byte(`{"error":{"type":"rate_limit_error","message":"limited"}}`)
-
-		oauthErr := svc.newOpenAIWSRateLimitFailoverError(&Account{
-			ID:       904,
-			Platform: PlatformOpenAI,
-			Type:     AccountTypeOAuth,
-		}, headers, body, "limited")
-		require.True(t, oauthErr.RetryableOnSameAccount)
-		require.False(t, oauthErr.SameAccountRetryDeadline.IsZero())
-		require.Positive(t, oauthErr.SameAccountRetryDelay)
-		require.LessOrEqual(t, oauthErr.SameAccountRetryDelay, openAIOAuth429MaxRetryDelay)
-		require.Equal(t, body, oauthErr.ResponseBody)
-		require.Equal(t, "30", oauthErr.ResponseHeaders.Get("Retry-After"))
-
-		apiKeyErr := svc.newOpenAIWSRateLimitFailoverError(&Account{
-			ID:       905,
-			Platform: PlatformOpenAI,
-			Type:     AccountTypeAPIKey,
-		}, headers, body, "limited")
-		require.False(t, apiKeyErr.RetryableOnSameAccount)
-		require.True(t, apiKeyErr.SameAccountRetryDeadline.IsZero())
-		require.Zero(t, apiKeyErr.SameAccountRetryDelay)
-	}
+	apiKeyErr := svc.newOpenAIWSRateLimitFailoverError(&Account{
+		ID:       905,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+	}, headers, body, "limited")
+	require.False(t, apiKeyErr.RetryableOnSameAccount)
+	require.True(t, apiKeyErr.SameAccountRetryDeadline.IsZero())
+	require.Zero(t, apiKeyErr.SameAccountRetryDelay)
+}

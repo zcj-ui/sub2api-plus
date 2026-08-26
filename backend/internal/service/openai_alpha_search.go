@@ -273,16 +273,16 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchResponsesWebSearchRequest(c
 	if s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		req.Header.Set("User-Agent", canonical.userAgent)
 	}
-		apiKeyID := getAPIKeyIDFromContext(c)
-		skipIdentity := shouldSkipCodexAccountIdentityRewrite(c, account, alphaBody)
-			if sessionID := strings.TrimSpace(gjson.GetBytes(alphaBody, "id").String()); sessionID != "" && !skipIdentity {
-			isolated := isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), sessionID)
-			req.Header.Set("Session_ID", isolated)
-			req.Header.Set("Conversation_ID", isolated)
-		}
-		if !skipIdentity {
-			applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), apiKeyID)
-		}
+	apiKeyID := getAPIKeyIDFromContext(c)
+	skipIdentity := shouldSkipCodexAccountIdentityRewrite(c, account, alphaBody)
+	if sessionID := strings.TrimSpace(gjson.GetBytes(alphaBody, "id").String()); sessionID != "" && !skipIdentity {
+		isolated := isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), sessionID)
+		req.Header.Set("Session_ID", isolated)
+		req.Header.Set("Conversation_ID", isolated)
+	}
+	if !skipIdentity {
+		applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), apiKeyID)
+	}
 	enforceCodexIdentityHeadersWithUA(req.Header, s.codexIdentityOverrideUA(account))
 	account.ApplyHeaderOverrides(req.Header)
 	return req, nil
@@ -398,12 +398,12 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchRequest(ctx context.Context
 			return nil, fmt.Errorf("resolve chatgpt account headers: %w", err)
 		}
 
-			if turnMetadata := openAIAlphaSearchInboundHeader(c, "X-Codex-Turn-Metadata"); turnMetadata != "" {
-				req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
-			}
-			if !shouldSkipCodexAccountIdentityRewrite(c, account, nil) {
-				applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-			}
+		if turnMetadata := openAIAlphaSearchInboundHeader(c, "X-Codex-Turn-Metadata"); turnMetadata != "" {
+			req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
+		}
+		if !shouldSkipCodexAccountIdentityRewrite(c, account, nil) {
+			applyCodexAccountIdentityHeaders(req.Header, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+		}
 		if version := openAIAlphaSearchInboundHeader(c, "Version"); version != "" {
 			req.Header.Set("Version", version)
 		} else {

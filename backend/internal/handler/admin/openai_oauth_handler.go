@@ -621,8 +621,8 @@ func (h *OpenAIOAuthHandler) ResetQuota(c *gin.Context) {
 	resetResponse.CacheRefreshed = postResult.CacheRefreshed
 	resetResponse.AccountStateRecovered = postResult.AccountStateRecovered
 	resetResponse.WarningCode = postResult.WarningCode
-		if postResult.Account != nil {
-			resetResponse.Account = dto.AccountFromService(postResult.Account)
-		}
-		response.Success(c, resetResponse)
+	if postResult.Account != nil {
+		resetResponse.Account = dto.AccountFromService(postResult.Account)
+	}
+	response.Success(c, resetResponse)
 }

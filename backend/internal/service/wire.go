@@ -253,12 +253,12 @@ func ProvideAccountTestService(
 	httpUpstream HTTPUpstream,
 	cfg *config.Config,
 	tlsFPProfileService *TLSFingerprintProfileService,
-		openAIGatewayService *OpenAIGatewayService,
-		rateLimitService *RateLimitService,
-		settingService *SettingService,
-		openAIQuotaService *OpenAIQuotaService,
-		pluginManager *PluginManager,
-	) *AccountTestService {
+	openAIGatewayService *OpenAIGatewayService,
+	rateLimitService *RateLimitService,
+	settingService *SettingService,
+	openAIQuotaService *OpenAIQuotaService,
+	pluginManager *PluginManager,
+) *AccountTestService {
 	service := NewAccountTestService(
 		accountRepo,
 		geminiTokenProvider,
@@ -270,11 +270,11 @@ func ProvideAccountTestService(
 		tlsFPProfileService,
 	)
 	service.agentIdentityWS = openAIGatewayService
-		service.SetRateLimitService(rateLimitService)
-		service.SetSettingService(settingService)
-		service.SetOpenAIQuotaService(openAIQuotaService)
-		service.SetPluginManager(pluginManager)
-		return service
+	service.SetRateLimitService(rateLimitService)
+	service.SetSettingService(settingService)
+	service.SetOpenAIQuotaService(openAIQuotaService)
+	service.SetPluginManager(pluginManager)
+	return service
 }
 
 func ProvideGrokQuotaService(

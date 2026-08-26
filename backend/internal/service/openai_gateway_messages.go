@@ -234,9 +234,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		if codexResult.PromptCacheKey != "" {
 			promptCacheKey = codexResult.PromptCacheKey
 		}
-			if !shouldSkipCodexAccountIdentityRewrite(c, account, responsesBody) {
-				applyCodexAccountIdentityClientMetadataMap(reqBody, codexAccountIdentitySource(c, account), apiKeyID)
-			}
+		if !shouldSkipCodexAccountIdentityRewrite(c, account, responsesBody) {
+			applyCodexAccountIdentityClientMetadataMap(reqBody, codexAccountIdentitySource(c, account), apiKeyID)
+		}
 		delete(reqBody, "prompt_cache_key")
 		if shouldAutoInjectPromptCacheKeyForCompat(upstreamModel) {
 			// Compatibility routing state is distinct from account/device identity.
@@ -337,40 +337,40 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		return nil, fmt.Errorf("build upstream request: %w", err)
 	}
 
-		// The Messages bridge for API-key OpenAI accounts has no upstream OAuth
-		// session to preserve. Keep its deterministic prompt-cache affinity header;
-		// OAuth requests use the selected Codex lifecycle (or the explicit bridge
-		// compatibility block below) instead of replacing a genuine client session.
-		if account.Platform != PlatformGrok && account.Type == AccountTypeAPIKey && promptCacheKey != "" {
-			isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
-			upstreamReq.Header.Set("session_id", isolatedSessionID)
-			if upstreamReq.Header.Get("conversation_id") != "" {
-				upstreamReq.Header.Set("conversation_id", isolatedSessionID)
-			}
+	// The Messages bridge for API-key OpenAI accounts has no upstream OAuth
+	// session to preserve. Keep its deterministic prompt-cache affinity header;
+	// OAuth requests use the selected Codex lifecycle (or the explicit bridge
+	// compatibility block below) instead of replacing a genuine client session.
+	if account.Platform != PlatformGrok && account.Type == AccountTypeAPIKey && promptCacheKey != "" {
+		isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
+		upstreamReq.Header.Set("session_id", isolatedSessionID)
+		if upstreamReq.Header.Get("conversation_id") != "" {
+			upstreamReq.Header.Set("conversation_id", isolatedSessionID)
 		}
-		if account.UsesOpenAICodexProtocol() && account.Platform != PlatformGrok {
-			// buildUpstreamRequest 保留 Messages bridge 的 body/session 兼容行为，并会先
-			// 清除身份头。真正发送前恢复完整 Codex 身份，避免 ChatGPT Codex 上游因缺失
-			// originator/OpenAI-Beta 返回 404（issue #3901）。
-			ensureCodexIdentityHeaders(upstreamReq.Header)
-			enforceCodexIdentityHeaders(upstreamReq.Header)
-		}
+	}
+	if account.UsesOpenAICodexProtocol() && account.Platform != PlatformGrok {
+		// buildUpstreamRequest 保留 Messages bridge 的 body/session 兼容行为，并会先
+		// 清除身份头。真正发送前恢复完整 Codex 身份，避免 ChatGPT Codex 上游因缺失
+		// originator/OpenAI-Beta 返回 404（issue #3901）。
+		ensureCodexIdentityHeaders(upstreamReq.Header)
+		enforceCodexIdentityHeaders(upstreamReq.Header)
+	}
 
-		// The Anthropic compatibility bridge has no Codex identity snapshot of its
-		// own. Retain its established per-client cache/session routing without
-		// inventing UA, originator, version, installation, or thread identity.
-		if account.Platform != PlatformGrok && account.UsesOpenAICodexProtocol() &&
-			isOpenAICompatMessagesBridgeContext(c) && promptCacheKey != "" {
-			isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
-			upstreamReq.Header.Set("session_id", isolatedSessionID)
-			if strings.TrimSpace(c.GetHeader("conversation_id")) != "" {
-				upstreamReq.Header.Set("conversation_id", isolatedSessionID)
-			} else {
-				upstreamReq.Header.Del("conversation_id")
-			}
-		} else if account.UsesOpenAICodexProtocol() && promptCacheKey != "" && strings.TrimSpace(c.GetHeader("conversation_id")) == "" {
+	// The Anthropic compatibility bridge has no Codex identity snapshot of its
+	// own. Retain its established per-client cache/session routing without
+	// inventing UA, originator, version, installation, or thread identity.
+	if account.Platform != PlatformGrok && account.UsesOpenAICodexProtocol() &&
+		isOpenAICompatMessagesBridgeContext(c) && promptCacheKey != "" {
+		isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
+		upstreamReq.Header.Set("session_id", isolatedSessionID)
+		if strings.TrimSpace(c.GetHeader("conversation_id")) != "" {
+			upstreamReq.Header.Set("conversation_id", isolatedSessionID)
+		} else {
 			upstreamReq.Header.Del("conversation_id")
 		}
+	} else if account.UsesOpenAICodexProtocol() && promptCacheKey != "" && strings.TrimSpace(c.GetHeader("conversation_id")) == "" {
+		upstreamReq.Header.Del("conversation_id")
+	}
 	if compatTurnState != "" && upstreamReq.Header.Get("x-codex-turn-state") == "" {
 		upstreamReq.Header.Set("x-codex-turn-state", compatTurnState)
 	}

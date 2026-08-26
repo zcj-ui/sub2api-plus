@@ -3787,8 +3787,8 @@ func TestOpenAIGatewayService_SchedulerWrappersAndDefaults(t *testing.T) {
 	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.TTFT = 0.6
 	svcWithCfg := &OpenAIGatewayService{cfg: cfg}
 
-		require.Equal(t, 9, svcWithCfg.openAIWSLBTopK())
-		require.Equal(t, openaiStickySessionIdleTTLDefault, svcWithCfg.openAIWSSessionStickyTTL())
+	require.Equal(t, 9, svcWithCfg.openAIWSLBTopK())
+	require.Equal(t, openaiStickySessionIdleTTLDefault, svcWithCfg.openAIWSSessionStickyTTL())
 	customWeights := svcWithCfg.openAIWSSchedulerWeights()
 	require.Equal(t, 0.2, customWeights.Priority)
 	require.Equal(t, 0.3, customWeights.Load)

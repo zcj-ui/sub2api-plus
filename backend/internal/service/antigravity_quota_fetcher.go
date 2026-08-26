@@ -206,13 +206,13 @@ func (f *AntigravityQuotaFetcher) buildUsageInfo(modelsResp *antigravity.FetchAv
 	return info
 }
 
-	// GetProxyURL 获取账户的代理 URL。账户配置了 proxy_id 时 fail-closed。
-	func (f *AntigravityQuotaFetcher) GetProxyURL(ctx context.Context, account *Account) (string, error) {
-		if f == nil {
-			return resolveConfiguredProxyURL(account)
-		}
-		return resolveConfiguredProxyURLWithLookup(ctx, account, f.proxyRepo)
+// GetProxyURL 获取账户的代理 URL。账户配置了 proxy_id 时 fail-closed。
+func (f *AntigravityQuotaFetcher) GetProxyURL(ctx context.Context, account *Account) (string, error) {
+	if f == nil {
+		return resolveConfiguredProxyURL(account)
 	}
+	return resolveConfiguredProxyURLWithLookup(ctx, account, f.proxyRepo)
+}
 
 // classifyForbiddenType 根据 403 响应体判断禁止类型
 func classifyForbiddenType(body string) string {

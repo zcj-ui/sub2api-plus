@@ -392,48 +392,48 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	// A state blob minted by a failed-over OAuth account is not valid for the
 	// selected account. This mutates only the outbound handshake copy; the
 	// client request headers remain untouched for retry/failover diagnostics.
-		s.guardOpenAICodexTurnStateEcho(c, account, headers)
-		applyOpenAICodexBetaFeatures(c, account, headers)
+	s.guardOpenAICodexTurnStateEcho(c, account, headers)
+	applyOpenAICodexBetaFeatures(c, account, headers)
 
-		// OAuth / SetupToken Codex: mix apiKeyID and credential namespace into
-		// session identifiers so a failover cannot reuse another account's session.
-			if account != nil && account.UsesOpenAICodexProtocol() {
-				apiKeyID := getAPIKeyIDFromContext(c)
-				hasFingerprintSnapshot := hasValidStagedCodexFingerprint(c, account)
-				if shouldPreserveOutboundCodexClientSession(c, account) {
-				sessionID := canonicalSessionID
-				if sessionID == "" {
-					sessionID = sessionResolution.SessionID
-				}
-				if sessionID != "" {
-					headers.Set("session-id", sessionID)
-					headers.Set("session_id", sessionID)
-				}
-				threadID := canonicalThreadID
-				if threadID == "" {
-					threadID = sessionID
-				}
-				if threadID != "" {
-					headers.Set("thread-id", threadID)
-					headers.Set("thread_id", threadID)
-				}
-				if canonicalRequestID != "" {
-					headers.Set("x-client-request-id", canonicalRequestID)
-				}
-				conversationID := canonicalConversationID
-				if conversationID != "" {
-					headers.Set("conversation_id", conversationID)
-				}
-				} else {
-					identitySource := codexAccountIdentitySource(c, account)
-					if sessionResolution.SessionID != "" {
-						headers.Set("session_id", isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, sessionResolution.SessionID))
-					}
-					if !hasFingerprintSnapshot && sessionResolution.ConversationID != "" {
-						headers.Set("conversation_id", isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, sessionResolution.ConversationID))
-					}
-				}
+	// OAuth / SetupToken Codex: mix apiKeyID and credential namespace into
+	// session identifiers so a failover cannot reuse another account's session.
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		apiKeyID := getAPIKeyIDFromContext(c)
+		hasFingerprintSnapshot := hasValidStagedCodexFingerprint(c, account)
+		if shouldPreserveOutboundCodexClientSession(c, account) {
+			sessionID := canonicalSessionID
+			if sessionID == "" {
+				sessionID = sessionResolution.SessionID
+			}
+			if sessionID != "" {
+				headers.Set("session-id", sessionID)
+				headers.Set("session_id", sessionID)
+			}
+			threadID := canonicalThreadID
+			if threadID == "" {
+				threadID = sessionID
+			}
+			if threadID != "" {
+				headers.Set("thread-id", threadID)
+				headers.Set("thread_id", threadID)
+			}
+			if canonicalRequestID != "" {
+				headers.Set("x-client-request-id", canonicalRequestID)
+			}
+			conversationID := canonicalConversationID
+			if conversationID != "" {
+				headers.Set("conversation_id", conversationID)
+			}
 		} else {
+			identitySource := codexAccountIdentitySource(c, account)
+			if sessionResolution.SessionID != "" {
+				headers.Set("session_id", isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, sessionResolution.SessionID))
+			}
+			if !hasFingerprintSnapshot && sessionResolution.ConversationID != "" {
+				headers.Set("conversation_id", isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, sessionResolution.ConversationID))
+			}
+		}
+	} else {
 		if sessionResolution.SessionID != "" {
 			headers.Set("session_id", sessionResolution.SessionID)
 		}
@@ -447,13 +447,13 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 		if fallbackSession == "" {
 			fallbackSession = strings.TrimSpace(promptCacheKey)
 		}
-				if fallbackSession != "" {
-					if account != nil && account.UsesOpenAICodexProtocol() &&
-						!shouldPreserveOutboundCodexClientSession(c, account) {
-						fallbackSession = isolateOpenAIOAuthSessionValue(getAPIKeyIDFromContext(c), codexAccountIdentitySource(c, account), fallbackSession)
-					}
-				headers.Set("session_id", fallbackSession)
+		if fallbackSession != "" {
+			if account != nil && account.UsesOpenAICodexProtocol() &&
+				!shouldPreserveOutboundCodexClientSession(c, account) {
+				fallbackSession = isolateOpenAIOAuthSessionValue(getAPIKeyIDFromContext(c), codexAccountIdentitySource(c, account), fallbackSession)
 			}
+			headers.Set("session_id", fallbackSession)
+		}
 	}
 	if strings.TrimSpace(headers.Get("conversation_id")) == "" {
 		fallbackConversation := ""
@@ -481,40 +481,40 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	if metadata := strings.TrimSpace(turnMetadata); metadata != "" && strings.TrimSpace(headers.Get(openAIWSTurnMetadataHeader)) == "" {
 		headers.Set(openAIWSTurnMetadataHeader, metadata)
 	}
-			if !shouldSkipCodexAccountIdentityRewrite(c, account, identityBody) {
-				applyCodexAccountIdentityHeaders(headers, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+	if !shouldSkipCodexAccountIdentityRewrite(c, account, identityBody) {
+		applyCodexAccountIdentityHeaders(headers, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+	}
+	// Preserve only client-supplied beta declarations here; v2 normalizes its
+	// protocol beta at the final boundary below. Fingerprint headers are applied
+	// after generic session isolation so session/full modes own the final IDs.
+	if account != nil && account.UsesOpenAICodexProtocol() {
+		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, headers, account); err != nil {
+			return nil, sessionResolution, fmt.Errorf("resolve chatgpt account headers: %w", err)
+		}
+		headers.Set("originator", resolveOpenAIUpstreamOriginator(c, isCodexCLI))
+		if !shouldPreserveOutboundCodexClientSession(c, account) {
+			identitySource := codexAccountIdentitySource(c, account)
+			apiKeyID := getAPIKeyIDFromContext(c)
+			if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalSessionID); isolated != "" {
+				headers.Set("session-id", isolated)
+				headers.Set("session_id", isolated)
 			}
-			// Preserve only client-supplied beta declarations here; v2 normalizes its
-			// protocol beta at the final boundary below. Fingerprint headers are applied
-			// after generic session isolation so session/full modes own the final IDs.
-			if account != nil && account.UsesOpenAICodexProtocol() {
-			if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, headers, account); err != nil {
-				return nil, sessionResolution, fmt.Errorf("resolve chatgpt account headers: %w", err)
+			if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalThreadID); isolated != "" {
+				headers.Set("thread-id", isolated)
+				headers.Set("thread_id", isolated)
+			} else if sessionID := strings.TrimSpace(headers.Get("session_id")); sessionID != "" {
+				headers.Set("thread-id", sessionID)
+				headers.Set("thread_id", sessionID)
 			}
-			headers.Set("originator", resolveOpenAIUpstreamOriginator(c, isCodexCLI))
-				if !shouldPreserveOutboundCodexClientSession(c, account) {
-					identitySource := codexAccountIdentitySource(c, account)
-					apiKeyID := getAPIKeyIDFromContext(c)
-					if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalSessionID); isolated != "" {
-						headers.Set("session-id", isolated)
-						headers.Set("session_id", isolated)
-					}
-					if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalThreadID); isolated != "" {
-						headers.Set("thread-id", isolated)
-						headers.Set("thread_id", isolated)
-					} else if sessionID := strings.TrimSpace(headers.Get("session_id")); sessionID != "" {
-					headers.Set("thread-id", sessionID)
-					headers.Set("thread_id", sessionID)
-				}
-					if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalRequestID); isolated != "" {
-						headers.Set("x-client-request-id", isolated)
-					} else if threadID := strings.TrimSpace(headers.Get("thread_id")); threadID != "" {
-						headers.Set("x-client-request-id", threadID)
-					}
-					if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalConversationID); isolated != "" {
-						headers.Set("conversation_id", isolated)
-					}
+			if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalRequestID); isolated != "" {
+				headers.Set("x-client-request-id", isolated)
+			} else if threadID := strings.TrimSpace(headers.Get("thread_id")); threadID != "" {
+				headers.Set("x-client-request-id", threadID)
 			}
+			if isolated := isolateOpenAIOAuthSessionValue(apiKeyID, identitySource, canonicalConversationID); isolated != "" {
+				headers.Set("conversation_id", isolated)
+			}
+		}
 		// Apply the account lifecycle after generic session isolation so full and
 		// session modes own the final session/thread/turn projection.
 		applyStagedCodexFingerprintHeaders(c, account, headers)
@@ -541,9 +541,9 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeadersWithBody(
 	if s != nil && s.cfg != nil && s.cfg.Gateway.ForceCodexCLI {
 		headers.Set("user-agent", CodexCanonicalUserAgent())
 	}
-		// 终态收口：WS 握手与 HTTP 出站共用同一套身份语义，账号级自定义 UA 同样作为
-		// 管理员显式配置传入（上面写进 headers 的值只在强制统一被关闭时才参与配对）。
-		if account != nil && account.UsesOpenAICodexProtocol() {
+	// 终态收口：WS 握手与 HTTP 出站共用同一套身份语义，账号级自定义 UA 同样作为
+	// 管理员显式配置传入（上面写进 headers 的值只在强制统一被关闭时才参与配对）。
+	if account != nil && account.UsesOpenAICodexProtocol() {
 		enforceCodexIdentityHeadersWithUA(headers, s.codexIdentityOverrideUA(account))
 	}
 
@@ -682,17 +682,17 @@ func normalizeOpenAIWSResponseCreatePayloadBytes(
 	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "response.create" {
 		return payload, false, nil
 	}
-		decoded := make(map[string]any)
-		if err := decodeOpenAIJSONUseNumber(payload, &decoded); err != nil {
-			return payload, false, err
-		}
-		if !normalizeOpenAIWSResponseCreatePayload(decoded, options) {
-			return payload, false, nil
-		}
-		normalized, err := marshalOpenAIUpstreamJSON(decoded)
-		if err != nil {
-			return payload, false, err
-		}
+	decoded := make(map[string]any)
+	if err := decodeOpenAIJSONUseNumber(payload, &decoded); err != nil {
+		return payload, false, err
+	}
+	if !normalizeOpenAIWSResponseCreatePayload(decoded, options) {
+		return payload, false, nil
+	}
+	normalized, err := marshalOpenAIUpstreamJSON(decoded)
+	if err != nil {
+		return payload, false, err
+	}
 	return normalized, true, nil
 }
 

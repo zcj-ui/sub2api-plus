@@ -374,10 +374,10 @@ func (s *AntigravityGatewayService) TestConnection(ctx context.Context, account 
 		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return nil, err
+	}
 
 	// 复用 antigravityRetryLoop：完整的重试 / credits overages / 智能重试
 	prefix := fmt.Sprintf("[antigravity-Test] account=%d(%s)", account.ID, account.Name)

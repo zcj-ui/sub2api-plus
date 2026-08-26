@@ -715,9 +715,9 @@ func TestOpenAIGatewayService_OAuthPassthrough_NamespaceNonStreamingResponse(t *
 	setOpenAIResponsesNamespaceNames(c, names)
 	account := &Account{ID: 124, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 
-		result, err := (&OpenAIGatewayService{cfg: &config.Config{}}).handleNonStreamingResponsePassthrough(
-			context.Background(), resp, c, account, "gpt-5.5", "",
-		)
+	result, err := (&OpenAIGatewayService{cfg: &config.Config{}}).handleNonStreamingResponsePassthrough(
+		context.Background(), resp, c, account, "gpt-5.5", "",
+	)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotContains(t, rec.Body.String(), "collaboration__spawn_agent")

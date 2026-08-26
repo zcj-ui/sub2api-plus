@@ -128,15 +128,15 @@ func TestOpenAIGatewayService_HandleFailoverSideEffects_DoesNotRereadResponseBod
 	})
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 
-		require.NotPanics(t, func() {
-			svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
-		})
+	require.NotPanics(t, func() {
+		svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	})
 
-		require.True(t, svc.isOpenAIAccountRuntimeBlocked(account),
-			"Plus two-strike 429 must freeze the account on the second confirmed hit")
-		require.False(t, svc.shouldRetryOpenAIOAuth429OnSameAccount(account, http.StatusTooManyRequests, false),
-			"a confirmed 429 must not keep the official same-account retry window open")
-	}
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account),
+		"Plus two-strike 429 must freeze the account on the second confirmed hit")
+	require.False(t, svc.shouldRetryOpenAIOAuth429OnSameAccount(account, http.StatusTooManyRequests, false),
+		"a confirmed 429 must not keep the official same-account retry window open")
+}
 
 func TestGetOpenAIRequestBodyMap_IgnoresLegacyContextCache(t *testing.T) {
 	gin.SetMode(gin.TestMode)

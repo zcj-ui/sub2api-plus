@@ -91,43 +91,43 @@ const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 // OpenAICodex429GuardEnabledExtraKey controls the opt-in Codex-only history
 // checkpoint used by the 429 guard (the UI calls this "奸商模式"). Missing
 // values stay disabled so existing accounts do not change behavior silently.
-	const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
+const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
 
-	// Runtime extra keys written by quota refresh / health probe. Generic account
-	// Update must preserve the current database values so a concurrent
-	// UpdateExtra is not clobbered by a stale in-memory snapshot.
-	const (
-		OpenAIQuotaCreditBalanceExtraKey   = "codex_credit_snapshot"
-		OpenAIQuotaResetCreditsExtraKey    = "codex_reset_credit_snapshot"
-		OpenAIQuotaUsageUpdatedAtExtraKey  = "codex_usage_updated_at"
-		OpenAIQuotaUsed5hPercentExtraKey   = "codex_5h_used_percent"
-		OpenAIQuotaReset5hSecondsExtraKey  = "codex_5h_reset_after_seconds"
-		OpenAIQuotaWindow5hMinutesExtraKey = "codex_5h_window_minutes"
-		OpenAIQuotaReset5hAtExtraKey       = "codex_5h_reset_at"
-		OpenAIQuotaUsed7dPercentExtraKey   = "codex_7d_used_percent"
-		OpenAIQuotaReset7dSecondsExtraKey  = "codex_7d_reset_after_seconds"
-		OpenAIQuotaWindow7dMinutesExtraKey = "codex_7d_window_minutes"
-		OpenAIQuotaReset7dAtExtraKey       = "codex_7d_reset_at"
-	)
+// Runtime extra keys written by quota refresh / health probe. Generic account
+// Update must preserve the current database values so a concurrent
+// UpdateExtra is not clobbered by a stale in-memory snapshot.
+const (
+	OpenAIQuotaCreditBalanceExtraKey   = "codex_credit_snapshot"
+	OpenAIQuotaResetCreditsExtraKey    = "codex_reset_credit_snapshot"
+	OpenAIQuotaUsageUpdatedAtExtraKey  = "codex_usage_updated_at"
+	OpenAIQuotaUsed5hPercentExtraKey   = "codex_5h_used_percent"
+	OpenAIQuotaReset5hSecondsExtraKey  = "codex_5h_reset_after_seconds"
+	OpenAIQuotaWindow5hMinutesExtraKey = "codex_5h_window_minutes"
+	OpenAIQuotaReset5hAtExtraKey       = "codex_5h_reset_at"
+	OpenAIQuotaUsed7dPercentExtraKey   = "codex_7d_used_percent"
+	OpenAIQuotaReset7dSecondsExtraKey  = "codex_7d_reset_after_seconds"
+	OpenAIQuotaWindow7dMinutesExtraKey = "codex_7d_window_minutes"
+	OpenAIQuotaReset7dAtExtraKey       = "codex_7d_reset_at"
+)
 
-	// AccountRuntimeExtraKeys are identity-independent snapshots restored from the
-	// current row during a full account Update. Identity changes still drop them.
-	func AccountRuntimeExtraKeys() []string {
-		return []string{
-			AccountHealthProbeExtraKey,
-			OpenAIQuotaCreditBalanceExtraKey,
-			OpenAIQuotaResetCreditsExtraKey,
-			OpenAIQuotaUsageUpdatedAtExtraKey,
-			OpenAIQuotaUsed5hPercentExtraKey,
-			OpenAIQuotaReset5hSecondsExtraKey,
-			OpenAIQuotaWindow5hMinutesExtraKey,
-			OpenAIQuotaReset5hAtExtraKey,
-			OpenAIQuotaUsed7dPercentExtraKey,
-			OpenAIQuotaReset7dSecondsExtraKey,
-			OpenAIQuotaWindow7dMinutesExtraKey,
-			OpenAIQuotaReset7dAtExtraKey,
-		}
+// AccountRuntimeExtraKeys are identity-independent snapshots restored from the
+// current row during a full account Update. Identity changes still drop them.
+func AccountRuntimeExtraKeys() []string {
+	return []string{
+		AccountHealthProbeExtraKey,
+		OpenAIQuotaCreditBalanceExtraKey,
+		OpenAIQuotaResetCreditsExtraKey,
+		OpenAIQuotaUsageUpdatedAtExtraKey,
+		OpenAIQuotaUsed5hPercentExtraKey,
+		OpenAIQuotaReset5hSecondsExtraKey,
+		OpenAIQuotaWindow5hMinutesExtraKey,
+		OpenAIQuotaReset5hAtExtraKey,
+		OpenAIQuotaUsed7dPercentExtraKey,
+		OpenAIQuotaReset7dSecondsExtraKey,
+		OpenAIQuotaWindow7dMinutesExtraKey,
+		OpenAIQuotaReset7dAtExtraKey,
 	}
+}
 
 const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
@@ -1347,72 +1347,72 @@ func (a *Account) IsOpenAIOAuth() bool {
 	return a.IsOpenAI() && a.Type == AccountTypeOAuth
 }
 
-	// HasAvailableCodexCredits reports whether the latest /wham/usage snapshot
-	// explicitly says this ordinary Codex OAuth account can spend paid credits.
-	// Spark shadows do not consume the parent account's paid-credit balance.
-	func (a *Account) HasAvailableCodexCredits() bool {
-		return a.hasAvailableCodexCreditsAt(time.Now().UTC())
-	}
+// HasAvailableCodexCredits reports whether the latest /wham/usage snapshot
+// explicitly says this ordinary Codex OAuth account can spend paid credits.
+// Spark shadows do not consume the parent account's paid-credit balance.
+func (a *Account) HasAvailableCodexCredits() bool {
+	return a.hasAvailableCodexCreditsAt(time.Now().UTC())
+}
 
-	func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
-		if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark || len(a.Extra) == 0 {
-			return false
-		}
-		raw, ok := a.Extra[openaiQuotaCreditBalanceKey]
-		if !ok || raw == nil {
-			return false
-		}
-		var snapshot *OpenAICodexCreditSnapshot
-		switch value := raw.(type) {
-		case *OpenAICodexCreditSnapshot:
-			snapshot = value
-		case OpenAICodexCreditSnapshot:
-			snapshot = &value
-		case map[string]any:
-			snapshot = &OpenAICodexCreditSnapshot{
-				OpenAICodexCredits: OpenAICodexCredits{
-					HasCredits:          resolveAccountExtraBool(value, "has_credits"),
-					Unlimited:           resolveAccountExtraBool(value, "unlimited"),
-					OverageLimitReached: resolveAccountExtraBool(value, "overage_limit_reached"),
-					Balance:             firstStringValue(value, "balance"),
-				},
-				UpdatedAt: firstStringValue(value, "updated_at"),
-			}
-		default:
-			return false
-		}
-		if snapshot == nil || strings.TrimSpace(snapshot.UpdatedAt) == "" {
-			return false
-		}
-		updatedAt, err := parseTime(snapshot.UpdatedAt)
-		if err != nil || updatedAt.After(now.Add(time.Minute)) {
-			return false
-		}
-		if snapshot.OverageLimitReached {
-			return false
-		}
-		if snapshot.Unlimited {
-			return true
-		}
-		if !snapshot.HasCredits {
-			return false
-		}
-		balance, err := strconv.ParseFloat(strings.TrimSpace(snapshot.Balance), 64)
-		return err == nil && balance > 0
+func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark || len(a.Extra) == 0 {
+		return false
 	}
+	raw, ok := a.Extra[openaiQuotaCreditBalanceKey]
+	if !ok || raw == nil {
+		return false
+	}
+	var snapshot *OpenAICodexCreditSnapshot
+	switch value := raw.(type) {
+	case *OpenAICodexCreditSnapshot:
+		snapshot = value
+	case OpenAICodexCreditSnapshot:
+		snapshot = &value
+	case map[string]any:
+		snapshot = &OpenAICodexCreditSnapshot{
+			OpenAICodexCredits: OpenAICodexCredits{
+				HasCredits:          resolveAccountExtraBool(value, "has_credits"),
+				Unlimited:           resolveAccountExtraBool(value, "unlimited"),
+				OverageLimitReached: resolveAccountExtraBool(value, "overage_limit_reached"),
+				Balance:             firstStringValue(value, "balance"),
+			},
+			UpdatedAt: firstStringValue(value, "updated_at"),
+		}
+	default:
+		return false
+	}
+	if snapshot == nil || strings.TrimSpace(snapshot.UpdatedAt) == "" {
+		return false
+	}
+	updatedAt, err := parseTime(snapshot.UpdatedAt)
+	if err != nil || updatedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if snapshot.OverageLimitReached {
+		return false
+	}
+	if snapshot.Unlimited {
+		return true
+	}
+	if !snapshot.HasCredits {
+		return false
+	}
+	balance, err := strconv.ParseFloat(strings.TrimSpace(snapshot.Balance), 64)
+	return err == nil && balance > 0
+}
 
-	// IsOpenAIOAuthLike reports OpenAI credentials that use the ChatGPT/Codex
-	// inference protocol. Setup tokens share that forwarding contract but do not
-	// participate in the refreshable OAuth credential lifecycle.
-	func (a *Account) IsOpenAIOAuthLike() bool {
-		return a != nil && a.IsOpenAI() && (a.Type == AccountTypeOAuth || a.Type == AccountTypeSetupToken)
-	}
+// IsOpenAIOAuthLike reports OpenAI credentials that use the ChatGPT/Codex
+// inference protocol. Setup tokens share that forwarding contract but do not
+// participate in the refreshable OAuth credential lifecycle.
+func (a *Account) IsOpenAIOAuthLike() bool {
+	return a != nil && a.IsOpenAI() && (a.Type == AccountTypeOAuth || a.Type == AccountTypeSetupToken)
+}
 
-	// UsesOpenAICodexProtocol preserves legacy OpenAI gateway OAuth routing for
-	// accounts whose platform is implicit, while adding OpenAI SetupToken.
-	func (a *Account) UsesOpenAICodexProtocol() bool {
-		return a != nil && (a.Type == AccountTypeOAuth || a.IsOpenAIOAuthLike())
-	}
+// UsesOpenAICodexProtocol preserves legacy OpenAI gateway OAuth routing for
+// accounts whose platform is implicit, while adding OpenAI SetupToken.
+func (a *Account) UsesOpenAICodexProtocol() bool {
+	return a != nil && (a.Type == AccountTypeOAuth || a.IsOpenAIOAuthLike())
+}
 
 func (a *Account) IsOpenAIChatGPTSubscription() bool {
 	if !a.IsOpenAIOAuth() {

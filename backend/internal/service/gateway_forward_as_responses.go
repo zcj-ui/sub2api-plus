@@ -70,10 +70,10 @@ func (s *GatewayService) ForwardAsResponses(
 	reqStream := true
 
 	// 4. Model mapping
-		mappedModel := originalModel
-		if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount || account.Type == AccountTypeUpstream {
-			mappedModel = account.GetMappedModel(originalModel)
-		}
+	mappedModel := originalModel
+	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount || account.Type == AccountTypeUpstream {
+		mappedModel = account.GetMappedModel(originalModel)
+	}
 	if mappedModel == originalModel && account.Platform == PlatformAnthropic && account.Type == AccountTypeServiceAccount {
 		normalized := normalizeVertexAnthropicModelID(claude.NormalizeModelID(originalModel))
 		if normalized != originalModel {

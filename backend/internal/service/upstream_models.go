@@ -432,12 +432,12 @@ func (s *AccountTestService) fetchModelsDevRegistry(ctx context.Context, account
 	if err != nil {
 		return nil, err
 	}
-		req.Header.Set("Accept", "application/json")
-		proxyURL, proxyErr := upstreamModelsProxyURL(account)
-		if proxyErr != nil {
-			return nil, proxyErr
-		}
-		resp, err := s.doUpstreamModelsRequest(req, proxyURL, account)
+	req.Header.Set("Accept", "application/json")
+	proxyURL, proxyErr := upstreamModelsProxyURL(account)
+	if proxyErr != nil {
+		return nil, proxyErr
+	}
+	resp, err := s.doUpstreamModelsRequest(req, proxyURL, account)
 	if err != nil {
 		return nil, err
 	}
@@ -591,10 +591,10 @@ func (s *AccountTestService) fetchUpstreamModelList(ctx context.Context, account
 		return nil, nil, err
 	}
 
-		proxyURL, proxyErr := resolveConfiguredProxyURL(account)
-		if proxyErr != nil {
-			return nil, nil, newUpstreamModelSyncConfigError("Configured proxy is unavailable", proxyErr)
-		}
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, nil, newUpstreamModelSyncConfigError("Configured proxy is unavailable", proxyErr)
+	}
 	resp, err := s.doUpstreamModelsRequest(req, proxyURL, account)
 	if err != nil {
 		return nil, nil, newUpstreamModelSyncUpstreamError("Failed to request upstream model list", err)
@@ -1039,20 +1039,20 @@ func (s *AccountTestService) fetchAntigravityOAuthUpstreamModels(ctx context.Con
 		return nil, newUpstreamModelSyncConfigError("No Antigravity access token is available", nil)
 	}
 
-		proxyURL, proxyErr := upstreamModelsProxyURL(account)
-		if proxyErr != nil {
-			return nil, newUpstreamModelSyncConfigError("Configured proxy is unavailable", proxyErr)
-		}
-		client, err := antigravity.NewClient(proxyURL)
-		if err != nil {
-			return nil, newUpstreamModelSyncConfigError("Failed to configure Antigravity client", err)
-		}
-		modelsResp, _, err := client.FetchAvailableModels(
-			ctx,
-			accessToken,
-			strings.TrimSpace(account.GetCredential("project_id")),
-			resolveModelsListReadLimit(s.cfg),
-		)
+	proxyURL, proxyErr := upstreamModelsProxyURL(account)
+	if proxyErr != nil {
+		return nil, newUpstreamModelSyncConfigError("Configured proxy is unavailable", proxyErr)
+	}
+	client, err := antigravity.NewClient(proxyURL)
+	if err != nil {
+		return nil, newUpstreamModelSyncConfigError("Failed to configure Antigravity client", err)
+	}
+	modelsResp, _, err := client.FetchAvailableModels(
+		ctx,
+		accessToken,
+		strings.TrimSpace(account.GetCredential("project_id")),
+		resolveModelsListReadLimit(s.cfg),
+	)
 	if err != nil {
 		return nil, newUpstreamModelSyncUpstreamError("Failed to fetch Antigravity available models", err)
 	}
@@ -1074,9 +1074,9 @@ func (s *AccountTestService) doUpstreamModelsRequest(req *http.Request, proxyURL
 	return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 }
 
-	func upstreamModelsProxyURL(account *Account) (string, error) {
-		return resolveConfiguredProxyURL(account)
-	}
+func upstreamModelsProxyURL(account *Account) (string, error) {
+	return resolveConfiguredProxyURL(account)
+}
 
 func buildV1ModelsURL(base string) string {
 	normalized := strings.TrimRight(strings.TrimSpace(base), "/")

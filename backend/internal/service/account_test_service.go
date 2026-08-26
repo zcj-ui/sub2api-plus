@@ -166,23 +166,23 @@ func (s *AccountTestService) SetSettingService(settingService *SettingService) {
 	}
 }
 
-	func (s *AccountTestService) SetOpenAIQuotaService(quotaService openAIHealthQuotaService) {
-		if s != nil {
-			s.openAIQuotaService = quotaService
-		}
+func (s *AccountTestService) SetOpenAIQuotaService(quotaService openAIHealthQuotaService) {
+	if s != nil {
+		s.openAIQuotaService = quotaService
 	}
+}
 
-	func (s *AccountTestService) SetRateLimitService(rateLimitService *RateLimitService) {
-		if s != nil {
-			s.rateLimitService = rateLimitService
-		}
+func (s *AccountTestService) SetRateLimitService(rateLimitService *RateLimitService) {
+	if s != nil {
+		s.rateLimitService = rateLimitService
 	}
+}
 
-	func (s *AccountTestService) SetPluginManager(pluginManager *PluginManager) {
-		if s != nil {
-			s.pluginManager = pluginManager
-		}
+func (s *AccountTestService) SetPluginManager(pluginManager *PluginManager) {
+	if s != nil {
+		s.pluginManager = pluginManager
 	}
+}
 
 // NewAccountTestService creates a new AccountTestService
 func NewAccountTestService(
@@ -458,10 +458,10 @@ func (s *AccountTestService) testClaudeAccountConnection(c *gin.Context, account
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 	if err != nil {
@@ -530,22 +530,22 @@ func (s *AccountTestService) testClaudeVertexServiceAccountConnection(c *gin.Con
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
 
-		resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-		}
-		defer func() { _ = resp.Body.Close() }()
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
+	defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			errMsg := fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body))
-			if resp.StatusCode == http.StatusForbidden {
-				_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusForbidden {
+			_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
 		}
 		return s.sendErrorAndEnd(c, errMsg)
 	}
@@ -616,12 +616,12 @@ func (s *AccountTestService) testBedrockAccountConnection(c *gin.Context, ctx co
 		}
 	}
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
 
-		resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, nil)
+	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, nil)
 	if err != nil {
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
@@ -975,18 +975,18 @@ func (s *AccountTestService) grokTestAccessToken(ctx context.Context, account *A
 	}
 }
 
-	func (s *AccountTestService) grokTestProxyURL(account *Account) (string, error) {
-		return resolveConfiguredProxyURL(account)
-	}
+func (s *AccountTestService) grokTestProxyURL(account *Account) (string, error) {
+	return resolveConfiguredProxyURL(account)
+}
 
-	func (s *AccountTestService) grokTestProxyOrFail(c *gin.Context, account *Account) (string, bool) {
-		proxyURL, err := s.grokTestProxyURL(account)
-		if err != nil {
-			_ = s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-			return "", false
-		}
-		return proxyURL, true
+func (s *AccountTestService) grokTestProxyOrFail(c *gin.Context, account *Account) (string, bool) {
+	proxyURL, err := s.grokTestProxyURL(account)
+	if err != nil {
+		_ = s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+		return "", false
 	}
+	return proxyURL, true
+}
 
 // accountTestProxyURL never silently falls back to a direct connection when
 // the account explicitly selected a proxy. AccountRepository hydrates Proxy on
@@ -1134,14 +1134,14 @@ func (s *AccountTestService) testGrokResponsesConnection(c *gin.Context, ctx con
 	}
 	s.applyGrokTestRequestHeaders(req, account, authToken, "application/json, text/event-stream")
 
-		proxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API request failed: %s", err.Error()))
-		}
+	proxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok Responses API request failed: %s", err.Error()))
+	}
 	defer func() { _ = resp.Body.Close() }()
 
 	s.observeGrokTestResponse(withGrokTeamRateLimitModel(ctx, testModelID), account, resp)
@@ -1226,11 +1226,11 @@ func (s *AccountTestService) testGrokImageGeneration(c *gin.Context, ctx context
 			s.applyGrokTestRequestHeaders(req, account, authToken, "application/json")
 			req.ContentLength = int64(len(payloadBytes))
 		}
-			proxyURL, ok := s.grokTestProxyOrFail(c, account)
-			if !ok {
-				return nil
-			}
-			resp, doErr = s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+		proxyURL, ok := s.grokTestProxyOrFail(c, account)
+		if !ok {
+			return nil
+		}
+		resp, doErr = s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 		if doErr == nil {
 			break
 		}
@@ -1321,14 +1321,14 @@ func (s *AccountTestService) testGrokVideoGeneration(c *gin.Context, ctx context
 	}
 	s.applyGrokTestRequestHeaders(req, account, authToken, "application/json")
 
-		proxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video request failed: %s", err.Error()))
-		}
+	proxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video request failed: %s", err.Error()))
+	}
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(ctx, account, resp)
 
@@ -1366,11 +1366,11 @@ func (s *AccountTestService) testGrokVideoGeneration(c *gin.Context, ctx context
 			return s.sendErrorAndEnd(c, "Failed to create Grok video status request")
 		}
 		s.applyGrokTestRequestHeaders(statusReq, account, authToken, "application/json")
-			statusProxyURL, ok := s.grokTestProxyOrFail(c, account)
-			if !ok {
-				return nil
-			}
-			statusResp, err := s.httpUpstream.Do(statusReq, statusProxyURL, account.ID, account.Concurrency)
+		statusProxyURL, ok := s.grokTestProxyOrFail(c, account)
+		if !ok {
+			return nil
+		}
+		statusResp, err := s.httpUpstream.Do(statusReq, statusProxyURL, account.ID, account.Concurrency)
 		if err != nil {
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video status failed: %s", err.Error()))
 		}
@@ -1427,14 +1427,14 @@ func (s *AccountTestService) emitGrokVideoResult(c *gin.Context, ctx context.Con
 		return s.sendErrorAndEnd(c, "Failed to create Grok video content request")
 	}
 	s.applyGrokTestRequestHeaders(req, account, authToken, "video/*, application/octet-stream, */*")
-		contentProxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		resp, err := s.httpUpstream.Do(req, contentProxyURL, account.ID, account.Concurrency)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video content download failed: %s", err.Error()))
-		}
+	contentProxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	resp, err := s.httpUpstream.Do(req, contentProxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok video content download failed: %s", err.Error()))
+	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20)) // 64 MiB cap for admin preview
 	if resp.StatusCode != http.StatusOK {
@@ -1501,16 +1501,16 @@ User query:
 	if err != nil {
 		return s.sendErrorAndEnd(c, "Failed to create standalone web_search probe request")
 	}
-		s.applyGrokTestRequestHeaders(req, account, authToken, "application/json")
+	s.applyGrokTestRequestHeaders(req, account, authToken, "application/json")
 
-		proxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("standalone web_search probe failed: %s", err.Error()))
-		}
+	proxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("standalone web_search probe failed: %s", err.Error()))
+	}
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(withGrokTeamRateLimitModel(ctx, grokDefaultResponsesModel), account, resp)
 
@@ -1587,12 +1587,12 @@ func (s *AccountTestService) testGrokTTS(c *gin.Context, ctx context.Context, ac
 		if err != nil {
 			return s.sendErrorAndEnd(c, "Failed to create Grok TTS request")
 		}
-			s.applyGrokTestRequestHeaders(req, account, authToken, "audio/*, application/json, */*")
-			proxyURL, ok := s.grokTestProxyOrFail(c, account)
-			if !ok {
-				return nil
-			}
-			resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+		s.applyGrokTestRequestHeaders(req, account, authToken, "audio/*, application/json, */*")
+		proxyURL, ok := s.grokTestProxyOrFail(c, account)
+		if !ok {
+			return nil
+		}
+		resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 		if err != nil {
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok TTS failed: %s", err.Error()))
 		}
@@ -1681,16 +1681,16 @@ func (s *AccountTestService) testGrokSTT(c *gin.Context, ctx context.Context, ac
 	if account.IsGrokOAuth() {
 		applyGrokCLIHeaders(req.Header)
 	}
-		account.ApplyHeaderOverrides(req.Header)
+	account.ApplyHeaderOverrides(req.Header)
 
-		proxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Grok STT failed: %s", err.Error()))
-		}
+	proxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Grok STT failed: %s", err.Error()))
+	}
 	defer func() { _ = resp.Body.Close() }()
 	s.observeGrokTestResponse(ctx, account, resp)
 	respBody, _ := io.ReadAll(resp.Body)
@@ -1768,11 +1768,11 @@ func (s *AccountTestService) testGrokRealtime(c *gin.Context, ctx context.Contex
 	dialCtx, cancel := context.WithTimeout(ctx, grokRealtimeProbeTimeout)
 	defer cancel()
 
-		proxyURL, ok := s.grokTestProxyOrFail(c, account)
-		if !ok {
-			return nil
-		}
-		conn, status, _, dialErr := dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+	proxyURL, ok := s.grokTestProxyOrFail(c, account)
+	if !ok {
+		return nil
+	}
+	conn, status, _, dialErr := dialer.Dial(dialCtx, wsURL, headers, proxyURL)
 	if dialErr != nil {
 		detail := dialErr.Error()
 		var hs *openAIWSHandshakeError
@@ -2379,10 +2379,10 @@ func (s *AccountTestService) testGeminiAccountConnection(c *gin.Context, account
 	// Send test_start event
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
+	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 	if err != nil {

@@ -18,29 +18,29 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-	// RateLimitService 处理限流和过载状态管理
-	type RateLimitService struct {
-		accountRepo           AccountRepository
-		usageRepo             UsageLogRepository
-		cfg                   *config.Config
-		geminiQuotaService    *GeminiQuotaService
-		tempUnschedCache      TempUnschedCache
-		openAIAPIKeyHealth    OpenAIAPIKeyHealthCache
-		timeoutCounterCache   TimeoutCounterCache
-		openAI429CounterCache OpenAI429CounterCache
-		openAI403CounterCache OpenAI403CounterCache
-		settingService        *SettingService
-		tokenCacheInvalidator TokenCacheInvalidator
-		runtimeBlocker        AccountRuntimeBlocker
-		usageCacheMu          sync.RWMutex
-		usageCache            map[int64]*geminiUsageCacheEntry
-		openAI429Locks        sync.Map
-		openAI429Streak       sync.Map
+// RateLimitService 处理限流和过载状态管理
+type RateLimitService struct {
+	accountRepo           AccountRepository
+	usageRepo             UsageLogRepository
+	cfg                   *config.Config
+	geminiQuotaService    *GeminiQuotaService
+	tempUnschedCache      TempUnschedCache
+	openAIAPIKeyHealth    OpenAIAPIKeyHealthCache
+	timeoutCounterCache   TimeoutCounterCache
+	openAI429CounterCache OpenAI429CounterCache
+	openAI403CounterCache OpenAI403CounterCache
+	settingService        *SettingService
+	tokenCacheInvalidator TokenCacheInvalidator
+	runtimeBlocker        AccountRuntimeBlocker
+	usageCacheMu          sync.RWMutex
+	usageCache            map[int64]*geminiUsageCacheEntry
+	openAI429Locks        sync.Map
+	openAI429Streak       sync.Map
 
-		// OpenAI Team 联动熔断的进程内去重：teamID → 去重窗口截止时间
-		openaiTeamLinkedMu     sync.Mutex
-		openaiTeamLinkedRecent map[string]time.Time
-	}
+	// OpenAI Team 联动熔断的进程内去重：teamID → 去重窗口截止时间
+	openaiTeamLinkedMu     sync.Mutex
+	openaiTeamLinkedRecent map[string]time.Time
+}
 
 type AccountRuntimeBlocker interface {
 	BlockAccountScheduling(account *Account, until time.Time, reason string)

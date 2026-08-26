@@ -131,14 +131,14 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 			ExpiresAt: expiresAt,
 		})
 	}
-		return openAIRateLimitResetCreditDetails{
-			AvailableCount:           availableCount,
-			ApplicableAvailableCount: applicableAvailableCount,
-			AvailableCreditCount:     availableCreditCount,
-			CreditListPresent:        creditListPresent,
-			Credits:                  credits,
-			AutoResetCandidates:      autoResetCandidates,
-		}, nil
+	return openAIRateLimitResetCreditDetails{
+		AvailableCount:           availableCount,
+		ApplicableAvailableCount: applicableAvailableCount,
+		AvailableCreditCount:     availableCreditCount,
+		CreditListPresent:        creditListPresent,
+		Credits:                  credits,
+		AutoResetCandidates:      autoResetCandidates,
+	}, nil
 }
 
 func parseOpenAIResetCreditAvailableCount(values ...json.RawMessage) *int {

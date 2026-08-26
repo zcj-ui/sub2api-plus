@@ -184,11 +184,11 @@ func (s *GatewayService) handleWebSearchEmulation(
 	return writeWebSearchNonStreamResponse(c, query, resp, model, startTime)
 }
 
-	func doWebSearch(ctx context.Context, account *Account, query string) (*websearch.SearchResponse, string, error) {
-		proxyURL, err := resolveAccountProxyURL(account)
-		if err != nil {
-			return nil, "", err
-		}
+func doWebSearch(ctx context.Context, account *Account, query string) (*websearch.SearchResponse, string, error) {
+	proxyURL, err := resolveAccountProxyURL(account)
+	if err != nil {
+		return nil, "", err
+	}
 	mgr := getWebSearchManager()
 	if mgr == nil {
 		return nil, "", fmt.Errorf("web search emulation: manager not initialized")
@@ -203,9 +203,9 @@ func (s *GatewayService) handleWebSearchEmulation(
 	return resp, providerName, nil
 }
 
-	func resolveAccountProxyURL(account *Account) (string, error) {
-		return resolveConfiguredProxyURL(account)
-	}
+func resolveAccountProxyURL(account *Account) (string, error) {
+	return resolveConfiguredProxyURL(account)
+}
 
 // --- SSE streaming response ---
 

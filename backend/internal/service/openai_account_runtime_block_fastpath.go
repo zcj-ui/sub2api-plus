@@ -10,18 +10,18 @@ import (
 	"time"
 )
 
-	const (
-		openAIAccountStateUpdateTimeout       = 5 * time.Second
-		openAIOAuth429FallbackCooldown        = 5 * time.Second
-		openAIOAuth429ConfirmationWindow      = 30 * time.Second
-		openAIOAuth429RetryWindow             = 2 * time.Minute
-		openAIOAuth429RetryDelay              = 500 * time.Millisecond
-		openAIOAuth429MaxRetryDelay           = 8 * time.Second
-		openAIOAuth429MaxAccountAttempts      = 3
-		openAIStopSchedulingBridgeCooldown    = 2 * time.Minute
-		openAIOAuth429StormWindow             = 10 * time.Second
-		openAIOAuth429StormMaxAccountSwitches = 1
-	)
+const (
+	openAIAccountStateUpdateTimeout       = 5 * time.Second
+	openAIOAuth429FallbackCooldown        = 5 * time.Second
+	openAIOAuth429ConfirmationWindow      = 30 * time.Second
+	openAIOAuth429RetryWindow             = 2 * time.Minute
+	openAIOAuth429RetryDelay              = 500 * time.Millisecond
+	openAIOAuth429MaxRetryDelay           = 8 * time.Second
+	openAIOAuth429MaxAccountAttempts      = 3
+	openAIStopSchedulingBridgeCooldown    = 2 * time.Minute
+	openAIOAuth429StormWindow             = 10 * time.Second
+	openAIOAuth429StormMaxAccountSwitches = 1
+)
 
 type openAIOAuth429StreakState struct {
 	Count              int
@@ -395,17 +395,17 @@ func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context
 	}
 	// Spark 影子：不按 /responses 429 的 global x-codex-* 信号做内存运行时熔断(同 handle429,外审第8轮 P1)。
 	// 同时避免把 spark 的 429 计入全局 429 storm 计数(recordOpenAIOAuth429),否则会误伤母账号 failover 决策。
-		if account.IsShadow() || account.QuotaDimensionOrDefault() == QuotaDimensionSpark {
-			return
-		}
-		s.recordOpenAIOAuth429()
-		disposition, resetAt := classifyOpenAIOAuth429(headers, responseBody)
-		_ = disposition
-		// A confirmed two-strike 429 must freeze immediately. The official same-account
-		// retry window only delays an unconfirmed mark (stream/direct callers).
-		if !openAIOAuth429AlreadyConfirmed(ctx) && s.openAIOAuth429RetryWindowActive(account) {
-			return
-		}
+	if account.IsShadow() || account.QuotaDimensionOrDefault() == QuotaDimensionSpark {
+		return
+	}
+	s.recordOpenAIOAuth429()
+	disposition, resetAt := classifyOpenAIOAuth429(headers, responseBody)
+	_ = disposition
+	// A confirmed two-strike 429 must freeze immediately. The official same-account
+	// retry window only delays an unconfirmed mark (stream/direct callers).
+	if !openAIOAuth429AlreadyConfirmed(ctx) && s.openAIOAuth429RetryWindowActive(account) {
+		return
+	}
 
 	cooldownUntil := time.Now().Add(openAIOAuth429FallbackCooldown)
 	if resetAt != nil && resetAt.After(time.Now()) {
@@ -648,10 +648,10 @@ func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	s.clearOpenAIOAuth429Streak(accountID)
 	mu := s.openAIAccountRuntimeBlockLock(accountID)
 	mu.Lock()
-		s.openaiAccountRuntimeBlockUntil.Delete(accountID)
-		s.openaiAccountRuntimeBlockReason.Delete(accountID)
-		s.openaiOAuth429RetryStartedAt.Delete(accountID)
-		s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
+	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
+	s.openaiAccountRuntimeBlockReason.Delete(accountID)
+	s.openaiOAuth429RetryStartedAt.Delete(accountID)
+	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
 	mu.Unlock()
 }
 

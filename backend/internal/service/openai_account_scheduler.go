@@ -20,10 +20,10 @@ import (
 )
 
 const (
-		openAIAccountScheduleLayerPreviousResponse = "previous_response_id"
-		openAIAccountScheduleLayer429Continuation  = "429_guard_continuation"
-		openAIAccountScheduleLayerGuardianParent   = "guardian_parent"
-		openAIAccountScheduleLayerSessionSticky    = "session_hash"
+	openAIAccountScheduleLayerPreviousResponse = "previous_response_id"
+	openAIAccountScheduleLayer429Continuation  = "429_guard_continuation"
+	openAIAccountScheduleLayerGuardianParent   = "guardian_parent"
+	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
 )
@@ -2311,44 +2311,44 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
-		decision := OpenAIAccountScheduleDecision{}
-		// Pricing restrictions are a request-level gate and must run before every
-		// scheduling fast path, including a 429-guard continuation. A bound old
-		// connection does not grant permission to use a restricted model/channel.
-		if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
-			slog.Warn("channel pricing restriction blocked request",
-				"group_id", derefGroupID(groupID),
-				"model", requestedModel)
-			return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
-		}
-		if selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
-			ctx,
-			groupID,
-			platform,
-			previousResponseID,
-			sessionHash,
-			requestedModel,
-			excludedIDs,
-			requiredTransport,
-			requiredCapability,
-			requireCompact,
-			requiredImageCapability,
-		); continuationErr != nil {
-			return nil, decision, continuationErr
-		} else if continuation && selection != nil && selection.Account != nil {
-			decision.Layer = openAIAccountScheduleLayer429Continuation
-			decision.StickyPreviousHit = strings.TrimSpace(previousResponseID) != ""
-			decision.StickySessionHit = !decision.StickyPreviousHit && strings.TrimSpace(sessionHash) != ""
-			decision.ContinuationLease = true
-			decision.SelectedAccountID = selection.Account.ID
-			decision.SelectedAccountType = selection.Account.Type
-			return selection, decision, nil
-		}
-		preserveGuardianParentBinding := preserveOpenAIGuardianParentBinding(ctx, sessionHash)
-		guardianParentAccountID := int64(0)
-		if strings.TrimSpace(previousResponseID) == "" {
-			guardianParentAccountID = s.resolveOpenAIGuardianParentAccountID(ctx, groupID)
-		}
+	decision := OpenAIAccountScheduleDecision{}
+	// Pricing restrictions are a request-level gate and must run before every
+	// scheduling fast path, including a 429-guard continuation. A bound old
+	// connection does not grant permission to use a restricted model/channel.
+	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
+		slog.Warn("channel pricing restriction blocked request",
+			"group_id", derefGroupID(groupID),
+			"model", requestedModel)
+		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
+	}
+	if selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
+		ctx,
+		groupID,
+		platform,
+		previousResponseID,
+		sessionHash,
+		requestedModel,
+		excludedIDs,
+		requiredTransport,
+		requiredCapability,
+		requireCompact,
+		requiredImageCapability,
+	); continuationErr != nil {
+		return nil, decision, continuationErr
+	} else if continuation && selection != nil && selection.Account != nil {
+		decision.Layer = openAIAccountScheduleLayer429Continuation
+		decision.StickyPreviousHit = strings.TrimSpace(previousResponseID) != ""
+		decision.StickySessionHit = !decision.StickyPreviousHit && strings.TrimSpace(sessionHash) != ""
+		decision.ContinuationLease = true
+		decision.SelectedAccountID = selection.Account.ID
+		decision.SelectedAccountType = selection.Account.Type
+		return selection, decision, nil
+	}
+	preserveGuardianParentBinding := preserveOpenAIGuardianParentBinding(ctx, sessionHash)
+	guardianParentAccountID := int64(0)
+	if strings.TrimSpace(previousResponseID) == "" {
+		guardianParentAccountID = s.resolveOpenAIGuardianParentAccountID(ctx, groupID)
+	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
@@ -2787,12 +2787,12 @@ func (s *OpenAIGatewayService) SnapshotOpenAIAccountSchedulerMetrics() OpenAIAcc
 	return scheduler.SnapshotMetrics()
 }
 
-	func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
-		if s != nil {
-			return s.openAIStickySessionIdleTTL(context.Background())
-		}
-		return openaiStickySessionIdleTTLDefault
+func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
+	if s != nil {
+		return s.openAIStickySessionIdleTTL(context.Background())
 	}
+	return openaiStickySessionIdleTTLDefault
+}
 
 func (s *OpenAIGatewayService) openAIWSLBTopK() int {
 	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.LBTopK > 0 {

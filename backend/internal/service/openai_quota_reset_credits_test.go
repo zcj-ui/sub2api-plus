@@ -32,10 +32,10 @@ func TestParseOpenAIRateLimitResetCreditDetails_PreservesAvailableCreditOrder(t 
 		{ExpiresAt: "2026-07-05T04:05:06Z"},
 		{ExpiresAt: "2026-07-06T04:05:06Z"},
 	}, details.Credits)
-		require.Equal(t, []openAIAutoResetCreditCandidate{
-			{ID: "credit-later", ExpiresAt: "2026-07-05T04:05:06Z"},
-			{ID: "credit-earlier", ExpiresAt: "2026-07-06T04:05:06Z"},
-		}, details.AutoResetCandidates)
+	require.Equal(t, []openAIAutoResetCreditCandidate{
+		{ID: "credit-later", ExpiresAt: "2026-07-05T04:05:06Z"},
+		{ID: "credit-earlier", ExpiresAt: "2026-07-06T04:05:06Z"},
+	}, details.AutoResetCandidates)
 }
 
 func TestQueryUsageResetCreditCountPrecedence(t *testing.T) {

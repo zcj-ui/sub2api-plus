@@ -501,10 +501,10 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	if err != nil {
 		return nil, "", "", err
 	}
-		proxyURL, proxyErr := s.resolveProxyURL(ctx, account)
-		if proxyErr != nil {
-			return nil, "", "", infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_PROXY_UNAVAILABLE", "configured account proxy is unavailable: %v", proxyErr)
-		}
+	proxyURL, proxyErr := s.resolveProxyURL(ctx, account)
+	if proxyErr != nil {
+		return nil, "", "", infraerrors.Newf(http.StatusBadGateway, "GROK_QUOTA_PROXY_UNAVAILABLE", "configured account proxy is unavailable: %v", proxyErr)
+	}
 
 	token, err := s.tokenProvider.GetAccessToken(ctx, account)
 	if err != nil {
@@ -517,12 +517,12 @@ func (s *GrokQuotaService) prepareProbe(ctx context.Context, accountID int64) (*
 	return account, token, proxyURL, nil
 }
 
-	func (s *GrokQuotaService) resolveProxyURL(ctx context.Context, account *Account) (string, error) {
-		if s == nil {
-			return resolveConfiguredProxyURL(account)
-		}
-		return resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+func (s *GrokQuotaService) resolveProxyURL(ctx context.Context, account *Account) (string, error) {
+	if s == nil {
+		return resolveConfiguredProxyURL(account)
 	}
+	return resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+}
 
 func (s *GrokQuotaService) loadGrokOAuthAccount(ctx context.Context, accountID int64) (*Account, error) {
 	if s == nil || s.accountRepo == nil {

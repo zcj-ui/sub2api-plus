@@ -877,32 +877,32 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
-		if strings.TrimSpace(gjson.GetBytes(firstClientMessage, "type").String()) != "response.create" {
-			return NewOpenAIWSClientCloseError(
-				coderws.StatusPolicyViolation,
-				"first relay frame must be response.create after prelude buffering",
-				nil,
-			)
+	if strings.TrimSpace(gjson.GetBytes(firstClientMessage, "type").String()) != "response.create" {
+		return NewOpenAIWSClientCloseError(
+			coderws.StatusPolicyViolation,
+			"first relay frame must be response.create after prelude buffering",
+			nil,
+		)
+	}
+	if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, firstClientMessage); changed {
+		firstClientMessage = scrubbed
+	}
+	if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(firstClientMessage) {
+		withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(firstClientMessage)
+		if appendErr != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
 		}
-		if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, firstClientMessage); changed {
-			firstClientMessage = scrubbed
+		if appended {
+			firstClientMessage = withContextPair
 		}
-		if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(firstClientMessage) {
-			withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(firstClientMessage)
-			if appendErr != nil {
-				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
-			}
-			if appended {
-				firstClientMessage = withContextPair
-			}
+	}
+	if isOpenAIResponsesLiteWebSocketPayload(firstClientMessage) {
+		liteFirstMessage, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(firstClientMessage, account)
+		if liteErr != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
 		}
-			if isOpenAIResponsesLiteWebSocketPayload(firstClientMessage) {
-				liteFirstMessage, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(firstClientMessage, account)
-				if liteErr != nil {
-					return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
-				}
-				firstClientMessage = liteFirstMessage
-			}
+		firstClientMessage = liteFirstMessage
+	}
 	if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 		if capped, changed := ApplyOpenAIReasoningEffortPolicy(firstClientMessage, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 			firstClientMessage = capped
@@ -968,15 +968,15 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			firstClientMessage = aliasedBody
 		}
 	}
-		if !shouldSkipCodexAccountIdentityRewrite(c, account, firstClientMessage) {
-			accountScopedFirst, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(firstClientMessage, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-			if scopeErr != nil {
-				return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
-			}
-			if accountScoped {
-				firstClientMessage = accountScopedFirst
-			}
+	if !shouldSkipCodexAccountIdentityRewrite(c, account, firstClientMessage) {
+		accountScopedFirst, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(firstClientMessage, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+		if scopeErr != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
 		}
+		if accountScoped {
+			firstClientMessage = accountScopedFirst
+		}
+	}
 	usageMeta := newOpenAIWSPassthroughUsageMeta(initialRequestModel, firstClientMessage)
 	updatedFirst, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, capturedSessionModel, firstClientMessage)
 	if policyErr != nil {
@@ -1134,10 +1134,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			truncateOpenAIWSLogValue(err.Error(), openAIWSLogValueMaxLen),
 		)
 		s.handleOpenAIWSDialTransientFailure(ctx, account, capturedSessionModel, dialErr)
-			if dialStatus, rateLimited := openAIWSDialRateLimitStatus(dialErr); rateLimited {
-				s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, responseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), dialStatus)
-				return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, responseBody, err.Error())
-			}
+		if dialStatus, rateLimited := openAIWSDialRateLimitStatus(dialErr); rateLimited {
+			s.persistOpenAIWSRateLimitSignal(ctx, account, handshakeHeaders, responseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), dialStatus)
+			return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, responseBody, err.Error())
+		}
 		return s.mapOpenAIWSPassthroughDialError(err, statusCode, handshakeHeaders)
 	}
 	defer func() {
@@ -1276,57 +1276,57 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					}
 				}()
 			}
-				responsesLite := isResponseCreate && isOpenAIResponsesLiteWebSocketPayload(payload)
-				if isResponseCreate {
-					if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(payload) {
-						withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(payload)
-						if appendErr != nil {
-							return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
-						}
-						if appended {
-							payload = withContextPair
-						}
+			responsesLite := isResponseCreate && isOpenAIResponsesLiteWebSocketPayload(payload)
+			if isResponseCreate {
+				if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(payload) {
+					withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(payload)
+					if appendErr != nil {
+						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
 					}
-					if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(payload, account, responsesLite); normalizeErr != nil {
-						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeErr)
-					} else if compatibilityChanged {
-						payload = normalized
+					if appended {
+						payload = withContextPair
 					}
 				}
-				if account.IsOpenAIOAuthLike() && (isResponseCreate || eventType == "session.update") {
-					aliasedBody, reverse, aliased, aliasErr := aliasOpenAIOAuthReservedToolNamesBody(payload)
-					if aliasErr != nil {
-						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, aliasErr.Error(), aliasErr)
+				if normalized, compatibilityChanged, normalizeErr := normalizeOpenAIResponsesWebSocketCompatibilityBody(payload, account, responsesLite); normalizeErr != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", normalizeErr)
+				} else if compatibilityChanged {
+					payload = normalized
+				}
+			}
+			if account.IsOpenAIOAuthLike() && (isResponseCreate || eventType == "session.update") {
+				aliasedBody, reverse, aliased, aliasErr := aliasOpenAIOAuthReservedToolNamesBody(payload)
+				if aliasErr != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, aliasErr.Error(), aliasErr)
+				}
+				updateCodexToolNameReverseForWSFrame(c, payload, reverse)
+				if aliased {
+					payload = aliasedBody
+				}
+			}
+			if (isResponseCreate || eventType == "session.update") &&
+				!shouldSkipCodexAccountIdentityRewrite(c, account, payload) {
+				accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
+				if scopeErr != nil {
+					return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
+				}
+				if accountScoped {
+					payload = accountScopedPayload
+				}
+			}
+			if isResponseCreate {
+				if responsesLite {
+					litePayload, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(payload, account)
+					if liteErr != nil {
+						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
 					}
-					updateCodexToolNameReverseForWSFrame(c, payload, reverse)
-					if aliased {
-						payload = aliasedBody
+					payload = litePayload
+				}
+				if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
+					if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+						payload = capped
 					}
 				}
-				if (isResponseCreate || eventType == "session.update") &&
-					!shouldSkipCodexAccountIdentityRewrite(c, account, payload) {
-					accountScopedPayload, accountScoped, scopeErr := applyCodexAccountIdentityClientMetadataRaw(payload, codexAccountIdentitySource(c, account), getAPIKeyIDFromContext(c))
-					if scopeErr != nil {
-						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket identity metadata", scopeErr)
-					}
-					if accountScoped {
-						payload = accountScopedPayload
-					}
-				}
-				if isResponseCreate {
-					if responsesLite {
-						litePayload, _, liteErr := normalizeOpenAIResponsesLitePayloadForAccount(payload, account)
-						if liteErr != nil {
-							return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, liteErr.Error(), liteErr)
-						}
-						payload = litePayload
-					}
-					if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-						if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
-							payload = capped
-						}
-					}
-				}
+			}
 			turnNo := int(completedTurns.Load()) + 1
 			if turnNo < 2 {
 				turnNo = 2
@@ -1615,38 +1615,38 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if msgType != coderws.MessageText {
 					return nil
 				}
-					eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
-					if eventType == "response.created" {
-						failureAccountSideEffectsApplied = false
-					}
-					if eventType == "response.failed" {
-						errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
-						upstreamStatus := openAIWSPayloadUpstreamStatus(payload)
-						turnNo := completedTurns.Load() + 1
-						isRateLimit := recordRateLimitSignal(turnNo, upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, payload)
-						if !wroteDownstream && isRateLimit {
-							return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, payload, errMsgRaw)
-						}
-					}
-					if isOpenAIWSTerminalEvent(eventType) {
-						s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
-					}
-					if eventType == "error" {
-						s.handleOpenAIWSErrorEventTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
-					}
+				eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
+				if eventType == "response.created" {
+					failureAccountSideEffectsApplied = false
+				}
+				if eventType == "response.failed" {
 					errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
-					isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitSignal(openAIWSPayloadUpstreamStatus(payload), errCodeRaw, errTypeRaw, errMsgRaw)
-					if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
-						failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
-					}
-					if eventType != "error" {
-						return nil
-					}
+					upstreamStatus := openAIWSPayloadUpstreamStatus(payload)
 					turnNo := completedTurns.Load() + 1
-					isRateLimit := recordRateLimitSignal(turnNo, openAIWSPayloadUpstreamStatus(payload), errCodeRaw, errTypeRaw, errMsgRaw, payload)
-					if wroteDownstream || !isRateLimit {
-						return nil
+					isRateLimit := recordRateLimitSignal(turnNo, upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, payload)
+					if !wroteDownstream && isRateLimit {
+						return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, payload, errMsgRaw)
 					}
+				}
+				if isOpenAIWSTerminalEvent(eventType) {
+					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
+				}
+				if eventType == "error" {
+					s.handleOpenAIWSErrorEventTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
+				}
+				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
+				isPreOutputRateLimit := eventType == "error" && !wroteDownstream && isOpenAIWSRateLimitSignal(openAIWSPayloadUpstreamStatus(payload), errCodeRaw, errTypeRaw, errMsgRaw)
+				if (eventType == "error" || eventType == "response.failed") && !failureAccountSideEffectsApplied && !isPreOutputRateLimit {
+					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, capturedSessionModel, handshakeHeaders, payload)
+				}
+				if eventType != "error" {
+					return nil
+				}
+				turnNo := completedTurns.Load() + 1
+				isRateLimit := recordRateLimitSignal(turnNo, openAIWSPayloadUpstreamStatus(payload), errCodeRaw, errTypeRaw, errMsgRaw, payload)
+				if wroteDownstream || !isRateLimit {
+					return nil
+				}
 				logOpenAIWSV2Passthrough(
 					"relay_rate_limit_failover account_id=%d err_code=%s err_type=%s err_message=%s",
 					account.ID,

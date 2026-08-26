@@ -67,14 +67,14 @@ func RegisterAdminRoutes(
 		// 代理管理
 		registerProxyRoutes(admin, h, stepUpAuth)
 
-			// 卡密管理
-			registerRedeemCodeRoutes(admin, h, stepUpAuth)
+		// 卡密管理
+		registerRedeemCodeRoutes(admin, h, stepUpAuth)
 
-			// 优惠码管理
-			registerPromoCodeRoutes(admin, h)
+		// 优惠码管理
+		registerPromoCodeRoutes(admin, h)
 
-			// 系统设置
-			registerSettingsRoutes(admin, h, stepUpAuth)
+		// 系统设置
+		registerSettingsRoutes(admin, h, stepUpAuth)
 
 		// 数据管理
 		registerDataManagementRoutes(admin, h, stepUpAuth)
@@ -381,8 +381,8 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.DELETE("/:id", h.Admin.Account.Delete)
 		accounts.POST("/:id/test", h.Admin.Account.Test)
 		accounts.POST("/:id/recover-state", h.Admin.Account.RecoverState)
-			accounts.POST("/:id/refresh", h.Admin.Account.Refresh)
-			accounts.POST("/:id/set-privacy", h.Admin.Account.SetPrivacy)
+		accounts.POST("/:id/refresh", h.Admin.Account.Refresh)
+		accounts.POST("/:id/set-privacy", h.Admin.Account.SetPrivacy)
 		accounts.POST("/:id/refresh-tier", h.Admin.Account.RefreshTier)
 		accounts.GET("/:id/stats", h.Admin.Account.GetStats)
 		accounts.POST("/:id/clear-error", h.Admin.Account.ClearError)
@@ -400,11 +400,11 @@ func registerAccountRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAu
 		accounts.GET("/:id/models", h.Admin.Account.GetAvailableModels)
 		accounts.POST("/:id/models/sync-upstream", h.Admin.Account.SyncUpstreamModels)
 		accounts.POST("/batch", h.Admin.Account.BatchCreate)
-			// 账号导出/导入/批量改凭证都会接触上游密钥——要求 step-up 2FA
-			accounts.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ExportData)
-			accounts.POST("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ImportData)
-			accounts.POST("/batch-update-credentials", gin.HandlerFunc(stepUpAuth), h.Admin.Account.BatchUpdateCredentials)
-			accounts.POST("/:id/apply-oauth-credentials", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ApplyOAuthCredentials)
+		// 账号导出/导入/批量改凭证都会接触上游密钥——要求 step-up 2FA
+		accounts.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ExportData)
+		accounts.POST("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ImportData)
+		accounts.POST("/batch-update-credentials", gin.HandlerFunc(stepUpAuth), h.Admin.Account.BatchUpdateCredentials)
+		accounts.POST("/:id/apply-oauth-credentials", gin.HandlerFunc(stepUpAuth), h.Admin.Account.ApplyOAuthCredentials)
 		accounts.POST("/batch-refresh-tier", h.Admin.Account.BatchRefreshTier)
 		accounts.POST("/bulk-update", h.Admin.Account.BulkUpdate)
 		accounts.POST("/batch-delete", h.Admin.Account.BatchDelete)
@@ -510,9 +510,9 @@ func registerProxyRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth
 	{
 		proxies.GET("", h.Admin.Proxy.List)
 		proxies.GET("/all", h.Admin.Proxy.GetAll)
-			// 代理导出/导入泄露账号密码原文——要求 step-up 2FA
-			proxies.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ExportData)
-			proxies.POST("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ImportData)
+		// 代理导出/导入泄露账号密码原文——要求 step-up 2FA
+		proxies.GET("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ExportData)
+		proxies.POST("/data", gin.HandlerFunc(stepUpAuth), h.Admin.Proxy.ImportData)
 		proxies.GET("/:id", h.Admin.Proxy.GetByID)
 		proxies.POST("", h.Admin.Proxy.Create)
 		proxies.PUT("/:id", h.Admin.Proxy.Update)
@@ -526,13 +526,13 @@ func registerProxyRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth
 	}
 }
 
-	func registerRedeemCodeRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {
-		codes := admin.Group("/redeem-codes")
-		{
-			codes.GET("", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.List)
-			codes.GET("/stats", h.Admin.Redeem.GetStats)
-			codes.GET("/export", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.Export)
-			codes.GET("/:id", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.GetByID)
+func registerRedeemCodeRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {
+	codes := admin.Group("/redeem-codes")
+	{
+		codes.GET("", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.List)
+		codes.GET("/stats", h.Admin.Redeem.GetStats)
+		codes.GET("/export", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.Export)
+		codes.GET("/:id", gin.HandlerFunc(stepUpAuth), h.Admin.Redeem.GetByID)
 		codes.POST("/create-and-redeem", h.Admin.Redeem.CreateAndRedeem)
 		codes.POST("/generate", h.Admin.Redeem.Generate)
 		codes.DELETE("/:id", h.Admin.Redeem.Delete)
@@ -554,7 +554,7 @@ func registerPromoCodeRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 	}
 }
 
-	func registerSettingsRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {
+func registerSettingsRoutes(admin *gin.RouterGroup, h *handler.Handlers, stepUpAuth middleware.StepUpAuthMiddleware) {
 	adminSettings := admin.Group("/settings")
 	{
 		adminSettings.GET("", h.Admin.Setting.GetSettings)
@@ -566,10 +566,10 @@ func registerPromoCodeRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		adminSettings.GET("/email-templates/:event/:locale", h.Admin.Setting.GetEmailTemplate)
 		adminSettings.PUT("/email-templates/:event/:locale", h.Admin.Setting.UpdateEmailTemplate)
 		adminSettings.POST("/email-templates/:event/:locale/restore-official", h.Admin.Setting.RestoreOfficialEmailTemplate)
-			// Admin API Key 管理：读取/轮换/删除都要求 step-up，禁止管理员 API Key 自续命
-			adminSettings.GET("/admin-api-key", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.GetAdminAPIKey)
-			adminSettings.POST("/admin-api-key/regenerate", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.RegenerateAdminAPIKey)
-			adminSettings.DELETE("/admin-api-key", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.DeleteAdminAPIKey)
+		// Admin API Key 管理：读取/轮换/删除都要求 step-up，禁止管理员 API Key 自续命
+		adminSettings.GET("/admin-api-key", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.GetAdminAPIKey)
+		adminSettings.POST("/admin-api-key/regenerate", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.RegenerateAdminAPIKey)
+		adminSettings.DELETE("/admin-api-key", gin.HandlerFunc(stepUpAuth), h.Admin.Setting.DeleteAdminAPIKey)
 		// 529过载冷却配置
 		adminSettings.GET("/overload-cooldown", h.Admin.Setting.GetOverloadCooldownSettings)
 		adminSettings.PUT("/overload-cooldown", h.Admin.Setting.UpdateOverloadCooldownSettings)

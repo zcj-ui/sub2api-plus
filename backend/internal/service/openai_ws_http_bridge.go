@@ -502,13 +502,13 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	pendingClientMessageBytes := int64(0)
 	capacityFailoverSuppressedLogged := false
 	clientDisconnected := false
-		rateLimitSignalHandled := false
-		officialOpenAIResponses := account != nil && account.Platform == PlatformOpenAI
-		bareErrorPending := false
-		var bareErrorPayload []byte
-		bareErrorMessage := ""
-		failureAccountSideEffectsApplied := false
-		mappedModel := actualModel
+	rateLimitSignalHandled := false
+	officialOpenAIResponses := account != nil && account.Platform == PlatformOpenAI
+	bareErrorPending := false
+	var bareErrorPayload []byte
+	bareErrorMessage := ""
+	failureAccountSideEffectsApplied := false
+	mappedModel := actualModel
 	needModelReplace := false
 	var mappedModelBytes []byte
 	if originalModel != "" {
@@ -704,46 +704,46 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 			}
 			statusCode := openAIStreamFailureStatus(upstreamMessage, errMessage)
 			shouldFailover := openAIStreamFailedEventShouldFailover(upstreamMessage, errMessage)
-				isRateLimit := false
-				var errCodeRaw, errTypeRaw string
-				if eventType == "error" {
-					errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
-					// Prefer an explicit status carried by the relay. When it is
-					// absent, retain the message so transport text such as
-					// "last status: 429 Too Many Requests" still participates in
-					// the explicit 429 confirmation path.
-					if explicitStatus := openAIWSPayloadUpstreamStatus(upstreamMessage); explicitStatus != 0 {
-						statusCode = explicitStatus
-					} else if account.Platform == PlatformGrok {
-						statusCode = openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
-					} else {
-						statusCode = openAIWSErrorHTTPStatusFromRawWithMessage(errCodeRaw, errTypeRaw, errMessage)
-					}
-					isRateLimit = account.Platform == PlatformOpenAI && recordRateLimitSignal(statusCode, errCodeRaw, errTypeRaw, errMessage, upstreamMessage)
-					shouldFailover = s.shouldFailoverOpenAIUpstreamResponse(statusCode, errMessage, upstreamMessage)
-				} else if account.Platform == PlatformOpenAI {
-					errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
-					isRateLimit = recordRateLimitSignal(
-						statusCode,
-						errCodeRaw,
-						errTypeRaw,
-						errMessage,
-						upstreamMessage,
-					)
+			isRateLimit := false
+			var errCodeRaw, errTypeRaw string
+			if eventType == "error" {
+				errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
+				// Prefer an explicit status carried by the relay. When it is
+				// absent, retain the message so transport text such as
+				// "last status: 429 Too Many Requests" still participates in
+				// the explicit 429 confirmation path.
+				if explicitStatus := openAIWSPayloadUpstreamStatus(upstreamMessage); explicitStatus != 0 {
+					statusCode = explicitStatus
+				} else if account.Platform == PlatformGrok {
+					statusCode = openAIWSErrorHTTPStatusFromRaw(errCodeRaw, errTypeRaw)
+				} else {
+					statusCode = openAIWSErrorHTTPStatusFromRawWithMessage(errCodeRaw, errTypeRaw, errMessage)
 				}
-				requestScopedCapacity := isOpenAIUpstreamCapacityShedEvent(upstreamMessage)
-				if account.Platform == PlatformGrok && eventType == "error" {
-					// SSE error events do not carry an HTTP status. The local status
-					// mapper therefore defaults unknown xAI codes (for example
-					// new_sensitive) to 502; classify the body as a request-scoped
-					// 403 before applying status-based failover or account state.
-					if isGrokContentPolicyRejection(http.StatusForbidden, upstreamMessage) {
-						shouldFailover = false
-					} else {
-						shouldFailover = s.shouldFailoverGrokUpstreamError(statusCode, upstreamMessage)
-						s.handleGrokAccountUpstreamError(ctx, account, statusCode, resp.Header, upstreamMessage)
-					}
+				isRateLimit = account.Platform == PlatformOpenAI && recordRateLimitSignal(statusCode, errCodeRaw, errTypeRaw, errMessage, upstreamMessage)
+				shouldFailover = s.shouldFailoverOpenAIUpstreamResponse(statusCode, errMessage, upstreamMessage)
+			} else if account.Platform == PlatformOpenAI {
+				errCodeRaw, errTypeRaw, _ = parseOpenAIWSErrorEventFields(upstreamMessage)
+				isRateLimit = recordRateLimitSignal(
+					statusCode,
+					errCodeRaw,
+					errTypeRaw,
+					errMessage,
+					upstreamMessage,
+				)
+			}
+			requestScopedCapacity := isOpenAIUpstreamCapacityShedEvent(upstreamMessage)
+			if account.Platform == PlatformGrok && eventType == "error" {
+				// SSE error events do not carry an HTTP status. The local status
+				// mapper therefore defaults unknown xAI codes (for example
+				// new_sensitive) to 502; classify the body as a request-scoped
+				// 403 before applying status-based failover or account state.
+				if isGrokContentPolicyRejection(http.StatusForbidden, upstreamMessage) {
+					shouldFailover = false
+				} else {
+					shouldFailover = s.shouldFailoverGrokUpstreamError(statusCode, upstreamMessage)
+					s.handleGrokAccountUpstreamError(ctx, account, statusCode, resp.Header, upstreamMessage)
 				}
+			}
 			// A later bridge turn may be replayed only for an explicit 429 before
 			// anything reached the client. Other later-turn failures must remain
 			// visible to avoid replaying client state that the handler does not own.
@@ -753,11 +753,11 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				}
 				return nil, s.newOpenAIStreamFailoverError(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, resp.Header)
 			}
-				if account.Platform != PlatformGrok && !failureAccountSideEffectsApplied {
-					if !isRateLimit && (eventType == "response.failed" || (!officialOpenAIResponses && shouldFailover && !requestScopedCapacity)) {
-						failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, mappedModel, resp.Header, upstreamMessage)
-					}
+			if account.Platform != PlatformGrok && !failureAccountSideEffectsApplied {
+				if !isRateLimit && (eventType == "response.failed" || (!officialOpenAIResponses && shouldFailover && !requestScopedCapacity)) {
+					failureAccountSideEffectsApplied = s.handleOpenAIWSFailureAccountSideEffects(ctx, account, mappedModel, resp.Header, upstreamMessage)
 				}
+			}
 			if wroteDownstream && requestScopedCapacity && !capacityFailoverSuppressedLogged {
 				logOpenAICapacityFailoverSuppressed(ctx, account, "ws_http_bridge", resp.Header.Get("x-request-id"), eventType)
 				capacityFailoverSuppressedLogged = true

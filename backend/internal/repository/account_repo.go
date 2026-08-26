@@ -735,69 +735,69 @@ func lockAndMergeAccountProbeExtra(
 		return nil, service.ErrAccountNotFound
 	}
 
-		var (
-			identityUnchanged            bool
-			ollamaGroupIdentityUnchanged bool
-			ollamaProxyIdentityUnchanged bool
-			currentEnabled               []byte
-			currentRateSyncEnabled       []byte
-			currentSnapshot              []byte
-			currentOllamaSession         []byte
-			currentOllamaAutoRefresh     []byte
-			currentOllamaSnapshot        []byte
-			currentHealthProbe           []byte
-			currentCreditSnapshot        []byte
-			currentResetCreditSnapshot   []byte
-			currentUsageUpdatedAt        []byte
-			currentUsed5hPercent         []byte
-			currentReset5hSeconds        []byte
-			currentWindow5hMinutes       []byte
-			currentReset5hAt             []byte
-			currentUsed7dPercent         []byte
-			currentReset7dSeconds        []byte
-			currentWindow7dMinutes       []byte
-			currentReset7dAt             []byte
-		)
-		if err := rows.Scan(
-			&identityUnchanged,
-			&ollamaGroupIdentityUnchanged,
-			&ollamaProxyIdentityUnchanged,
-			&currentEnabled,
-			&currentRateSyncEnabled,
-			&currentSnapshot,
-			&currentOllamaSession,
-			&currentOllamaAutoRefresh,
-			&currentOllamaSnapshot,
-			&currentHealthProbe,
-			&currentCreditSnapshot,
-			&currentResetCreditSnapshot,
-			&currentUsageUpdatedAt,
-			&currentUsed5hPercent,
-			&currentReset5hSeconds,
-			&currentWindow5hMinutes,
-			&currentReset5hAt,
-			&currentUsed7dPercent,
-			&currentReset7dSeconds,
-			&currentWindow7dMinutes,
-			&currentReset7dAt,
-		); err != nil {
+	var (
+		identityUnchanged            bool
+		ollamaGroupIdentityUnchanged bool
+		ollamaProxyIdentityUnchanged bool
+		currentEnabled               []byte
+		currentRateSyncEnabled       []byte
+		currentSnapshot              []byte
+		currentOllamaSession         []byte
+		currentOllamaAutoRefresh     []byte
+		currentOllamaSnapshot        []byte
+		currentHealthProbe           []byte
+		currentCreditSnapshot        []byte
+		currentResetCreditSnapshot   []byte
+		currentUsageUpdatedAt        []byte
+		currentUsed5hPercent         []byte
+		currentReset5hSeconds        []byte
+		currentWindow5hMinutes       []byte
+		currentReset5hAt             []byte
+		currentUsed7dPercent         []byte
+		currentReset7dSeconds        []byte
+		currentWindow7dMinutes       []byte
+		currentReset7dAt             []byte
+	)
+	if err := rows.Scan(
+		&identityUnchanged,
+		&ollamaGroupIdentityUnchanged,
+		&ollamaProxyIdentityUnchanged,
+		&currentEnabled,
+		&currentRateSyncEnabled,
+		&currentSnapshot,
+		&currentOllamaSession,
+		&currentOllamaAutoRefresh,
+		&currentOllamaSnapshot,
+		&currentHealthProbe,
+		&currentCreditSnapshot,
+		&currentResetCreditSnapshot,
+		&currentUsageUpdatedAt,
+		&currentUsed5hPercent,
+		&currentReset5hSeconds,
+		&currentWindow5hMinutes,
+		&currentReset5hAt,
+		&currentUsed7dPercent,
+		&currentReset7dSeconds,
+		&currentWindow7dMinutes,
+		&currentReset7dAt,
+	); err != nil {
 		return nil, err
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-		extra := copyJSONMap(normalizeJSONMap(account.Extra))
-		for _, key := range append([]string{
-			service.UpstreamBillingProbeEnabledExtraKey,
-			service.UpstreamBillingRateSyncEnabledExtraKey,
-			service.UpstreamBillingProbeExtraKey,
-			service.OllamaCloudUsageSessionExtraKey,
-			service.OllamaCloudUsageAutoRefreshExtraKey,
-			service.OllamaCloudUsageSnapshotExtraKey,
-		}, service.AccountRuntimeExtraKeys()...) {
-			delete(extra, key)
-		}
+	extra := copyJSONMap(normalizeJSONMap(account.Extra))
+	for _, key := range append([]string{
+		service.UpstreamBillingProbeEnabledExtraKey,
+		service.UpstreamBillingRateSyncEnabledExtraKey,
+		service.UpstreamBillingProbeExtraKey,
+		service.OllamaCloudUsageSessionExtraKey,
+		service.OllamaCloudUsageAutoRefreshExtraKey,
+		service.OllamaCloudUsageSnapshotExtraKey,
+	}, service.AccountRuntimeExtraKeys()...) {
+		delete(extra, key)
+	}
 	probeAccount := service.IsUpstreamBillingProbeIdentity(account.Platform, account.Type)
 	probeEnabled := false
 	probeEnabledPresent := false
@@ -864,38 +864,38 @@ func lockAndMergeAccountProbeExtra(
 				extra[key] = value
 			}
 		}
-			if ollamaProxyIdentityUnchanged {
-				if snapshot, ok, err := decodeAccountExtraJSON(currentOllamaSnapshot); err != nil {
-					return nil, err
-				} else if ok {
-					extra[service.OllamaCloudUsageSnapshotExtraKey] = snapshot
-				}
+		if ollamaProxyIdentityUnchanged {
+			if snapshot, ok, err := decodeAccountExtraJSON(currentOllamaSnapshot); err != nil {
+				return nil, err
+			} else if ok {
+				extra[service.OllamaCloudUsageSnapshotExtraKey] = snapshot
 			}
 		}
-		if identityUnchanged {
-			for key, raw := range map[string][]byte{
-				service.AccountHealthProbeExtraKey:           currentHealthProbe,
-				service.OpenAIQuotaCreditBalanceExtraKey:     currentCreditSnapshot,
-				service.OpenAIQuotaResetCreditsExtraKey:      currentResetCreditSnapshot,
-				service.OpenAIQuotaUsageUpdatedAtExtraKey:    currentUsageUpdatedAt,
-				service.OpenAIQuotaUsed5hPercentExtraKey:     currentUsed5hPercent,
-				service.OpenAIQuotaReset5hSecondsExtraKey:    currentReset5hSeconds,
-				service.OpenAIQuotaWindow5hMinutesExtraKey:   currentWindow5hMinutes,
-				service.OpenAIQuotaReset5hAtExtraKey:         currentReset5hAt,
-				service.OpenAIQuotaUsed7dPercentExtraKey:     currentUsed7dPercent,
-				service.OpenAIQuotaReset7dSecondsExtraKey:    currentReset7dSeconds,
-				service.OpenAIQuotaWindow7dMinutesExtraKey:   currentWindow7dMinutes,
-				service.OpenAIQuotaReset7dAtExtraKey:         currentReset7dAt,
-			} {
-				if value, ok, err := decodeAccountExtraJSON(raw); err != nil {
-					return nil, err
-				} else if ok {
-					extra[key] = value
-				}
-			}
-		}
-		return extra, nil
 	}
+	if identityUnchanged {
+		for key, raw := range map[string][]byte{
+			service.AccountHealthProbeExtraKey:         currentHealthProbe,
+			service.OpenAIQuotaCreditBalanceExtraKey:   currentCreditSnapshot,
+			service.OpenAIQuotaResetCreditsExtraKey:    currentResetCreditSnapshot,
+			service.OpenAIQuotaUsageUpdatedAtExtraKey:  currentUsageUpdatedAt,
+			service.OpenAIQuotaUsed5hPercentExtraKey:   currentUsed5hPercent,
+			service.OpenAIQuotaReset5hSecondsExtraKey:  currentReset5hSeconds,
+			service.OpenAIQuotaWindow5hMinutesExtraKey: currentWindow5hMinutes,
+			service.OpenAIQuotaReset5hAtExtraKey:       currentReset5hAt,
+			service.OpenAIQuotaUsed7dPercentExtraKey:   currentUsed7dPercent,
+			service.OpenAIQuotaReset7dSecondsExtraKey:  currentReset7dSeconds,
+			service.OpenAIQuotaWindow7dMinutesExtraKey: currentWindow7dMinutes,
+			service.OpenAIQuotaReset7dAtExtraKey:       currentReset7dAt,
+		} {
+			if value, ok, err := decodeAccountExtraJSON(raw); err != nil {
+				return nil, err
+			} else if ok {
+				extra[key] = value
+			}
+		}
+	}
+	return extra, nil
+}
 
 func decodeAccountExtraJSON(raw []byte) (any, bool, error) {
 	if len(raw) == 0 || string(raw) == "null" {

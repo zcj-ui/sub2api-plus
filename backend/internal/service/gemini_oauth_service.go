@@ -409,10 +409,10 @@ func (s *GeminiOAuthService) RefreshAccountGoogleOneTier(
 		return "", nil, nil, fmt.Errorf("missing access_token")
 	}
 
-		proxyURL, err := resolveConfiguredProxyURL(account)
-		if err != nil {
-			return "", nil, nil, err
-		}
+	proxyURL, err := resolveConfiguredProxyURL(account)
+	if err != nil {
+		return "", nil, nil, err
+	}
 
 	// 调用 Drive API
 	tierID, storageInfo, err := s.FetchGoogleOneTier(ctx, accessToken, proxyURL)
@@ -745,12 +745,12 @@ func (s *GeminiOAuthService) RefreshAccountToken(ctx context.Context, account *A
 		oauthType = "code_assist"
 	}
 
-		proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
-		if err != nil {
-			return nil, err
-		}
+	proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+	if err != nil {
+		return nil, err
+	}
 
-		tokenInfo, err := s.RefreshToken(ctx, oauthType, refreshToken, proxyURL)
+	tokenInfo, err := s.RefreshToken(ctx, oauthType, refreshToken, proxyURL)
 	// Backward compatibility:
 	// Older versions could refresh Code Assist tokens using a user-provided OAuth client when configured.
 	// If the refresh token was originally issued to that custom client, forcing the built-in client will

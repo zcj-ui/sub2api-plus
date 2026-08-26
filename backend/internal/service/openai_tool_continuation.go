@@ -251,13 +251,13 @@ func AnalyzeToolCallOutputContextCoverageBytes(body []byte) ToolCallOutputContex
 	missingCallID := false
 	var outputCallIDs map[string]struct{}
 	var contextIDs map[string]struct{}
-		analyzeItem := func(item gjson.Result) {
-			if !item.IsObject() {
-				return
-			}
-			if isCodexSyntheticAgentContextJSONItem(item) {
-				return
-			}
+	analyzeItem := func(item gjson.Result) {
+		if !item.IsObject() {
+			return
+		}
+		if isCodexSyntheticAgentContextJSONItem(item) {
+			return
+		}
 		itemType := item.Get("type").String()
 		switch {
 		case isCodexToolCallOutputItemType(itemType):
