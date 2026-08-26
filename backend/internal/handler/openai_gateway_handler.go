@@ -1117,15 +1117,15 @@ func isOpenAIRemoteCompactionV2RequestForContext(c *gin.Context, body []byte) bo
 // 返回归一化后的 body；ok=false 表示错误响应已写出，调用方应直接 return。
 func (h *OpenAIGatewayHandler) normalizeOpenAIResponsesCompactRequest(c *gin.Context, reqLog *zap.Logger, body []byte) ([]byte, bool) {
 	isCompactRequest := isOpenAILegacyCompactPath(c)
-		if !isCompactRequest && isBareOpenAIResponsesPath(c) && service.HasCompactionTriggerInInput(body) {
-			if normalized, changed, err := service.NormalizeCompactionTriggerInputOrder(body); err != nil {
-				reqLog.Warn("codex.remote_compact.trigger_order_normalization_failed", zap.Error(err))
-			} else if changed {
-				body = normalized
-			}
-			if isOpenAIRemoteCompactionV2RequestForContext(c, body) {
-				return body, true
-			}
+	if !isCompactRequest && isBareOpenAIResponsesPath(c) && service.HasCompactionTriggerInInput(body) {
+		if normalized, changed, err := service.NormalizeCompactionTriggerInputOrder(body); err != nil {
+			reqLog.Warn("codex.remote_compact.trigger_order_normalization_failed", zap.Error(err))
+		} else if changed {
+			body = normalized
+		}
+		if isOpenAIRemoteCompactionV2RequestForContext(c, body) {
+			return body, true
+		}
 		c.Request.URL.Path = strings.TrimRight(c.Request.URL.Path, "/") + "/compact"
 		isCompactRequest = true
 		clientStream := gjson.GetBytes(body, "stream").Bool()
@@ -2317,15 +2317,15 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
-		// A WebSocket without an explicit session signal gets a per-connection
-		// fallback. Content/model-only frames are not stable conversation IDs and
-		// must never reuse another client's local upstream socket.
-		sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, firstMessage)
-		if sessionHash == "" {
-			fallbackSeed := openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID) + ":" + uuid.NewString()
-			sessionHash = h.gatewayService.GenerateSessionHashWithFallback(c, nil, fallbackSeed)
-		}
-		ctx = service.WithOpenAIGuardianParentAffinity(ctx, c, firstMessage, reqModel)
+	// A WebSocket without an explicit session signal gets a per-connection
+	// fallback. Content/model-only frames are not stable conversation IDs and
+	// must never reuse another client's local upstream socket.
+	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, firstMessage)
+	if sessionHash == "" {
+		fallbackSeed := openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID) + ":" + uuid.NewString()
+		sessionHash = h.gatewayService.GenerateSessionHashWithFallback(c, nil, fallbackSeed)
+	}
+	ctx = service.WithOpenAIGuardianParentAffinity(ctx, c, firstMessage, reqModel)
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -3037,80 +3037,80 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			defer cleanupPreempt()
 		}
 
-			for {
-				err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
-				if err == nil {
-					reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
+		for {
+			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
+			if err == nil {
+				reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
+				return
+			}
+			if service.IsOpenAIWSSessionPreemptedError(err) {
+				return
+			}
+			// Some dial/handshake failures happen before the relay can invoke
+			// AfterTurn. Release only an unsettled lease here; a completed turn
+			// keeps its lease until its background bill has reached the cache
+			// barrier, even if the socket subsequently fails.
+			subscriptionTurnLeases.abortUnsettled()
+			var failoverErr *service.UpstreamFailoverError
+			if errors.As(err, &failoverErr) {
+				retryPayload, retryCurrentTurn := service.OpenAIWSCurrentTurnRetryPayload(err)
+				nextAttemptMessage, retrySafe := openAIWSNextAttemptMessage(wsAttemptMessage, retryPayload, retryCurrentTurn)
+				if !retrySafe {
+					closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
 					return
 				}
-				if service.IsOpenAIWSSessionPreemptedError(err) {
-					return
-				}
-				// Some dial/handshake failures happen before the relay can invoke
-				// AfterTurn. Release only an unsettled lease here; a completed turn
-				// keeps its lease until its background bill has reached the cache
-				// barrier, even if the socket subsequently fails.
-				subscriptionTurnLeases.abortUnsettled()
-				var failoverErr *service.UpstreamFailoverError
-				if errors.As(err, &failoverErr) {
-					retryPayload, retryCurrentTurn := service.OpenAIWSCurrentTurnRetryPayload(err)
-					nextAttemptMessage, retrySafe := openAIWSNextAttemptMessage(wsAttemptMessage, retryPayload, retryCurrentTurn)
-					if !retrySafe {
+				if retryCurrentTurn {
+					if !applyWSCurrentTurnRetryPayload(nextAttemptMessage) {
 						closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
 						return
 					}
-					if retryCurrentTurn {
-						if !applyWSCurrentTurnRetryPayload(nextAttemptMessage) {
-							closeOpenAIWSFailoverExhausted(c, wsConn, failoverErr)
+					reqLog.Warn("openai.websocket_current_turn_failover_retry",
+						zap.Int64("account_id", account.ID),
+						zap.Int("upstream_status", failoverErr.StatusCode),
+						zap.Int("retry_payload_bytes", len(retryPayload)),
+					)
+				} else {
+					wsAttemptMessage = nextAttemptMessage
+				}
+				if waitForWSSameAccountRetry(account, failoverErr) {
+					if failoverErr.ShouldReportAccountScheduleFailure() {
+						h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, wsForwardModel, false, nil), false, nil, err)
+					}
+					if !ensureUserSlotHeld() {
+						return
+					}
+					if currentAccountRelease == nil {
+						accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+						if acquireErr != nil || !acquired {
+							reqLog.Warn("openai.websocket_same_account_retry_slot_unavailable",
+								zap.Int64("account_id", account.ID),
+								zap.Error(acquireErr),
+							)
+							closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
 							return
 						}
-						reqLog.Warn("openai.websocket_current_turn_failover_retry",
-							zap.Int64("account_id", account.ID),
-							zap.Int("upstream_status", failoverErr.StatusCode),
-							zap.Int("retry_payload_bytes", len(retryPayload)),
-						)
-					} else {
-						wsAttemptMessage = nextAttemptMessage
+						currentAccountRelease = wrapReleaseOnDone(ctx, accountRelease)
 					}
-					if waitForWSSameAccountRetry(account, failoverErr) {
-						if failoverErr.ShouldReportAccountScheduleFailure() {
-							h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, wsForwardModel, false, nil), false, nil, err)
-						}
-						if !ensureUserSlotHeld() {
-							return
-						}
-						if currentAccountRelease == nil {
-							accountRelease, acquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
-							if acquireErr != nil || !acquired {
-								reqLog.Warn("openai.websocket_same_account_retry_slot_unavailable",
-									zap.Int64("account_id", account.ID),
-									zap.Error(acquireErr),
-								)
-								closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "account is busy, please retry later")
-								return
-							}
-							currentAccountRelease = wrapReleaseOnDone(ctx, accountRelease)
-						}
-						wsFirstMessage = wsAttemptMessage
-						continue
-					}
-					if handleWSFailover(account, failoverErr) {
-						if failoverErr.WSResume != nil {
-							if !applyWSResume(failoverErr.WSResume) {
-								closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
-								return
-							}
-						} else if strings.TrimSpace(previousResponseID) != "" {
-							// A raw previous_response_id is only meaningful to the old
-							// upstream account. Do not strip it and send a delta-only
-							// request to a replacement account without a verified replay.
+					wsFirstMessage = wsAttemptMessage
+					continue
+				}
+				if handleWSFailover(account, failoverErr) {
+					if failoverErr.WSResume != nil {
+						if !applyWSResume(failoverErr.WSResume) {
 							closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
 							return
 						}
-						break
+					} else if strings.TrimSpace(previousResponseID) != "" {
+						// A raw previous_response_id is only meaningful to the old
+						// upstream account. Do not strip it and send a delta-only
+						// request to a replacement account without a verified replay.
+						closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
+						return
 					}
-					return
+					break
 				}
+				return
+			}
 
 			if errors.Is(context.Cause(ctx), service.ErrOpenAIWSIngressLeaseLost) {
 				reqLog.Warn("openai.websocket_ingress_lease_lost",
@@ -3779,75 +3779,75 @@ func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn b
 	return append([]byte(nil), retryPayload...), true
 }
 
-	// openAIWSCurrentTurnRetryPayloadState validates the full replay payload that
-	// the HTTP bridge creates for a later failed turn. The model belongs to this
-	// payload, not to the connection's first response.create frame.
-	func openAIWSCurrentTurnRetryPayloadState(payload []byte) ([]byte, string, service.ToolCallOutputContextCoverage, bool) {
-		if !gjson.ValidBytes(payload) {
-			return nil, "", service.ToolCallOutputContextCoverage{}, false
-		}
-		if messageType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); messageType != "response.create" {
-			return nil, "", service.ToolCallOutputContextCoverage{}, false
-		}
-		model := gjson.GetBytes(payload, "model")
-		if !model.Exists() || model.Type != gjson.String || strings.TrimSpace(model.String()) == "" {
-			return nil, "", service.ToolCallOutputContextCoverage{}, false
-		}
-		coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
-		if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
-			return nil, "", service.ToolCallOutputContextCoverage{}, false
-		}
-		return append([]byte(nil), payload...), strings.TrimSpace(model.String()), coverage, true
+// openAIWSCurrentTurnRetryPayloadState validates the full replay payload that
+// the HTTP bridge creates for a later failed turn. The model belongs to this
+// payload, not to the connection's first response.create frame.
+func openAIWSCurrentTurnRetryPayloadState(payload []byte) ([]byte, string, service.ToolCallOutputContextCoverage, bool) {
+	if !gjson.ValidBytes(payload) {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
 	}
-
-	func openAIWSSubscriptionTurnLeaseEnabled(configured bool, platform string, cfg *config.Config) bool {
-		if !configured || platform != service.PlatformOpenAI {
-			return false
-		}
-		// Simple mode intentionally bypasses billing and quota enforcement; do not
-		// introduce a distributed admission dependency into that mode.
-		return cfg == nil || cfg.RunMode != config.RunModeSimple
+	if messageType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); messageType != "response.create" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
 	}
+	model := gjson.GetBytes(payload, "model")
+	if !model.Exists() || model.Type != gjson.String || strings.TrimSpace(model.String()) == "" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
+	if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	return append([]byte(nil), payload...), strings.TrimSpace(model.String()), coverage, true
+}
 
-	func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failoverErr *service.UpstreamFailoverError) {
-		intendedStatus := http.StatusBadGateway
-		errorType := "upstream_error"
-		errorCode := "upstream_ws_failover_exhausted"
-		message := "upstream websocket proxy failed"
-		closeStatus := coderws.StatusInternalError
+func openAIWSSubscriptionTurnLeaseEnabled(configured bool, platform string, cfg *config.Config) bool {
+	if !configured || platform != service.PlatformOpenAI {
+		return false
+	}
+	// Simple mode intentionally bypasses billing and quota enforcement; do not
+	// introduce a distributed admission dependency into that mode.
+	return cfg == nil || cfg.RunMode != config.RunModeSimple
+}
 
-		if failoverErr != nil {
-			if reason := strings.TrimSpace(string(failoverErr.Reason)); reason != "" {
-				errorCode = reason
-			}
-			if failoverErr.Stage == service.GatewayFailureStageAccountAuth {
-				intendedStatus = http.StatusServiceUnavailable
-				errorType = "api_error"
-				message = service.GrokCredentialUnavailableClientMessage
+func closeOpenAIWSFailoverExhausted(c *gin.Context, conn *coderws.Conn, failoverErr *service.UpstreamFailoverError) {
+	intendedStatus := http.StatusBadGateway
+	errorType := "upstream_error"
+	errorCode := "upstream_ws_failover_exhausted"
+	message := "upstream websocket proxy failed"
+	closeStatus := coderws.StatusInternalError
+
+	if failoverErr != nil {
+		if reason := strings.TrimSpace(string(failoverErr.Reason)); reason != "" {
+			errorCode = reason
+		}
+		if failoverErr.Stage == service.GatewayFailureStageAccountAuth {
+			intendedStatus = http.StatusServiceUnavailable
+			errorType = "api_error"
+			message = service.GrokCredentialUnavailableClientMessage
+			closeStatus = coderws.StatusTryAgainLater
+		} else {
+			switch failoverErr.StatusCode {
+			case http.StatusTooManyRequests:
+				intendedStatus = http.StatusTooManyRequests
+				errorType = "rate_limit_error"
+				message = "upstream rate limit exceeded, please retry later"
 				closeStatus = coderws.StatusTryAgainLater
-			} else {
-				switch failoverErr.StatusCode {
-				case http.StatusTooManyRequests:
-					intendedStatus = http.StatusTooManyRequests
-					errorType = "rate_limit_error"
-					message = "upstream rate limit exceeded, please retry later"
-					closeStatus = coderws.StatusTryAgainLater
-				case 529, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-					intendedStatus = failoverErr.StatusCode
-					message = "upstream service temporarily unavailable"
-					closeStatus = coderws.StatusTryAgainLater
-				case http.StatusUnauthorized, http.StatusForbidden:
-					intendedStatus = failoverErr.StatusCode
-					errorType = "authentication_error"
-					message = "upstream websocket authentication failed"
-					closeStatus = coderws.StatusPolicyViolation
-				}
+			case 529, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				intendedStatus = failoverErr.StatusCode
+				message = "upstream service temporarily unavailable"
+				closeStatus = coderws.StatusTryAgainLater
+			case http.StatusUnauthorized, http.StatusForbidden:
+				intendedStatus = failoverErr.StatusCode
+				errorType = "authentication_error"
+				message = "upstream websocket authentication failed"
+				closeStatus = coderws.StatusPolicyViolation
 			}
 		}
-
-		service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
-		closeOpenAIClientWS(conn, closeStatus, message)
 	}
+
+	service.MarkOpsStreamFailure(c, errorType, errorCode, message, intendedStatus)
+	closeOpenAIClientWS(conn, closeStatus, message)
+}
 
 func writeContentModerationWSError(ctx context.Context, conn *coderws.Conn, decision *service.ContentModerationDecision) {
 	if conn == nil || decision == nil {

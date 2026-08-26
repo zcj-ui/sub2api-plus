@@ -458,9 +458,9 @@ func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	if cfg.Gateway.OpenAIWS.APIKeyMaxConnsFactor != 1.0 {
 		t.Fatalf("Gateway.OpenAIWS.APIKeyMaxConnsFactor = %v, want 1.0", cfg.Gateway.OpenAIWS.APIKeyMaxConnsFactor)
 	}
-		if cfg.Gateway.OpenAIWS.StickySessionTTLSeconds != 60 {
-			t.Fatalf("Gateway.OpenAIWS.StickySessionTTLSeconds = %d, want 60", cfg.Gateway.OpenAIWS.StickySessionTTLSeconds)
-		}
+	if cfg.Gateway.OpenAIWS.StickySessionTTLSeconds != 60 {
+		t.Fatalf("Gateway.OpenAIWS.StickySessionTTLSeconds = %d, want 60", cfg.Gateway.OpenAIWS.StickySessionTTLSeconds)
+	}
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled {
 		t.Fatalf("Gateway.OpenAIScheduler.StickyEscapeEnabled = true, want false (escape is opt-in)")
 	}

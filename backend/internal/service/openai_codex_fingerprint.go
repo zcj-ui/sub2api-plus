@@ -477,13 +477,6 @@ func shouldPreserveCodexClientSessionIdentityForRequest(c *gin.Context, account 
 		strings.TrimSpace(ids.installationID) != ""
 }
 
-func inboundCodexIdentityHeaders(c *gin.Context) http.Header {
-	if c != nil && c.Request != nil {
-		return c.Request.Header
-	}
-	return nil
-}
-
 func frozenCodexClientIdentityPassthrough(c *gin.Context, account *Account) bool {
 	if account == nil || !account.IsOpenAIOAuth() || c == nil {
 		return false
@@ -1229,54 +1222,42 @@ func codexFingerprintSeed(extra map[string]any) (string, bool) {
 	return canonicalCodexFingerprintSeed(extraStringValue(extra, codexFingerprintSeedExtraKey))
 }
 
-	func newCodexFingerprintSeed() string {
-		return uuid.NewString()
-	}
+func newCodexFingerprintSeed() string {
+	return uuid.NewString()
+}
 
-	func stripCodexFingerprintSeed(extra map[string]any) map[string]any {
-		if extra == nil {
-			return nil
-		}
-		stripped := cloneCodexFingerprintExtra(extra)
-		delete(stripped, codexFingerprintSeedExtraKey)
-		return stripped
+func stripCodexFingerprintSeed(extra map[string]any) map[string]any {
+	if extra == nil {
+		return nil
 	}
+	stripped := cloneCodexFingerprintExtra(extra)
+	delete(stripped, codexFingerprintSeedExtraKey)
+	return stripped
+}
 
-	func prepareCodexFingerprintExtraForCreate(platform, accountType string, extra map[string]any) map[string]any {
-		prepared := stripCodexFingerprintSeed(extra)
-		if platform != PlatformOpenAI || (accountType != AccountTypeOAuth && accountType != AccountTypeSetupToken) || !codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
-			return prepared
+func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]any) map[string]any {
+	if account != nil && account.IsOpenAIOAuth() {
+		return NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
+	}
+	prepared := stripCodexFingerprintSeed(extra)
+	if account == nil || !account.IsOpenAIOAuthLike() {
+		return prepared
+	}
+	if seed, ok := codexFingerprintSeed(account.Extra); ok {
+		if prepared == nil {
+			prepared = make(map[string]any, 1)
 		}
+		prepared[codexFingerprintSeedExtraKey] = seed
+		return prepared
+	}
+	if codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
 		if prepared == nil {
 			prepared = make(map[string]any, 1)
 		}
 		prepared[codexFingerprintSeedExtraKey] = newCodexFingerprintSeed()
-		return prepared
 	}
-
-	func prepareCodexFingerprintExtraForUpdate(account *Account, extra map[string]any) map[string]any {
-		if account != nil && account.IsOpenAIOAuth() {
-			return NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
-		}
-		prepared := stripCodexFingerprintSeed(extra)
-		if account == nil || !account.IsOpenAIOAuthLike() {
-			return prepared
-		}
-		if seed, ok := codexFingerprintSeed(account.Extra); ok {
-			if prepared == nil {
-				prepared = make(map[string]any, 1)
-			}
-			prepared[codexFingerprintSeedExtraKey] = seed
-			return prepared
-		}
-		if codexFingerprintModeRequiresSeed(codexFingerprintModeFromExtra(prepared)) {
-			if prepared == nil {
-				prepared = make(map[string]any, 1)
-			}
-			prepared[codexFingerprintSeedExtraKey] = newCodexFingerprintSeed()
-		}
-		return prepared
-	}
+	return prepared
+}
 
 func sanitizedCodexFingerprintExtraUpdates(updates map[string]any) map[string]any {
 	if updates == nil {

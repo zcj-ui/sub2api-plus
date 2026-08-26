@@ -115,16 +115,7 @@ func openAICodexBetaFeatureHeaderValues(h http.Header) []string {
 	return values
 }
 
-	func hasOpenAICodexBetaFeaturesHeader(h http.Header) bool {
-		for _, value := range openAICodexBetaFeatureHeaderValues(h) {
-			if strings.TrimSpace(value) != "" {
-				return true
-			}
-		}
-		return false
-	}
-
-	// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
+// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
 // Native remote compaction v2 is the only wire shape that requires the
 // gateway to add its explicit capability token.
 //
@@ -148,16 +139,16 @@ func openAICodexBetaFeatureHeaderValues(h http.Header) []string {
 // 已知无解的歧义：用户关掉 v2 且无其他特性时，真实 Codex 同样不发该头，与"老
 // 客户端"在线型上不可区分，此时按默认形态补注。该用户的 legacy 压缩端点本就
 // 已被上游下线（404），不存在可回退的正确行为。
-	func applyOpenAICodexBetaFeatures(c *gin.Context, account *Account, h http.Header) {
-		if h == nil {
-			return
-		}
-		if isOpenAINativeCompactionV2(c) {
-			ensureOpenAIRemoteCompactionV2BetaFeature(h)
-		}
+func applyOpenAICodexBetaFeatures(c *gin.Context, account *Account, h http.Header) {
+	if h == nil {
+		return
 	}
+	if isOpenAINativeCompactionV2(c) {
+		ensureOpenAIRemoteCompactionV2BetaFeature(h)
+	}
+}
 
-	// HasCompactionTriggerInInput detects an input item with
+// HasCompactionTriggerInInput detects an input item with
 // type="compaction_trigger". The handler combines this body signal with the
 // request path, stream flag, and Codex beta feature header to distinguish the
 // native remote compaction v2 wire from the legacy /responses/compact bridge.
