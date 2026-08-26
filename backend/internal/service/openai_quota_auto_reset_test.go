@@ -188,6 +188,10 @@ func (q *autoResetTestQuota) QueryUsage(context.Context, int64) (*OpenAIQuotaUsa
 	return &copy, nil
 }
 
+func (q *autoResetTestQuota) CacheUsageSnapshot(context.Context, int64, *OpenAIQuotaUsage) error {
+	return nil
+}
+
 func (q *autoResetTestQuota) CacheResetCreditsSnapshot(context.Context, int64, *OpenAIRateLimitResetCredits) error {
 	return nil
 }

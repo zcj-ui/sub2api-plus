@@ -133,19 +133,7 @@ func TestCodexModelsAppliesLocalFiltersBeforeClientETag(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	groupID := int64(43)
 	repo := &codexModelsFailoverAccountRepo{accounts: []service.Account{
-		{
-			ID:          1,
-			Name:        "custom-openai",
-			Platform:    service.PlatformOpenAI,
-			Type:        service.AccountTypeAPIKey,
-			Status:      service.StatusActive,
-			Schedulable: true,
-			Concurrency: 1,
-			Credentials: map[string]any{
-				"api_key":  "sk-test",
-				"base_url": "https://upstream.example/v1",
-			},
-		},
+		codexModelsTestAccount(1, "custom-openai", "sk-test", "https://upstream.example/v1"),
 	}}
 	upstream := &codexModelsFailoverHTTPUpstream{
 		firstBody: `{"object":"list","data":[{"id":"codex-auto-review"},{"id":"gpt-5.6"}]}`,
@@ -202,19 +190,7 @@ func TestCodexModelsAppliesLocalFiltersBeforeClientETag(t *testing.T) {
 func TestCodexModelsAPIKeyCacheDoesNotLeakGroupFilters(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	repo := &codexModelsFailoverAccountRepo{accounts: []service.Account{
-		{
-			ID:          1,
-			Name:        "shared-api-key",
-			Platform:    service.PlatformOpenAI,
-			Type:        service.AccountTypeAPIKey,
-			Status:      service.StatusActive,
-			Schedulable: true,
-			Concurrency: 1,
-			Credentials: map[string]any{
-				"api_key":  "sk-shared",
-				"base_url": "https://upstream.example/v1",
-			},
-		},
+		codexModelsTestAccount(1, "shared-api-key", "sk-shared", "https://upstream.example/v1"),
 	}}
 	upstream := &codexModelsFailoverHTTPUpstream{
 		firstBody: `{"object":"list","data":[{"id":"model-a"},{"id":"model-b"}]}`,
@@ -516,6 +492,31 @@ func TestCodexModelsHonorsAccountSwitchLimit(t *testing.T) {
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "upstream error 504") {
 		t.Fatalf("body does not preserve the limit-ending upstream error: %s", body)
+	}
+}
+
+func codexModelsTestAccount(id int64, name, apiKey, baseURL string) service.Account {
+	proxyID := int64(1000 + id)
+	return service.Account{
+		ID:          id,
+		Name:        name,
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeAPIKey,
+		Status:      service.StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy: &service.Proxy{
+			ID:       proxyID,
+			Protocol: "http",
+			Host:     "127.0.0.1",
+			Port:     18080 + int(id),
+			Status:   service.StatusActive,
+		},
+		Credentials: map[string]any{
+			"api_key":  apiKey,
+			"base_url": baseURL,
+		},
 	}
 }
 

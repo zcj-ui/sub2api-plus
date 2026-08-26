@@ -53,6 +53,7 @@ type OpenAIAutoResetCreditState struct {
 
 type openAIAutoResetQuota interface {
 	QueryUsage(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error)
+	CacheUsageSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error
 	CacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *OpenAIRateLimitResetCredits) error
 	ResetCreditTargeted(ctx context.Context, accountID int64, creditID, redeemRequestID string) (*OpenAIQuotaResetResult, error)
 }

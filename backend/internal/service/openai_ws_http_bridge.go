@@ -751,6 +751,12 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				if account.Platform == PlatformGrok {
 					return nil, newOpenAIUpstreamFailoverError(statusCode, resp.Header, upstreamMessage, errMessage, false)
 				}
+				if isRateLimit {
+					// recordRateLimitSignal already applied the first-strike 429
+					// confirmation. Re-entering stream terminal side effects would
+					// count the same request twice and freeze the account.
+					return nil, s.newOpenAIWSRateLimitFailoverError(account, resp.Header, upstreamMessage, errMessage)
+				}
 				return nil, s.newOpenAIStreamFailoverError(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, resp.Header)
 			}
 			if account.Platform != PlatformGrok && !failureAccountSideEffectsApplied {
