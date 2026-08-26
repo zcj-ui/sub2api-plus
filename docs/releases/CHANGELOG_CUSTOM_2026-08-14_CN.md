@@ -1,29 +1,22 @@
 # Sub2API Plus 更新日志
 
-当前准备版本：`0.2.6`
+当前准备版本：`0.2.7`
 
-发布日期：2026-08-20
+发布日期：2026-08-26
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
 
-## 0.2.6+ 官方同步至 `efb46db0a9` / `0.1.183`（本地合并，尚未发版）
+## 0.2.7 官方同步至 `0.1.183`、指纹透传与 429 兼容
 
-- 继续同步官方 `upstream/main` `aa2c4e8d13..efb46db0a9`（37 提交 / 24 非合并提交）。
-- 纳入 Codex 路由模型目录、session-id 调度哈希、WS v2 过期 tool ID 清理、Antigravity token clamp、Kimi 并发 403 可恢复、邮箱换绑别名去重、监控 SQL 修复。
-- 冲突按兼容处理：瞬时 429 仍两次明确确认，不采用官方“配额耗尽立刻暂停”；粘性会话保留 Plus wait-on-full；指纹透传继续跟官方 CLI 快照；Plus 版本号保持 `0.2.6`。
+- 同步官方 `upstream/main` 至 `efb46db0a9`（官方版本 `0.1.181` / `0.1.182` / `0.1.183`）。Plus 版本号为 `0.2.7`，不采用官方 `0.1.183`。
+- 纳入官方 Go 1.27、OAuth 出站 plugin、自动用卡、`service_tier`、SetupToken 协议路由、Grok 4.6 / Realtime、渠道分时计价、Responses Lite 并行工具约束与大整数精度、OpenCode Go 用量重置解析、OAuth 图片 prompt 原样转发、Codex 路由模型目录、Antigravity Sonnet 4.5/4.6 与 token clamp、Kimi K3 / 并发 403、支付完成后余额刷新、邮箱换绑别名去重。
+- 完整官方 CLI 快照与 device 模式透传 session/thread/request；compact 与不完整身份继续隔离。普通 OAuth 请求不再凭空声明 `remote_compaction_v2`。
+- 瞬时 429 仍两次明确确认才冻结，不采用官方“配额耗尽立刻暂停”。第一次 failover，30 秒内第二次冻结。卡429 只作用于 OpenAI/Codex，不进 Claude/CC。
+- 粘性会话保留 Plus wait-on-full：队列未饱和时继续等待，不因容量溢出改写长期绑定。`session-id` 可用于调度哈希，不覆盖指纹透传。
+- 非流式 SSE「Selected model is at capacity」转为请求级 failover。WebSocket 图片桥保留超大整数精度。插件安装在 Windows 上先关闭 ZIP 再提交，避免文件占用导致 rename 失败。
+- `proxy_id` 仍 fail-closed；代理丢失或配置错误时明确失败，不静默直连。
 
-## 0.2.6+ 官方同步至 `aa2c4e8d13` / `0.1.182`（本地合并，尚未发版）
-
-- 继续同步官方 `upstream/main` `e2d9b823f6..aa2c4e8d13`（22 提交 / 14 非合并提交）。
-- 纳入 Responses Lite 并行工具约束与大整数精度、WS HTTP 桥 Lite 规范化、OpenCode Go 用量重置文案解析、OAuth 图片 prompt 原样转发、Antigravity Sonnet 4.5/4.6 路由、Kimi K3 复合路由、支付完成后余额刷新、Anthropic cache TTL 去重计费、监控复合组平台解析。
-- 冲突按兼容处理：Plus 版本号保持 `0.2.6`，不采用官方 `0.1.182`；完整官方 CLI 快照 / device 模式指纹透传、两次明确 429、卡429 不进 Claude/CC、`proxy_id` fail-closed 均保留。
-
-## 0.2.6+ 官方同步至 `e2d9b823f6`（本地合并，尚未发版）
-
-- 在保留 Plus 定制语义的前提下合并官方 `upstream/main` `32a0d9ba2d..e2d9b823f6`（213 提交 / 142 非合并提交）。
-- 纳入官方 Go 1.27、OAuth 出站 plugin、自动用卡、`service_tier`、SetupToken 协议路由、Grok 4.6 / Realtime / 同号 429 重试、渠道分时计价和模型广场展示。
-- 冲突按兼容处理：两次明确 429、Credit 跳过本地自动停调、`proxy_id` fail-closed、指纹默认 off / seed 隔离、卡429 不进 Claude/CC 均保留；官方新能力与 Plus 字段并存。
-- Plus 版本号保持 `0.2.6`，不采用官方 `0.1.181`。README / 发布文档继续使用本仓库地址与免责声明。
+验证结果：`internal/service` 全量、repository、domain、handler、创建账号前端用例均通过。先推 `dev`，CI 绿后再合 `main` / 打标签。
 
 ## 0.2.6 官方同步、OpenAI/Codex 稳定性与更新链路修复
 
