@@ -16,7 +16,7 @@
 - 非流式 SSE「Selected model is at capacity」转为请求级 failover。WebSocket 图片桥保留超大整数精度。插件安装在 Windows 上先关闭 ZIP 再提交，避免文件占用导致 rename 失败。
 - `proxy_id` 仍 fail-closed；代理丢失或配置错误时明确失败，不静默直连。
 
-验证结果：`internal/service` 全量、repository、domain、handler、创建账号前端用例均通过。先推 `dev`，CI 绿后再合 `main` / 打标签。
+验证结果：`internal/service` 全量、repository、domain、handler、创建账号前端用例均通过。`dev` / `main` CI 绿；Release 工作流的 golangci-lint 与 CI 对齐为 v2.13，以支持 Go 1.27。
 
 ## 0.2.6 官方同步、OpenAI/Codex 稳定性与更新链路修复
 
