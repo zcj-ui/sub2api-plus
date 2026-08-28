@@ -319,11 +319,15 @@ type OpenAIForwardResult struct {
 	// ServiceTier 优先取上游实际响应回显的 tier；缺失时回退到最终出站 body 的
 	// tier。nil 表示两者都无识别 tier。
 	ServiceTier *string
-	// ReasoningEffort is extracted from request body (reasoning.effort) or derived from model suffix.
+	// ReasoningEffort is extracted from request body (reasoning.effort) or derived from model suffix
+	// after group policy rewriting and model-family remapping.
 	// Stored for usage records display; nil means not provided / not applicable.
 	ReasoningEffort *string
-	Stream          bool
-	OpenAIWSMode    bool
+	// RequestedReasoningEffort is the client-requested effort before mapping.
+	// Empty/nil means it should fall back to ReasoningEffort at persistence.
+	RequestedReasoningEffort *string
+	Stream                   bool
+	OpenAIWSMode             bool
 	// UpstreamTerminalEvent is the normalized terminal event observed on an
 	// upstream Responses WebSocket turn. Empty preserves legacy/non-WS success.
 	UpstreamTerminalEvent string
@@ -532,23 +536,28 @@ type OpenAIGatewayService struct {
 	openaiProxyStreamCircuit       *openAIProxyStreamCircuit
 	openaiProxyStreamFailOpenLogAt atomic.Int64
 
-	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
-	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
-	openaiAccountRuntimeBlockReason     sync.Map // key: int64(accountID), value: string
-	openaiAccountRuntimeBlockLocks      sync.Map // key: int64(accountID), value: *sync.Mutex
-	openaiAccountRuntimeBlockGeneration sync.Map // key: int64(accountID), value: uint64
-	openaiAccountRuntimeBlockSequence   atomic.Uint64
-	openaiOAuth429RetryStartedAt        sync.Map // key: int64(accountID), value: time.Time
-	grokCredentialMutationLocks         sync.Map // key: int64(accountID), value: *sync.Mutex
-	openaiOAuth429WindowStartUnixNano   atomic.Int64
-	openaiOAuth429WindowCount           atomic.Int64
-	openaiOAuth429Streak                sync.Map // key: int64(accountID), value: openAIOAuth429StreakState
-	openaiWSRetryMetrics                openAIWSRetryMetrics
-	responseHeaderFilter                *responseheaders.CompiledHeaderFilter
-	codexSnapshotThrottle               *accountWriteThrottle
-	codexModelsManifestCache            codexModelsManifestCache
-	openaiCompatSessionResponses        sync.Map
-	openaiCompatAnthropicDigestSessions sync.Map
+	openaiWSFallbackUntil           sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockUntil  sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockReason sync.Map // key: int64(accountID), value: string
+	// openaiAccountRuntimeBlockObservedUpdatedAt records the account row version
+	// seen when a local block was installed.  It lets the scheduler distinguish
+	// a successfully persisted/cleared cooldown on another instance from a
+	// failed persistence attempt that must continue to block locally.
+	openaiAccountRuntimeBlockObservedUpdatedAt sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockLocks             sync.Map // key: int64(accountID), value: *sync.Mutex
+	openaiAccountRuntimeBlockGeneration        sync.Map // key: int64(accountID), value: uint64
+	openaiAccountRuntimeBlockSequence          atomic.Uint64
+	openaiOAuth429RetryStartedAt               sync.Map // key: int64(accountID), value: time.Time
+	grokCredentialMutationLocks                sync.Map // key: int64(accountID), value: *sync.Mutex
+	openaiOAuth429WindowStartUnixNano          atomic.Int64
+	openaiOAuth429WindowCount                  atomic.Int64
+	openaiOAuth429Streak                       sync.Map // key: int64(accountID), value: openAIOAuth429StreakState
+	openaiWSRetryMetrics                       openAIWSRetryMetrics
+	responseHeaderFilter                       *responseheaders.CompiledHeaderFilter
+	codexSnapshotThrottle                      *accountWriteThrottle
+	codexModelsManifestCache                   codexModelsManifestCache
+	openaiCompatSessionResponses               sync.Map
+	openaiCompatAnthropicDigestSessions        sync.Map
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
@@ -743,9 +752,13 @@ func (s *OpenAIGatewayService) billingDeps() *billingDeps {
 // CloseOpenAIWSPool 关闭 OpenAI WebSocket 连接池的后台 worker 和空闲连接。
 // 应在应用优雅关闭时调用。
 func (s *OpenAIGatewayService) CloseOpenAIWSPool() {
-	if s != nil && s.openaiWSPool != nil {
+	if s == nil {
+		return
+	}
+	if s.openaiWSPool != nil {
 		s.openaiWSPool.Close()
 	}
+	s.clearAllOpenAIRuntimeBlockState()
 }
 
 func (s *OpenAIGatewayService) InvalidateAgentIdentityWSConnections(accountID int64) {

@@ -89,6 +89,7 @@ func TestUsageLogRepositoryCreateSyncRequestTypeAndLegacyFields(t *testing.T) {
 			sqlmock.AnyArg(), // video_duration_seconds
 			sqlmock.AnyArg(), // service_tier
 			sqlmock.AnyArg(), // reasoning_effort
+			sqlmock.AnyArg(), // requested_reasoning_effort
 			sqlmock.AnyArg(), // inbound_endpoint
 			sqlmock.AnyArg(), // upstream_endpoint
 			log.CacheTTLOverridden,
@@ -180,9 +181,10 @@ func TestUsageLogRepositoryCreate_PersistsServiceTier(t *testing.T) {
 			sqlmock.AnyArg(), // video_resolution
 			sqlmock.AnyArg(), // video_duration_seconds
 			serviceTier,
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
-			sqlmock.AnyArg(),
+			sqlmock.AnyArg(), // reasoning_effort
+			sqlmock.AnyArg(), // requested_reasoning_effort
+			sqlmock.AnyArg(), // inbound_endpoint
+			sqlmock.AnyArg(), // upstream_endpoint
 			log.CacheTTLOverridden,
 			log.LongContextBillingApplied,
 			sqlmock.AnyArg(), // channel_id
@@ -831,6 +833,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},
 			sql.NullString{},
 			sql.NullString{},
+			sql.NullString{},
 			false,
 			false,
 			sql.NullInt64{},
@@ -908,6 +911,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},
 			sql.NullString{},
 			sql.NullString{},
+			sql.NullString{},
 			false,
 			false,
 			sql.NullInt64{},   // channel_id
@@ -968,6 +972,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{},
 			sql.NullString{},
 			sql.NullString{},
+			sql.NullString{},
 			false,
 			false,
 			sql.NullInt64{},   // channel_id
@@ -1025,6 +1030,7 @@ func TestScanUsageLogRequestTypeAndLegacyFallback(t *testing.T) {
 			sql.NullString{}, // video_resolution
 			sql.NullInt64{},  // video_duration_seconds
 			sql.NullString{Valid: true, String: "priority"},
+			sql.NullString{},
 			sql.NullString{},
 			sql.NullString{},
 			sql.NullString{},

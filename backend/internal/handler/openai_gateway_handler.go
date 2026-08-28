@@ -243,6 +243,55 @@ func shouldReportOpenAIWSProxyAccountFailure(err error) bool {
 	return err != nil && !errors.Is(err, errOpenAIWSUnsupportedModelSwitch) && !service.IsOpenAIWSSessionPreemptedError(err)
 }
 
+// openAIWSIngressEndedByClient reports whether a finished ingress WebSocket turn
+// ended the way a healthy client ends one, rather than through an upstream or
+// account fault.
+//
+// Three error shapes describe that same benign outcome and only the first was
+// recognised:
+//
+//   - *service.OpenAIWSClientCloseError carrying 1000 — the gateway closing the
+//     socket on its own terms, e.g. the inter-turn idle timeout.
+//   - a bare coderws.CloseError{Code: 1000} — what coder/websocket returns when
+//     the client closes cleanly. ReadOpenAIWSClientMessage hands conn.Read's
+//     error back verbatim, so nothing ever wraps it into the type above and an
+//     errors.As against that type cannot see it.
+//   - context.Canceled — the client went away mid-turn. That path closes with
+//     StatusGoingAway (1001) and carries the cancellation as its cause, so a
+//     check for 1000 alone never matched it either.
+//
+// The last two fell through to shouldReportOpenAIWSProxyAccountFailure, which
+// filters only model-switch and session-preemption errors. Everything else
+// reaches ObserveOpenAIAPIKeyHealthFailure and scheduler.ReportResult(false), so
+// a client that merely disconnected counted against the upstream account's
+// health and could trip it out of scheduling.
+//
+// failoverClientGone already states the rule this restores for the HTTP failover
+// path — a cancelled client context "被误报成账号耗尽" is a bug, not a signal —
+// and summarizeWSCloseErrorForLog already reads the close code the correct way,
+// which is why the resulting WARN printed close_status=1000(StatusNormalClosure)
+// for an error that was, in the same breath, being charged to the account.
+//
+// Deliberately narrow. StatusGoingAway is not matched on its own: the gateway
+// emits 1001 when it tears a session down for its own reasons too, and the
+// client-cancellation case is already covered by context.Canceled.
+// context.DeadlineExceeded is left out as well — the idle-timeout path wraps it
+// in a 1000 close error and stays benign through the first check, while any
+// other deadline is a genuine stall worth reporting.
+func openAIWSIngressEndedByClient(err error) bool {
+	if err == nil {
+		return true
+	}
+	var closeErr *service.OpenAIWSClientCloseError
+	if errors.As(err, &closeErr) && closeErr.StatusCode() == coderws.StatusNormalClosure {
+		return true
+	}
+	if coderws.CloseStatus(err) == coderws.StatusNormalClosure {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
 func openAIWSTurnBillingModel(result *service.OpenAIForwardResult, mapping service.ChannelMappingResult, requestedModel, upstreamModel string) string {
 	billingModel := ""
 	if result != nil {
@@ -899,6 +948,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			if res == nil {
 				return
 			}
+			stampOpenAIRequestedReasoningEffort(res, c)
 			userAgent := c.GetHeader("User-Agent")
 			clientIP := ip.GetClientIP(c)
 			requestPayloadHash := service.HashUsageRequestPayload(body)
@@ -1482,6 +1532,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			if res == nil {
 				return
 			}
+			stampOpenAIRequestedReasoningEffort(res, c)
 			userAgent := c.GetHeader("User-Agent")
 			clientIP := ip.GetClientIP(c)
 			requestPayloadHash := service.HashUsageRequestPayload(body)
@@ -2714,7 +2765,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		var turnChannelMapping atomic.Pointer[openAIWSTurnChannelMappingSnapshot]
 		turnChannelMapping.Store(&openAIWSTurnChannelMappingSnapshot{turn: 1, mapping: channelMappingWS})
 		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号；
-		// passthrough 没有 BeforeTurn 时，AfterTurn 回退到 TurnStarted 的所属 turn 时刻。
+		// passthrough 后续 turn 也执行该钩子，AfterTurn 以 TurnStarted 的所属
+		// turn 时刻作为没有冻结值时的计费兜底。
 		var turnPricing openAIWSTurnPricing
 		reacquirePassthroughTurnSlots := func(turn int) error {
 			// The initial turn keeps the handler's admission slots. Later
@@ -2774,6 +2826,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				c.Set(securityAuditWSTurnContextKey, turn)
 				service.BeginOpsStreamTurn(c, turn)
 				setCyberTurnBody(turn, payload)
+				// Enforce the connection-level cyber session gate here as well. Native
+				// ingress visits this hook first and gets the same side-effect-free
+				// close error; BeforeTurn remains defense in depth for every mode.
+				if cyberBlockedThisConn {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, cyberSessionBlockedClientMsg, nil)
+				}
 				if turn == 1 {
 					return nil
 				}
@@ -2792,8 +2850,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
 				}
 				// A long-lived socket must not retain the admission decision made at
-				// handshake. Passthrough mode intentionally skips BeforeTurn, so this
-				// hook is the shared per-turn billing gate for every ingress mode. The
+				// handshake. This hook is the shared per-turn billing gate for every
+				// ingress mode. The
 				// subscription lease is acquired before the read and held until the
 				// corresponding usage task settles.
 				admitted, err := admitSubscriptionTurn(turn)
@@ -3122,12 +3180,23 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			}
 
 			var closeErr *service.OpenAIWSClientCloseError
-			if errors.As(err, &closeErr) && closeErr.StatusCode() == coderws.StatusNormalClosure {
-				reqLog.Info("openai.websocket_ingress_closed_normally",
-					zap.Int64("account_id", account.ID),
-					zap.String("reason", closeErr.Reason()),
-				)
-				closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
+			hasClientCloseErr := errors.As(err, &closeErr)
+			if openAIWSIngressEndedByClient(err) {
+				closedFields := []zap.Field{zap.Int64("account_id", account.ID)}
+				if hasClientCloseErr {
+					closedFields = append(closedFields, zap.String("reason", closeErr.Reason()))
+				} else {
+					closedFields = append(closedFields, zap.Error(err))
+				}
+				reqLog.Info("openai.websocket_ingress_closed_normally", closedFields...)
+				// A bare coderws.CloseError or a plain cancellation carries no
+				// gateway-chosen close frame; mirror the client's clean 1000
+				// rather than the 1011 the proxy-failure tail would have sent.
+				if hasClientCloseErr {
+					closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
+				} else {
+					closeOpenAIClientWS(wsConn, coderws.StatusNormalClosure, "")
+				}
 				return
 			}
 
@@ -3152,7 +3221,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				proxyFailedFields = append(proxyFailedFields, zap.Int64p("proxy_id", account.ProxyID))
 			}
 			reqLog.Warn("openai.websocket_proxy_failed", proxyFailedFields...)
-			if errors.As(err, &closeErr) {
+			if hasClientCloseErr {
 				closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
 				return
 			}

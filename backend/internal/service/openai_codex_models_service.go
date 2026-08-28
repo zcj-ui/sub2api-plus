@@ -477,7 +477,7 @@ func configuredCodexGrokReasoningLevels(modelID string) []configuredCodexReasoni
 		{Effort: "medium", Description: "Balanced reasoning for most coding tasks"},
 		{Effort: "high", Description: "Greater reasoning depth for coding and agent tasks"},
 	}
-	if grokSupportsXHighReasoningEffort(modelID) {
+	if GrokSupportsXHighReasoningEffort(modelID) {
 		levels = append(levels, configuredCodexReasoningLevel{
 			Effort:      "xhigh",
 			Description: "Extra-high reasoning depth for difficult tasks",

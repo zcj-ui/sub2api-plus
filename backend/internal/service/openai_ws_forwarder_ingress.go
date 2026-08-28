@@ -150,9 +150,9 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				forceHTTPBridge = true
 				break
 			}
-			// The direct relay reports each accepted turn through TurnStarted but
-			// intentionally does not run BeforeTurn. Admission stays connection-
-			// scoped, while the handler uses the reported time for turn pricing.
+			// The direct relay reports each accepted turn through TurnStarted;
+			// follow-up response.create frames also run BeforeRequest → BeforeTurn
+			// so turn-level admission, pricing, and slot reacquisition stay aligned.
 			return s.proxyResponsesWebSocketV2Passthrough(
 				ctx,
 				c,
@@ -213,6 +213,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		imageSizeTier            string
 		imageInputSize           string
 		payloadBytes             int
+		requestedReasoningEffort *string
 	}
 	ingressSessionOriginalModel := ""
 	// The non-v2 ingress parser handles every response.create frame in one
@@ -288,6 +289,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nil,
 			)
 		}
+		requestedReasoningEffort := CanonicalRequestedReasoningEffort(normalized, strings.TrimSpace(values[1].String()))
 		if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 			if capped, changed := ApplyOpenAIReasoningEffortPolicy(normalized, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 				normalized = capped
@@ -553,6 +555,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			imageSizeTier:            imageSizeTier,
 			imageInputSize:           imageInputSize,
 			payloadBytes:             len(normalized),
+			requestedReasoningEffort: requestedReasoningEffort,
 		}, nil
 	}
 
@@ -1029,7 +1032,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	// omits previous_response_id on a store=false follow-up.
 	lastTurnResponseID := ""
 	var rejectedFieldRetryState *openAIResponsesRejectedFieldRetryState
-	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string) (*OpenAIForwardResult, error) {
+	sendAndRelay := func(turn int, lease *openAIWSConnLease, payload []byte, payloadBytes int, originalModel string, imageBillingModel string, imageSizeTier string, imageInputSize string, requestedReasoningEffort *string) (*OpenAIForwardResult, error) {
 		responseModelObserver := &upstreamResponseModelObserver{}
 		if lease == nil {
 			return nil, errors.New("upstream websocket lease is nil")
@@ -1053,7 +1056,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		payload = normalizedPayload
-		payloadBytes := len(payload)
+		// The payload can be normalized immediately before the write (for example
+		// when the protocol options repair a client frame). Keep the accounting
+		// size aligned with the bytes that are actually sent upstream.
+		payloadBytes = len(payload)
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
@@ -1573,6 +1579,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					UpstreamResponseServiceTier:   responseModelObserver.ServiceTier(),
 					ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTierFromBody(payload)),
 					ReasoningEffort:               ApplyThinkingEnabledFallback(extractOpenAIReasoningEffortFromBody(payload, mappedModel, originalModel), payload, mappedModel),
+					RequestedReasoningEffort:      requestedReasoningEffort,
 					Stream:                        reqStream,
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         terminalEvent,
@@ -1602,6 +1609,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	currentImageBillingModel := firstPayload.imageBillingModel
 	currentImageSizeTier := firstPayload.imageSizeTier
 	currentImageInputSize := firstPayload.imageInputSize
+	currentPayloadBytes := firstPayload.payloadBytes
+	currentRequestedReasoningEffort := firstPayload.requestedReasoningEffort
 	isStrictAffinityTurn := func(payload []byte) bool {
 		if !storeDisabled {
 			return false
@@ -2258,7 +2267,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 
 		guardContinuationForTurn := guardContinuationFailureActive()
-		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize)
+		result, relayErr := sendAndRelay(turn, sessionLease, currentPayload, currentPayloadBytes, currentOriginalModel, currentImageBillingModel, currentImageSizeTier, currentImageInputSize, currentRequestedReasoningEffort)
 		if relayErr != nil {
 			lastTurnClean = false
 			if isOpenAIWSSessionPreempted(ctx) {
@@ -2476,6 +2485,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		currentImageBillingModel = nextPayload.imageBillingModel
 		currentImageSizeTier = nextPayload.imageSizeTier
 		currentImageInputSize = nextPayload.imageInputSize
+		currentPayloadBytes = nextPayload.payloadBytes
+		currentRequestedReasoningEffort = nextPayload.requestedReasoningEffort
 		rejectedFieldRetryState = newOpenAIResponsesRejectedFieldRetryState(currentPayload)
 		storeDisabled = s.isOpenAIWSStoreDisabledInRequestRaw(currentPayload, account)
 		if !storeDisabled {

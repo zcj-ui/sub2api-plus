@@ -521,6 +521,10 @@ func TestOpenAIRuntimeBlock_CreditsOnlyOverrideLocalThresholdReason(t *testing.T
 	require.True(t, ok)
 	require.Equal(t, "account_scheduling_threshold", thresholdReason)
 	require.False(t, thresholdSvc.isOpenAIAccountRuntimeBlocked(account))
+	// The scheduler-facing predicate must apply the same credit override; an
+	// active local threshold marker must not hide a positive /wham balance.
+	thresholdSvc.BlockAccountScheduling(account, time.Now().Add(time.Hour), "account_scheduling_threshold")
+	require.False(t, thresholdSvc.isOpenAIAccountRequestRuntimeBlocked(account, "gpt-5.5"))
 
 	upstreamSvc := &OpenAIGatewayService{}
 	upstreamSvc.BlockAccountScheduling(account, time.Now().Add(time.Hour), "429")
@@ -874,6 +878,69 @@ func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlock(t *testing.T) {
 
 	svc.ClearAccountSchedulingBlock(account.ID)
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+// A failed durable Set* write must not be turned into an immediate fail-open
+// merely because the in-memory Account snapshot has no cooldown fields.  A
+// production repository is present and the row version has not advanced, so
+// the local block remains authoritative until a later snapshot proves a write.
+func TestRuntimeBlockKeepsImmediateBlockWhenPersistenceIsUnobserved(t *testing.T) {
+	svc := &OpenAIGatewayService{accountRepo: &mockAccountRepoForGemini{}}
+	account := &Account{
+		ID:          4700,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		UpdatedAt:   time.Now().UTC(),
+	}
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "transport_error")
+	require.True(t, svc.isOpenAIAccountRequestRuntimeBlocked(account, "gpt-5.5"))
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+// Simulate another instance clearing the durable cooldown: its scheduler
+// snapshot carries a newer UpdatedAt and no active cooldown.  The local stale
+// block is then retired, while the generation/deadline CAS protects a newer
+// block installed concurrently.
+func TestRuntimeBlockClearsAfterNewerPersistedSnapshot(t *testing.T) {
+	svc := &OpenAIGatewayService{accountRepo: &mockAccountRepoForGemini{}}
+	baseline := time.Now().Add(-time.Minute).UTC()
+	account := &Account{
+		ID:          4701,
+		Platform:    PlatformGrok,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		UpdatedAt:   baseline,
+	}
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "grok payment required")
+	stale := *account
+	stale.UpdatedAt = baseline
+	require.True(t, svc.isOpenAIAccountRequestRuntimeBlocked(&stale, "grok-3"))
+
+	fresh := stale
+	fresh.UpdatedAt = baseline.Add(time.Second)
+	require.False(t, svc.isOpenAIAccountRequestRuntimeBlocked(&fresh, "grok-3"))
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(&fresh))
+}
+
+func TestCloseOpenAIWSPoolClearsRuntimeBlockState(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	account := &Account{ID: 4703, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "transport_error")
+	if _, ok := svc.openaiAccountRuntimeBlockObservedUpdatedAt.Load(account.ID); !ok {
+		t.Fatal("block should record the observed account version")
+	}
+
+	svc.CloseOpenAIWSPool()
+	_, untilPresent := svc.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	_, reasonPresent := svc.openaiAccountRuntimeBlockReason.Load(account.ID)
+	_, observedPresent := svc.openaiAccountRuntimeBlockObservedUpdatedAt.Load(account.ID)
+	if untilPresent || reasonPresent || observedPresent {
+		t.Fatalf("shutdown must clear runtime maps: until=%v reason=%v observed=%v", untilPresent, reasonPresent, observedPresent)
+	}
 }
 
 func TestOpenAIRuntimeBlock_ClearAccountSchedulingBlockResets429Streak(t *testing.T) {

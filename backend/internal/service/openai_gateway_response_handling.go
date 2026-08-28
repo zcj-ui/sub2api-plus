@@ -1719,7 +1719,10 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 		if compactErr := newOpenAICompactFallbackSignal(c, terminalPayload, msg); compactErr != nil {
 			return nil, compactErr
 		}
-		if failoverErr := s.nonStreamingFailedEventFailover(c, account, false, resp, terminalPayload, msg); failoverErr != nil {
+		// Use the shared terminal-event classifier so non-streaming responses
+		// follow the same 429/capacity/proxy attribution policy as streaming ones.
+		// It also handles a bare `error` event, which the legacy helper omitted.
+		if failoverErr := s.nonStreamingTerminalFailureFailover(c, resp, account, false, terminalType, terminalPayload, msg); failoverErr != nil {
 			return nil, failoverErr
 		}
 		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)

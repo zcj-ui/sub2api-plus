@@ -1047,6 +1047,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		ImageOutputSizes:              imageCounter.Sizes(),
 		ServiceTier:                   resolvedOpenAIUpstreamServiceTierFromObserver(responseModelObserver, extractOpenAIServiceTier(reqBody)),
 		ReasoningEffort:               extractOpenAIReasoningEffort(reqBody, mappedModel, originalModel),
+		RequestedReasoningEffort:      CanonicalRequestedReasoningEffortFromReqBody(reqBody, originalModel, mappedModel),
 		Stream:                        reqStream,
 		OpenAIWSMode:                  true,
 		UpstreamTerminalEvent:         upstreamTerminalEvent,

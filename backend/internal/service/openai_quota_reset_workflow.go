@@ -16,7 +16,7 @@ const (
 type openAIQuotaResetWorkflowQuota interface {
 	QueryUsage(ctx context.Context, accountID int64) (*OpenAIQuotaUsage, error)
 	CacheUsageSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error
-	CacheResetCreditsSnapshot(ctx context.Context, accountID int64, credits *OpenAIRateLimitResetCredits) error
+	CachePostResetSnapshot(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage) error
 }
 
 type openAIQuotaResetWorkflowRecoverer interface {
@@ -61,11 +61,25 @@ func RunOpenAIQuotaResetPostProcess(
 			slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error_code", infraerrors.Reason(usageErr))
 			result.WarningCode = OpenAIQuotaResetWarningCacheRefreshFailed
 		default:
+			// CachePostResetSnapshot is the upstream refresh path: it persists the
+			// newly observed rate-limit windows together with reset-credit details.
+			// Plus keeps a second, deliberately independent snapshot for paid
+			// Codex credits and threshold recovery. Run both even if the first one
+			// fails so a valid usage/credit refresh is not discarded merely because
+			// reset-credit metadata was unavailable. The first error wins for the
+			// operator-facing warning.
+			var cacheErr error
+			if err := quota.CachePostResetSnapshot(ctx, accountID, usage); err != nil {
+				cacheErr = err
+				slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error_code", infraerrors.Reason(err))
+			}
 			if err := quota.CacheUsageSnapshot(ctx, accountID, usage); err != nil {
-				slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error_code", infraerrors.Reason(err))
-				result.WarningCode = OpenAIQuotaResetWarningCacheRefreshFailed
-			} else if err := quota.CacheResetCreditsSnapshot(ctx, accountID, usage.RateLimitResetCredits); err != nil {
-				slog.Warn("openai_quota_reset_cache_refresh_failed", "account_id", accountID, "error_code", infraerrors.Reason(err))
+				if cacheErr == nil {
+					cacheErr = err
+				}
+				slog.Warn("openai_quota_usage_cache_refresh_failed", "account_id", accountID, "error_code", infraerrors.Reason(err))
+			}
+			if cacheErr != nil {
 				result.WarningCode = OpenAIQuotaResetWarningCacheRefreshFailed
 			} else {
 				result.Quota = usage

@@ -78,6 +78,8 @@ const (
 const (
 	openAIImageRateLimitDefaultCooldown = time.Minute
 	openAIImageRateLimitReason          = "openai_image_rate_limited"
+	openAIImageCapabilityLossCooldown   = 30 * time.Minute
+	openAIImageCapabilityLossReason     = "openai_image_capability_lost"
 )
 
 var openAIImageTryAgainPattern = regexp.MustCompile(`(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes)`)
@@ -2312,6 +2314,44 @@ func (s *RateLimitService) HandleOpenAIImageRateLimit(ctx context.Context, accou
 	}
 	slog.Info("openai_image_rate_limited", "account_id", account.ID, "scope", openAIImageGenerationRateLimitKey, "reset_at", resetAt, "reset_in", time.Until(resetAt).Truncate(time.Second))
 	return true
+}
+
+func (s *RateLimitService) HandleOpenAIImageCapabilityLoss(ctx context.Context, account *Account, statusCode int, responseBody []byte) bool {
+	if s == nil || account == nil || s.accountRepo == nil {
+		return false
+	}
+	if account.Platform != PlatformOpenAI {
+		return false
+	}
+	if !account.ShouldHandleErrorCode(statusCode) {
+		slog.Info("openai_image_capability_loss_skipped_by_error_code_policy", "account_id", account.ID, "status_code", statusCode)
+		return false
+	}
+	if !isOpenAIImageCapabilityLossError(statusCode, responseBody) {
+		return false
+	}
+
+	resetAt := time.Now().Add(openAIImageCapabilityLossCooldown)
+	if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, openAIImageGenerationRateLimitKey, resetAt, openAIImageCapabilityLossReason); err != nil {
+		slog.Warn("openai_image_capability_loss_set_model_rate_limit_failed", "account_id", account.ID, "scope", openAIImageGenerationRateLimitKey, "error", err)
+		return true
+	}
+	slog.Info("openai_image_capability_lost", "account_id", account.ID, "scope", openAIImageGenerationRateLimitKey, "reset_at", resetAt, "reset_in", time.Until(resetAt).Truncate(time.Second))
+	return true
+}
+
+// isOpenAIImageCapabilityLossError reports whether upstream rejected the
+// image_generation tool choice that sub2api itself put into the request body.
+// Only meaningful for self-built images requests, where tools always carries a
+// matching image_generation entry — upstream saying otherwise means the account
+// lost the capability.
+func isOpenAIImageCapabilityLossError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest || len(body) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "image_generation") &&
+		strings.Contains(lower, "not found in 'tools' parameter")
 }
 
 func isOpenAIImageRateLimitError(statusCode int, body []byte) bool {

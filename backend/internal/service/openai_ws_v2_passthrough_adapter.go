@@ -331,10 +331,11 @@ func openAIWSPassthroughPolicyModelFromSessionFrame(account *Account, payload []
 }
 
 type openAIWSPassthroughUsageMeta struct {
-	serviceTier     atomic.Pointer[string]
-	reasoningEffort atomic.Pointer[string]
-	requestModel    atomic.Pointer[string]
-	upstreamModel   atomic.Pointer[string]
+	serviceTier              atomic.Pointer[string]
+	reasoningEffort          atomic.Pointer[string]
+	requestedReasoningEffort atomic.Pointer[string]
+	requestModel             atomic.Pointer[string]
+	upstreamModel            atomic.Pointer[string]
 
 	// 仅在 client->upstream filter goroutine 中读写；Load 侧通过上方原子指针同步。
 	sessionRequestModel string
@@ -357,6 +358,14 @@ func (m *openAIWSPassthroughUsageMeta) initFromFirstFrame(policyOutput []byte, m
 	m.serviceTier.Store(extractOpenAIServiceTierFromBody(policyOutput))
 	m.reasoningEffort.Store(extractOpenAIReasoningEffortFromBody(policyOutput, mappedModel, m.sessionRequestModel))
 	m.storeTurnModels(m.sessionRequestModel, policyOutput)
+}
+
+func (m *openAIWSPassthroughUsageMeta) captureRequestedReasoningEffort(originalBody []byte, modelCandidates ...string) {
+	if m == nil {
+		return
+	}
+	candidates := append([]string{m.sessionRequestModel}, modelCandidates...)
+	m.requestedReasoningEffort.Store(CanonicalRequestedReasoningEffort(originalBody, candidates...))
 }
 
 func (m *openAIWSPassthroughUsageMeta) updateSessionRequestModel(payload []byte) {
@@ -903,6 +912,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		}
 		firstClientMessage = liteFirstMessage
 	}
+	originalFirstClientMessage := firstClientMessage
 	if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 		if capped, changed := ApplyOpenAIReasoningEffortPolicy(firstClientMessage, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 			firstClientMessage = capped
@@ -1039,6 +1049,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 	// goroutine）和 OnTurnComplete / final result（runUpstreamToClient
 	// goroutine）之间同步当前 turn 的 usage metadata。
 	usageMeta.initFromFirstFrame(firstClientMessage, capturedSessionModel)
+	usageMeta.captureRequestedReasoningEffort(originalFirstClientMessage, capturedSessionModel)
 	_, initialUpstreamModel := usageMeta.turnModels(initialRequestModel)
 	SetOpsUpstreamModel(c, initialUpstreamModel)
 	wsURL, err := s.buildOpenAIResponsesWSURL(account)
@@ -1321,11 +1332,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					}
 					payload = litePayload
 				}
+				originalResponseCreate := payload
 				if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
 					if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
 						payload = capped
 					}
 				}
+				usageMeta.captureRequestedReasoningEffort(originalResponseCreate)
 			}
 			turnNo := int(completedTurns.Load()) + 1
 			if turnNo < 2 {
@@ -1345,6 +1358,20 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					requestModelForThisFrame,
 				); err != nil {
 					return payload, nil, err
+				}
+				// Match the pooled ingress lifecycle: every follow-up turn must
+				// run the standard BeforeTurn admission hook after BeforeRequest
+				// and before model mapping/policy evaluation. Keep the older
+				// passthrough-specific hook as a compatibility fallback for direct
+				// callers that have not adopted BeforeTurn yet.
+				if hooks != nil && hooks.BeforeTurn != nil {
+					if err := hooks.BeforeTurn(turnNo); err != nil {
+						return payload, nil, err
+					}
+				} else if hooks != nil && hooks.BeforePassthroughTurn != nil {
+					if err := hooks.BeforePassthroughTurn(turnNo); err != nil {
+						return payload, nil, err
+					}
 				}
 				if hooks != nil && hooks.MapRequestModel != nil {
 					upstreamModel, err := hooks.MapRequestModel(turnNo, requestModelForThisFrame)
@@ -1417,15 +1444,6 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			//     覆盖（Store(nil)），因为 OpenAI 上游对该帧实际不传
 			//     service_tier 时按 default 处理，billing 应如实反映。
 			if policyErr == nil && blocked == nil && isResponseCreate {
-				// The initial turn already owns the slots acquired by the handler.
-				// Every later passthrough turn must reacquire them after the previous
-				// terminal callback released the pair. Run this last so a locally
-				// rejected frame never acquires a slot it cannot later release.
-				if hooks != nil && hooks.BeforePassthroughTurn != nil {
-					if err := hooks.BeforePassthroughTurn(turnNo); err != nil {
-						return out, nil, err
-					}
-				}
 				usageMeta.updateFromResponseCreate(out, model, requestModelForThisFrame)
 				_, actualModel := usageMeta.turnModels(requestModelForThisFrame)
 				SetOpsUpstreamModel(c, actualModel)
@@ -1561,6 +1579,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 					UpstreamResponseServiceTier:   normalizeObservedOpenAIServiceTier(turn.ResponseServiceTier),
 					ServiceTier:                   usageMeta.serviceTier.Load(),
 					ReasoningEffort:               usageMeta.reasoningEffort.Load(),
+					RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 					Stream:                        true,
 					OpenAIWSMode:                  true,
 					UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(turn.TerminalEventType),
@@ -1608,6 +1627,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if !ok {
 					return
 				}
+				// Match the handler close path and stay within the WebSocket control
+				// frame limit; an oversized reason makes coder/websocket skip the
+				// close frame, leaving the client with EOF instead of the status code.
+				reason = truncateString(reason, 120)
 				_ = clientConn.Close(status, reason)
 				_ = clientConn.CloseNow()
 			},
@@ -1619,6 +1642,12 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				if eventType == "response.created" {
 					failureAccountSideEffectsApplied = false
 				}
+				// Cyber-policy responses are business/policy outcomes. Preserve the
+				// frame for the client while recording the dedicated ops marker;
+				// they must not poison account health or trigger rate-limit failover.
+				if (eventType == "error" || eventType == "response.failed") && markOpenAIWSV2PassthroughCyberPolicy(c, payload) {
+					return nil
+				}
 				if eventType == "response.failed" {
 					errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(payload)
 					upstreamStatus := openAIWSPayloadUpstreamStatus(payload)
@@ -1628,7 +1657,10 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 						return s.newOpenAIWSRateLimitFailoverError(account, handshakeHeaders, payload, errMsgRaw)
 					}
 				}
-				if isOpenAIWSTerminalEvent(eventType) {
+				if isOpenAIWSTerminalEvent(eventType) && eventType != "response.failed" {
+					// response.failed is handled exactly once by the shared failure
+					// side-effect block below. The terminal helper also invokes that
+					// block, so calling both would double-count credential failures.
 					s.handleOpenAIWSTerminalTransientFailure(ctx, account, capturedSessionModel, handshakeHeaders, payload)
 				}
 				if eventType == "error" {
@@ -1703,6 +1735,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		UpstreamResponseServiceTier:   normalizeObservedOpenAIServiceTier(relayResult.ResponseServiceTier),
 		ServiceTier:                   usageMeta.serviceTier.Load(),
 		ReasoningEffort:               usageMeta.reasoningEffort.Load(),
+		RequestedReasoningEffort:      usageMeta.requestedReasoningEffort.Load(),
 		Stream:                        true,
 		OpenAIWSMode:                  true,
 		UpstreamTerminalEvent:         normalizeOpenAIWSTerminalEvent(relayResult.TerminalEventType),
@@ -1823,6 +1856,24 @@ func openAIWSPassthroughRelayClientClose(exit openaiwsv2.RelayExit, completedTur
 		return coderws.StatusInternalError, "upstream websocket proxy failed", true
 	}
 	return 0, "", false
+}
+
+func markOpenAIWSV2PassthroughCyberPolicy(c *gin.Context, payload []byte) bool {
+	hit, code, message := detectOpenAICyberPolicy(payload)
+	if !hit {
+		return false
+	}
+	usage := OpenAIUsage{}
+	parseOpenAIWSResponseUsageFromCompletedEvent(payload, &usage)
+	MarkOpsCyberPolicy(c, CyberPolicyMark{
+		Code:           code,
+		Message:        message,
+		Body:           truncateString(string(payload), 4096),
+		UpstreamStatus: http.StatusOK,
+		UpstreamInTok:  usage.InputTokens,
+		UpstreamOutTok: usage.OutputTokens,
+	})
+	return true
 }
 
 func (s *OpenAIGatewayService) mapOpenAIWSPassthroughDialError(
