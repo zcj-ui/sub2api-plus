@@ -386,6 +386,60 @@ describe('EditAccountModal', () => {
     })
   })
 
+  it('rehydrates and persists Zhipu team IDs for Coding Plan accounts', async () => {
+    const account = buildAccount()
+    account.platform = 'zhipu'
+    account.credentials = {
+      api_key: 'sk-glm-team',
+      account_mode: 'coding',
+      api_protocol: 'adaptive',
+      base_url: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      api_base_urls: {
+        chat_completions: 'https://open.bigmodel.cn/api/coding/paas/v4',
+        anthropic: 'https://open.bigmodel.cn/api/anthropic'
+      },
+      zhipu_organization: 'org-team_01',
+      zhipu_project: 'proj-team_01'
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    expect(wrapper.get('[data-testid="edit-zhipu-team-organization"]').element.value).toBe('org-team_01')
+    expect(wrapper.get('[data-testid="edit-zhipu-team-project"]').element.value).toBe('proj-team_01')
+
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    expect(updateAccountMock).toHaveBeenCalledTimes(1)
+    expect(updateAccountMock.mock.calls[0]?.[1]?.credentials).toMatchObject({
+      zhipu_organization: 'org-team_01',
+      zhipu_project: 'proj-team_01'
+    })
+  })
+
+  it('clears both Zhipu team IDs when organization is emptied', async () => {
+    const account = buildAccount()
+    account.platform = 'zhipu'
+    account.credentials = {
+      api_key: 'sk-glm-team',
+      account_mode: 'coding',
+      api_protocol: 'adaptive',
+      base_url: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      zhipu_organization: 'org-team_01',
+      zhipu_project: 'proj-team_01'
+    }
+    updateAccountMock.mockReset().mockResolvedValue(account)
+    checkMixedChannelRiskMock.mockReset().mockResolvedValue({ has_risk: false })
+
+    const wrapper = mountModal(account)
+    await wrapper.get('[data-testid="edit-zhipu-team-organization"]').setValue('')
+    await wrapper.get('form#edit-account-form').trigger('submit.prevent')
+
+    const credentials = updateAccountMock.mock.calls[0]?.[1]?.credentials
+    expect(credentials).not.toHaveProperty('zhipu_organization')
+    expect(credentials).not.toHaveProperty('zhipu_project')
+  })
+
   it.each([
     ['explicit Chat Completions', 'chat_completions'],
     ['legacy missing protocol', undefined]

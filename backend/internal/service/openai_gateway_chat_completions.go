@@ -197,6 +197,13 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 				responsesBody = stripped
 			}
 		}
+		if isOpenAICodexSamplingUnsupportedModel(upstreamModel) {
+			for _, field := range []string{"temperature", "top_p"} {
+				if stripped, derr := sjson.DeleteBytes(responsesBody, field); derr == nil {
+					responsesBody = stripped
+				}
+			}
+		}
 		var normalizedServiceTier string
 		responsesBody, normalizedServiceTier, err = normalizeResponsesBodyServiceTier(responsesBody)
 		if err != nil {
@@ -219,6 +226,10 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 			return nil, fmt.Errorf("convert chat completions to responses: %w", err)
 		}
 		responsesReq.Model = upstreamModel
+		// The converter initially sees the inbound alias. Re-evaluate sampling
+		// support against the mapped upstream model so gpt-5.4 → gpt-5.6 keeps
+		// client temperature/top_p, while legacy GPT-5 remains stripped.
+		applyOpenAIResponsesSamplingModelPolicy(responsesReq, upstreamModel, chatReq.Temperature, chatReq.TopP)
 		normalizeResponsesRequestServiceTier(responsesReq)
 		responsesBody, err = json.Marshal(responsesReq)
 		if err != nil {

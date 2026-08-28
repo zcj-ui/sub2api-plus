@@ -565,6 +565,20 @@ type RateLimit429CooldownSettings struct {
 	CooldownSeconds int `json:"cooldown_seconds"`
 }
 
+// OpenAIImagesOAuthUnavailableCooldownSettings controls how long an OpenAI
+// OAuth account's image-generation capability is paused after the upstream
+// explicitly reports that the image tool is unavailable.  This setting is
+// intentionally scoped to OpenAI OAuth image requests; it has no effect on
+// Claude/CC or on ordinary text requests.
+type OpenAIImagesOAuthUnavailableCooldownSettings struct {
+	CooldownMinutes int `json:"cooldown_minutes"`
+}
+
+const (
+	openAIImagesOAuthUnavailableDefaultCooldownMinutes = 30
+	openAIImagesOAuthUnavailableMaxCooldownMinutes     = 120
+)
+
 // OpenAIAPIKeyHealthBreakerSettings controls cross-instance failure counting for OpenAI pool API keys.
 type OpenAIAPIKeyHealthBreakerSettings struct {
 	Enabled          bool `json:"enabled"`
@@ -595,6 +609,16 @@ func DefaultRateLimit429CooldownSettings() *RateLimit429CooldownSettings {
 	return &RateLimit429CooldownSettings{
 		Enabled:         true,
 		CooldownSeconds: 5,
+	}
+}
+
+// DefaultOpenAIImagesOAuthUnavailableCooldownSettings returns the historical
+// 30-minute image-tool cooldown.  Keeping this as a function (rather than a
+// mutable package value) prevents callers from accidentally changing the
+// process-wide default.
+func DefaultOpenAIImagesOAuthUnavailableCooldownSettings() *OpenAIImagesOAuthUnavailableCooldownSettings {
+	return &OpenAIImagesOAuthUnavailableCooldownSettings{
+		CooldownMinutes: openAIImagesOAuthUnavailableDefaultCooldownMinutes,
 	}
 }
 

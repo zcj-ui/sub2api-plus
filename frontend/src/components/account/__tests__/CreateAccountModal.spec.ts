@@ -468,6 +468,39 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     })
   })
 
+  it('submits validated Zhipu team IDs only for Coding Plan accounts', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'Zhipu')
+    await selectButtonByText(wrapper, 'admin.accounts.cnProviders.accountMode.coding')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Zhipu team')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('sk-glm-team')
+    await wrapper.get('[data-testid="create-zhipu-team-organization"]').setValue(' org-team_01 ')
+    await wrapper.get('[data-testid="create-zhipu-team-project"]').setValue(' proj-team_01 ')
+
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    expect(createAccountMock.mock.calls[0]?.[0]?.credentials).toMatchObject({
+      zhipu_organization: 'org-team_01',
+      zhipu_project: 'proj-team_01'
+    })
+  })
+
+  it('rejects unsafe Zhipu team IDs before creating an account', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'Zhipu')
+    await selectButtonByText(wrapper, 'admin.accounts.cnProviders.accountMode.coding')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Zhipu team')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('sk-glm-team')
+    await wrapper.get('[data-testid="create-zhipu-team-organization"]').setValue('org-team/path')
+
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock).not.toHaveBeenCalled()
+  })
+
   it('uses the edited adaptive Chat endpoint when previewing upstream models', async () => {
     const wrapper = mountModal()
     await selectButtonByText(wrapper, 'Kimi')

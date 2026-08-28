@@ -259,6 +259,52 @@ export const GROK_BASE_URL_PRESETS: GrokBaseUrlPreset[] = [
 
 export type CnAccountMode = 'payg' | 'coding'
 
+// ========== 智谱团队版 Coding Plan 组织 / 项目 ID ==========
+// IDs are copied from the BigModel console. Keep the accepted shape narrow so
+// pasted URLs, header fragments, control characters, and unexpectedly large
+// values never reach the credentials payload or an upstream request header.
+export const ZHIPU_TEAM_ID_MAX_LENGTH = 128
+const ZHIPU_ORGANIZATION_ID_PATTERN = /^org[-_][A-Za-z0-9][A-Za-z0-9_-]*$/
+const ZHIPU_PROJECT_ID_PATTERN = /^proj[-_][A-Za-z0-9][A-Za-z0-9_-]*$/
+
+export type ZhipuTeamIDValidationError =
+  | 'organizationInvalid'
+  | 'projectRequired'
+  | 'projectInvalid'
+
+/**
+ * Validate optional team IDs. Empty values are valid and select the personal
+ * quota path; a project value without an organization is ignored by the
+ * request builder and therefore does not enable team mode.
+ */
+export function validateZhipuTeamIDs(
+  organization: string,
+  project: string
+): ZhipuTeamIDValidationError | null {
+  const normalizedOrganization = organization.trim()
+  const normalizedProject = project.trim()
+  if (
+    normalizedOrganization &&
+    (normalizedOrganization.length > ZHIPU_TEAM_ID_MAX_LENGTH ||
+      !ZHIPU_ORGANIZATION_ID_PATTERN.test(normalizedOrganization))
+  ) {
+    return 'organizationInvalid'
+  }
+  if (normalizedOrganization && !normalizedProject) {
+    return 'projectRequired'
+  }
+  // A project-only value is ignored by the request builder and selects the
+  // personal route; validate it only once an organization has opted into the
+  // team route so stale imported data can be cleared normally.
+  if (normalizedOrganization && (
+    normalizedProject.length > ZHIPU_TEAM_ID_MAX_LENGTH ||
+    !ZHIPU_PROJECT_ID_PATTERN.test(normalizedProject)
+  )) {
+    return 'projectInvalid'
+  }
+  return null
+}
+
 /** 仅 deepseek 支持原生 responses；adaptive 会按入站协议选择原生端点。 */
 export type CnApiProtocol = 'adaptive' | 'chat_completions' | 'anthropic' | 'responses'
 export type CnNativeApiProtocol = Exclude<CnApiProtocol, 'adaptive'>

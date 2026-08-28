@@ -555,6 +555,21 @@ func isOpenAICodexReasoningGPTModel(modelID string) bool {
 	return strings.HasPrefix(normalized, "gpt-5")
 }
 
+// supportsOpenAICodexSamplingParameters reports the GPT-5 family exception
+// accepted by the public Codex/Responses endpoint. Older GPT-5 reasoning
+// models reject temperature/top_p, while GPT-5.6 and its dated, Cyber, Sol,
+// Terra, and Luna variants accept them. The boundary requires either the bare
+// gpt-5.6 slug or a hyphen-delimited suffix so names such as gpt-5.60 and
+// gpt-5.6ish are not accidentally treated as supported.
+func supportsOpenAICodexSamplingParameters(modelID string) bool {
+	normalized := canonicalizeOpenAIModelAliasSpelling(modelID)
+	return normalized == "gpt-5.6" || strings.HasPrefix(normalized, "gpt-5.6-")
+}
+
+func isOpenAICodexSamplingUnsupportedModel(modelID string) bool {
+	return isOpenAICodexReasoningGPTModel(modelID) && !supportsOpenAICodexSamplingParameters(modelID)
+}
+
 func isOpenAICodexImageInputModel(modelID string) bool {
 	normalized := canonicalizeOpenAIModelAliasSpelling(modelID)
 	return strings.HasPrefix(normalized, "gpt-5") ||

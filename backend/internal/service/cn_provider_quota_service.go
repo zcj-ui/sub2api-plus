@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,12 +32,26 @@ const (
 	cnQuotaUpstreamTimeout = 15 * time.Second
 	cnQuotaMaxBodyBytes    = 256 * 1024
 
+	// Zhipu team IDs are opaque identifiers returned by the BigModel console.
+	// Keep a deliberately small, ASCII-only envelope before placing them in a
+	// request header.  Apart from catching accidental pasted URLs/newlines this
+	// prevents an imported credential from becoming an arbitrary header value.
+	zhipuTeamIDMaxLength = 128
+
 	// Extra 快照键后缀（加 provider 前缀，如 kimi_5h_used_percent）。
 	cnExtraSuffix5hUsed       = "5h_used_percent"
 	cnExtraSuffix5hReset      = "5h_reset_at"
 	cnExtraSuffixWeeklyUsed   = "weekly_used_percent"
 	cnExtraSuffixWeeklyReset  = "weekly_reset_at"
 	cnExtraSuffixUsageUpdated = "usage_updated_at"
+)
+
+var (
+	// Current BigModel IDs use org-<opaque> and proj_<opaque>.  A handful of
+	// older/global console responses use an underscore after the org prefix,
+	// therefore both separators are accepted while the value remains token-safe.
+	zhipuOrganizationIDPattern = regexp.MustCompile(`^org[-_][A-Za-z0-9][A-Za-z0-9_-]*$`)
+	zhipuProjectIDPattern      = regexp.MustCompile(`^proj[-_][A-Za-z0-9][A-Za-z0-9_-]*$`)
 )
 
 // cnExtraKey 拼接 provider 维度的 extra 键。
@@ -140,8 +156,10 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 
 	baseURL := account.GetOpenAIBaseURL()
 	var (
-		targetURL  string
-		authHeader string
+		targetURL    string
+		authHeader   string
+		zhipuOrg     string
+		zhipuProject string
 	)
 	switch provider {
 	case PlatformKimi:
@@ -150,6 +168,14 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 	case PlatformZhipu:
 		targetURL = zhipuQuotaURL(baseURL)
 		authHeader = apiKey // 智谱额度端点鉴权不加 Bearer 前缀
+		var teamErr error
+		zhipuOrg, zhipuProject, teamErr = zhipuTeamIDs(account)
+		if teamErr != nil {
+			return nil, infraerrors.New(http.StatusBadRequest, "CN_QUOTA_INVALID_ZHIPU_TEAM_ID", teamErr.Error())
+		}
+		if zhipuOrg != "" {
+			targetURL = zhipuTeamQuotaURL(targetURL)
+		}
 	}
 
 	// 探测发起前过出站 URL 安全策略（与网关转发/Grok 探测同一套校验）：
@@ -178,6 +204,21 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 	}
 	// 探测与真实转发保持同一套账号级请求头覆写，避免探测通过但转发失败。
 	account.ApplyHeaderOverrides(req.Header)
+	// Team context is derived from validated credentials and must win over a
+	// generic header override.  This also keeps a stale/malicious override from
+	// changing which organization receives the quota request.
+	if provider == PlatformZhipu {
+		// Never carry team headers from a generic override into the personal
+		// endpoint.  They are re-added only from the validated credential pair.
+		req.Header.Del("bigmodel-organization")
+		req.Header.Del("bigmodel-project")
+		if zhipuOrg != "" {
+			req.Header.Set("bigmodel-organization", zhipuOrg)
+			if zhipuProject != "" {
+				req.Header.Set("bigmodel-project", zhipuProject)
+			}
+		}
+	}
 
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, maxInt(account.Concurrency, 1))
 	if err != nil {
@@ -221,8 +262,9 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 	case PlatformKimi:
 		tiers = parseKimiUsageTiers(bodyBytes)
 	case PlatformZhipu:
-		tiers = parseZhipuTokenTiers(gjson.GetBytes(bodyBytes, "data"))
-		result.PlanLevel = strings.TrimSpace(gjson.GetBytes(bodyBytes, "data.level").String())
+		quotaData := zhipuQuotaData(bodyBytes)
+		tiers = parseZhipuTokenTiers(quotaData)
+		result.PlanLevel = strings.TrimSpace(quotaData.Get("level").String())
 	}
 	result.Tiers = tiers
 	result.Success = true
@@ -235,6 +277,19 @@ func (s *CNProviderQuotaService) queryUsageForAccount(ctx context.Context, accou
 		result.Persisted = true
 	}
 	return result, nil
+}
+
+// zhipuQuotaData normalizes response envelopes seen across BigModel
+// deployments. The documented shape is {data:{limits:[...]}}; some relays
+// return {data:[...]} or put limits directly at the root/top-level array.
+// Keeping this at the boundary lets the parser retain one classification path
+// (including CREDIT_LIMIT fallback) for all variants.
+func zhipuQuotaData(body []byte) gjson.Result {
+	root := gjson.ParseBytes(body)
+	if data := root.Get("data"); data.Exists() && (data.IsObject() || data.IsArray()) {
+		return data
+	}
+	return root
 }
 
 func (s *CNProviderQuotaService) loadCodingPlanAccount(ctx context.Context, accountID int64) (*Account, error) {
@@ -261,6 +316,75 @@ func validateCodingPlanAccount(account *Account) error {
 		return infraerrors.New(http.StatusBadRequest, "CN_QUOTA_NOT_CODING_PLAN", "account is not a coding plan account")
 	}
 	return nil
+}
+
+// zhipuTeamIDs returns the optional team context for a Zhipu Coding Plan
+// account.  Values are read from credentials because the account API response
+// deliberately redacts secrets, and are validated again at the egress
+// boundary (imports and older clients can bypass the UI validation).
+//
+// A project without an organization is ignored so that an account can safely
+// fall back to the personal-plan endpoint. This also lets an administrator
+// repair or clear a stale project-only value without being blocked by a field
+// that can never be sent on the personal route.
+func zhipuTeamIDs(account *Account) (organization, project string, err error) {
+	if account == nil {
+		return "", "", fmt.Errorf("account is unavailable")
+	}
+	organization, err = validateZhipuTeamID(account.GetCredential("zhipu_organization"), "organization")
+	if err != nil {
+		return "", "", err
+	}
+	if organization == "" {
+		// No organization means personal plan; do not send a project header.
+		return "", "", nil
+	}
+	project, err = validateZhipuTeamID(account.GetCredential("zhipu_project"), "project")
+	if err != nil {
+		return "", "", err
+	}
+	if project == "" {
+		// The team endpoint requires the organization and project context as a
+		// pair. Failing before the request avoids a misleading personal/team
+		// fallback and makes an incomplete import immediately actionable.
+		return "", "", fmt.Errorf("zhipu project id is required when organization id is set")
+	}
+	return organization, project, nil
+}
+
+func validateZhipuTeamID(raw, kind string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if len(value) > zhipuTeamIDMaxLength {
+		return "", fmt.Errorf("zhipu %s id exceeds %d characters", kind, zhipuTeamIDMaxLength)
+	}
+	pattern := zhipuOrganizationIDPattern
+	if kind == "project" {
+		pattern = zhipuProjectIDPattern
+	}
+	if !pattern.MatchString(value) {
+		return "", fmt.Errorf("zhipu %s id has an invalid format", kind)
+	}
+	return value, nil
+}
+
+// zhipuTeamQuotaURL adds the team discriminator without string concatenation.
+// Team Coding Plan is exposed only on the domestic BigModel control plane;
+// unlike personal plans, a configured api.z.ai base URL must not redirect this
+// request to the international host where the team route does not exist.
+func zhipuTeamQuotaURL(_ string) string {
+	parsed, err := url.Parse("https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+	if err != nil || parsed == nil {
+		// The endpoint above is a compile-time constant; retain a deterministic
+		// fallback solely for defensive completeness.
+		return "https://open.bigmodel.cn/api/monitor/usage/quota/limit?type=2"
+	}
+	query := parsed.Query()
+	query.Set("type", "2")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 // zhipuQuotaURL 根据 base_url 解析智谱额度端点（与数据面推理域名同主机）。
@@ -415,7 +539,18 @@ func parseZhipuTokenTiers(data gjson.Result) []CNQuotaTier {
 	var creditFallback []entry
 	hasTokensLimit := false
 
-	data.Get("limits").ForEach(func(_, item gjson.Result) bool {
+	limits := data.Get("limits")
+	if data.IsArray() {
+		limits = data
+	} else if !limits.Exists() {
+		// A few gateways wrap the limit array one level deeper as
+		// {data:{data:[...]}}. Accept it without weakening field validation.
+		nested := data.Get("data")
+		if nested.IsArray() {
+			limits = nested
+		}
+	}
+	limits.ForEach(func(_, item gjson.Result) bool {
 		limitType := strings.ToUpper(strings.TrimSpace(item.Get("type").String()))
 		if limitType != "TOKENS_LIMIT" && limitType != "CREDIT_LIMIT" {
 			return true

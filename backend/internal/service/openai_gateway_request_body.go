@@ -1224,7 +1224,12 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 		changed = true
 	}
 
-	for _, field := range openAIChatGPTInternalUnsupportedFields {
+	// The internal Codex endpoint rejects sampling fields for older GPT-5
+	// reasoning models, while GPT-5.6 variants accept them. Resolve the model
+	// after the compatibility normalizer so passthrough follows the same rule
+	// as the structured transform path.
+	model := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
+	for _, field := range openAICodexOAuthUnsupportedFieldsForRequest(model, compact) {
 		if value := gjson.GetBytes(normalized, field); !value.Exists() {
 			continue
 		}

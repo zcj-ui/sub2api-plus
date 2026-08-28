@@ -312,7 +312,14 @@ func TestOpenAIResponsesWebSocketV2PassthroughNonCyberTurnAllowsFollowup(t *test
 	}
 	select {
 	case second := <-secondUpstreamFrame:
-		require.JSONEq(t, secondPayload, string(second))
+		// The relay adds a request-start timestamp to client_metadata for
+		// observability. Assert the client-owned semantic fields while allowing
+		// that server-owned metadata to be present on the forwarded frame.
+		require.Equal(t, "response.create", gjson.GetBytes(second, "type").String())
+		require.Equal(t, "gpt-5.1", gjson.GetBytes(second, "model").String())
+		require.Equal(t, "non-cyber-session-1", gjson.GetBytes(second, "prompt_cache_key").String())
+		require.Equal(t, "follow-up", gjson.GetBytes(second, "input").String())
+		require.NotEmpty(t, gjson.GetBytes(second, "client_metadata.x-codex-ws-stream-request-start-ms").String())
 	default:
 		t.Fatal("non-cyber follow-up did not reach upstream")
 	}

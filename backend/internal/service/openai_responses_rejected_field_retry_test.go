@@ -174,6 +174,27 @@ func TestNormalizeOpenAIResponsesRejectedFieldRetryBodyBindsMaxOutputTokensToRej
 	require.False(t, gjson.GetBytes(retryBody, "max_output_tokens").Exists())
 }
 
+func TestNormalizeOpenAIResponsesRejectedFieldRetryBodyRemovesRejectedSamplingParameter(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-terra","temperature":0.35,"top_p":0.75,"input":[{"content":{"temperature":"keep","top_p":"keep"}}]}`)
+	for _, tt := range []struct {
+		param string
+		code  string
+	}{
+		{param: "temperature", code: "unsupported_parameter"},
+		{param: "top_p", code: "unknown_parameter"},
+	} {
+		t.Run(tt.param, func(t *testing.T) {
+			responseBody := []byte(fmt.Sprintf(`{"error":{"code":%q,"message":"Unsupported parameter: %s","param":%q}}`, tt.code, tt.param, tt.param))
+			retryBody, reason, changed, err := normalizeOpenAIResponsesRejectedFieldRetryBody(http.StatusBadRequest, body, responseBody)
+			require.NoError(t, err)
+			require.True(t, changed)
+			require.Contains(t, reason, tt.param)
+			require.False(t, gjson.GetBytes(retryBody, tt.param).Exists())
+			require.Equal(t, "keep", gjson.GetBytes(retryBody, "input.0.content."+tt.param).String())
+		})
+	}
+}
+
 func TestNormalizeOpenAIResponsesRejectedFieldRetryBodyRemovesExactIndexedStatus(t *testing.T) {
 	body := []byte(`{"input":[{"type":"message","status":"keep","content":"one"},{"type":"reasoning","status":"remove","summary":[]}]}`)
 	responses := []struct {

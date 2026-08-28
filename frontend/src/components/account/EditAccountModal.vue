@@ -118,6 +118,53 @@
           </div>
           <p class="input-hint">{{ t(`admin.accounts.cnProviders.apiProtocol.${cnProtocolDescKey}Desc`) }}</p>
         </div>
+        <!-- Zhipu 团队版 Coding Plan：组织/项目 ID（可选，填写后用量查询走团队版端点） -->
+        <div v-if="account.platform === 'zhipu' && editAccountMode === 'coding'">
+          <div class="flex items-center">
+            <label class="input-label">{{ t('admin.accounts.cnProviders.zhipuTeam.title') }}</label>
+            <HelpTooltip trigger="click" width-class="w-80">
+              <p class="mb-1 font-medium">{{ t('admin.accounts.cnProviders.zhipuTeam.help.title') }}</p>
+              <ol class="list-decimal space-y-1 pl-4">
+                <li>{{ t('admin.accounts.cnProviders.zhipuTeam.help.step1') }}</li>
+                <li>{{ t('admin.accounts.cnProviders.zhipuTeam.help.step2') }}</li>
+                <li>{{ t('admin.accounts.cnProviders.zhipuTeam.help.step3') }}</li>
+                <li>{{ t('admin.accounts.cnProviders.zhipuTeam.help.step4') }}</li>
+              </ol>
+              <p class="mt-2 break-all rounded bg-black/20 p-1.5 font-mono text-[11px] leading-relaxed">
+                {{ t('admin.accounts.cnProviders.zhipuTeam.help.example') }}
+              </p>
+            </HelpTooltip>
+          </div>
+          <div class="mt-2 grid gap-4 sm:grid-cols-2">
+            <div>
+              <label class="input-label">{{ t('admin.accounts.cnProviders.zhipuTeam.organization') }}</label>
+              <input
+                v-model="editZhipuOrganization"
+                type="text"
+                class="input"
+                data-testid="edit-zhipu-team-organization"
+                :maxlength="ZHIPU_TEAM_ID_MAX_LENGTH"
+                autocomplete="off"
+                spellcheck="false"
+                :placeholder="t('admin.accounts.cnProviders.zhipuTeam.organizationPlaceholder')"
+              />
+            </div>
+            <div>
+              <label class="input-label">{{ t('admin.accounts.cnProviders.zhipuTeam.project') }}</label>
+              <input
+                v-model="editZhipuProject"
+                type="text"
+                class="input"
+                data-testid="edit-zhipu-team-project"
+                :maxlength="ZHIPU_TEAM_ID_MAX_LENGTH"
+                autocomplete="off"
+                spellcheck="false"
+                :placeholder="t('admin.accounts.cnProviders.zhipuTeam.projectPlaceholder')"
+              />
+            </div>
+          </div>
+          <p class="input-hint mt-2">{{ t('admin.accounts.cnProviders.zhipuTeam.hint') }}</p>
+        </div>
         <div>
           <label class="input-label">{{ t('admin.accounts.apiKey') }}</label>
           <input
@@ -2887,6 +2934,7 @@ import type {
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
+import HelpTooltip from '@/components/common/HelpTooltip.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import Icon from '@/components/icons/Icon.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
@@ -2911,6 +2959,8 @@ import {
   validateHeaderOverrideRows,
   defaultCNAdaptiveBaseUrls,
   defaultCNBaseUrl,
+  validateZhipuTeamIDs,
+  ZHIPU_TEAM_ID_MAX_LENGTH,
   HEADER_OVERRIDE_ENABLED_CREDENTIAL_KEY,
   HEADER_OVERRIDES_CREDENTIAL_KEY,
   type CnAccountMode,
@@ -3021,6 +3071,9 @@ const cnPresetPlatform = computed<'kimi' | 'zhipu' | 'deepseek'>(() => {
 })
 const editApiProtocol = ref<CnApiProtocol>('adaptive')
 const editAccountMode = ref<CnAccountMode>('payg')
+// 智谱团队版 Coding Plan：组织/项目 ID，写入 credentials 供额度探测切换团队端点。
+const editZhipuOrganization = ref('')
+const editZhipuProject = ref('')
 const editAdaptiveBaseUrls = ref<Record<CnNativeApiProtocol, string>>({
   chat_completions: '',
   anthropic: '',
@@ -3089,6 +3142,12 @@ watch(editAccountMode, (mode, previousMode) => {
   if (effectiveMode !== mode) {
     editAccountMode.value = effectiveMode
     return
+  }
+  if (props.account!.platform === 'zhipu' && mode !== 'coding') {
+    // Team IDs are meaningful only for Coding Plan. Clear hidden values when
+    // switching back so saving the account unambiguously uses the personal path.
+    editZhipuOrganization.value = ''
+    editZhipuProject.value = ''
   }
   if (editApiProtocol.value === 'adaptive') {
     const previousDefaults = defaultCNAdaptiveBaseUrls(cnPresetPlatform.value, previousMode)
@@ -3723,6 +3782,10 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   // Load intercept warmup requests setting (applies to all account types)
   const credentials = newAccount.credentials as Record<string, unknown> | undefined
   interceptWarmupRequests.value = credentials?.intercept_warmup_requests === true
+  // Team GLM fields are reset on every account switch so values from a prior
+  // modal session can never be submitted for another account.
+  editZhipuOrganization.value = ''
+  editZhipuProject.value = ''
   autoPauseOnExpired.value = newAccount.auto_pause_on_expired === true
   editVertexProjectId.value = ''
   editVertexClientEmail.value = ''
@@ -3997,6 +4060,14 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         nextAdaptiveBaseUrls[legacyProtocol] = legacyBaseUrl
       }
       editAdaptiveBaseUrls.value = nextAdaptiveBaseUrls
+      if (newAccount.platform === 'zhipu') {
+        editZhipuOrganization.value = typeof credentials.zhipu_organization === 'string'
+          ? credentials.zhipu_organization.trim()
+          : ''
+        editZhipuProject.value = typeof credentials.zhipu_project === 'string'
+          ? credentials.zhipu_project.trim()
+          : ''
+      }
     }
     const platformDefaultUrl =
       newAccount.platform === 'openai'
@@ -4712,6 +4783,29 @@ const handleSubmit = async () => {
           newCredentials.base_url = protocolBaseUrls.chat_completions
         } else {
           delete newCredentials.api_base_urls
+        }
+
+        // Team GLM context is opt-in. Clearing the organization (or switching
+        // to pay-as-you-go) removes both IDs and restores the personal query
+        // path; malformed values are rejected before the update is sent.
+        if (props.account.platform === 'zhipu') {
+          const organization = editAccountMode.value === 'coding'
+            ? editZhipuOrganization.value.trim()
+            : ''
+          const project = editAccountMode.value === 'coding'
+            ? editZhipuProject.value.trim()
+            : ''
+          const teamIDError = validateZhipuTeamIDs(organization, project)
+          if (teamIDError) {
+            appStore.showError(t(`admin.accounts.cnProviders.zhipuTeam.${teamIDError}`))
+            return
+          }
+          delete newCredentials.zhipu_organization
+          delete newCredentials.zhipu_project
+          if (organization) {
+            newCredentials.zhipu_organization = organization
+            if (project) newCredentials.zhipu_project = project
+          }
         }
       }
 

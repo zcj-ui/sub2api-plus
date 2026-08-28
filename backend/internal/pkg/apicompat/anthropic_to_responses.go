@@ -32,7 +32,7 @@ func AnthropicToResponses(req *AnthropicRequest) (*ResponsesRequest, error) {
 	// sampling parameters. Sending temperature or top_p causes a 400
 	// "Unsupported parameter" error, so we only forward them for non-reasoning
 	// models.
-	if !isReasoningModel(req.Model) {
+	if !rejectsSamplingParameters(req.Model) {
 		out.Temperature = req.Temperature
 		out.TopP = req.TopP
 	}
@@ -465,12 +465,27 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
-// isReasoningModel reports whether model is a reasoning model that does not
-// support sampling parameters (temperature, top_p) via the Responses API.
-// All gpt-5.x models are reasoning-only; the Responses API returns
-// "Unsupported parameter: temperature" if these fields are present.
+// isReasoningModel reports whether a model belongs to the broad GPT-5
+// reasoning family. It intentionally remains broader than
+// rejectsSamplingParameters because GPT-5.6 is reasoning-capable while also
+// accepting temperature/top_p.
 func isReasoningModel(model string) bool {
 	return strings.HasPrefix(model, "gpt-5")
+}
+
+// rejectsSamplingParameters reports GPT-5 families that reject temperature
+// and top_p on the Responses API. GPT-5.6 (including Sol/Terra/Luna and
+// dated/Cyber variants) accepts both fields. Keep isReasoningModel above for
+// callers that only need the broad reasoning-family classification.
+func rejectsSamplingParameters(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if slash := strings.LastIndex(normalized, "/"); slash >= 0 {
+		normalized = normalized[slash+1:]
+	}
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	return strings.HasPrefix(normalized, "gpt-5") &&
+		normalized != "gpt-5.6" &&
+		!strings.HasPrefix(normalized, "gpt-5.6-")
 }
 
 // normalizeToolParameters ensures the tool parameter schema is valid for

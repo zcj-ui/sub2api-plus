@@ -179,11 +179,33 @@ var openAIChatGPTInternalUnsupportedFields = []string{
 var openAICodexOAuthUnsupportedFields = append([]string{
 	"max_output_tokens",
 	"max_completion_tokens",
-	"temperature",
-	"top_p",
 	"frequency_penalty",
 	"presence_penalty",
 }, openAIChatGPTInternalUnsupportedFields...)
+
+var openAICodexOAuthSamplingFields = []string{"temperature", "top_p"}
+
+func openAICodexOAuthUnsupportedFieldsForModel(model string) []string {
+	if supportsOpenAICodexSamplingParameters(model) {
+		return openAICodexOAuthUnsupportedFields
+	}
+	fields := make([]string, 0, len(openAICodexOAuthUnsupportedFields)+len(openAICodexOAuthSamplingFields))
+	fields = append(fields, openAICodexOAuthUnsupportedFields...)
+	return append(fields, openAICodexOAuthSamplingFields...)
+}
+
+func openAICodexOAuthUnsupportedFieldsForRequest(model string, compact bool) []string {
+	fields := openAICodexOAuthUnsupportedFieldsForModel(model)
+	// The compact endpoint has a dedicated request schema and never accepts
+	// sampling controls, even when the selected model is GPT-5.6. Keep the
+	// historical compact behavior while allowing those fields on normal
+	// Responses turns.
+	if compact && supportsOpenAICodexSamplingParameters(model) {
+		fields = make([]string, 0, len(fields)+len(openAICodexOAuthSamplingFields))
+		fields = append(fields, openAICodexOAuthSamplingFields...)
+	}
+	return fields
+}
 
 func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact bool) codexTransformResult {
 	return applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{
@@ -236,8 +258,9 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 		}
 	}
 
-	// Strip parameters unsupported by ChatGPT internal Codex endpoint.
-	for _, key := range openAICodexOAuthUnsupportedFields {
+	// Strip parameters unsupported by ChatGPT internal Codex endpoint. GPT-5.6
+	// is the one GPT-5 family that accepts sampling parameters.
+	for _, key := range openAICodexOAuthUnsupportedFieldsForRequest(normalizedModel, opts.IsCompact) {
 		if _, ok := reqBody[key]; ok {
 			delete(reqBody, key)
 			result.Modified = true

@@ -141,6 +141,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	}
 
 	responsesReq.Model = upstreamModel
+	// AnthropicToResponses made its initial capability decision from the
+	// inbound model alias; apply the final mapped-model policy before marshal.
+	applyOpenAIResponsesSamplingModelPolicy(responsesReq, upstreamModel, anthropicReq.Temperature, anthropicReq.TopP)
 	if responsesReq.Reasoning != nil {
 		responsesReq.Reasoning.Effort = openAICompatAnthropicReasoningEffort(&anthropicReq, upstreamModel, responsesReq.Reasoning.Effort)
 	}

@@ -962,12 +962,17 @@ func (s *OpenAIGatewayService) localRuntimeBlockPersistencePending(account *Acco
 	observedUpdatedAt, _ := observedRaw.(time.Time)
 	if account.UpdatedAt.IsZero() {
 		// A zero row version cannot prove that a durable writer observed the
-		// transition. In production a repository/scheduler dependency is
-		// present, so keep the local block until its own deadline instead of
-		// turning a failed persistence into an immediate fail-open decision.
-		// Dependency-free fixtures represent the legacy/unknown state and keep
-		// the upstream PR's stale-block cleanup semantics.
-		return s.accountRepo != nil || s.schedulerSnapshot != nil
+		// transition. Keep every ordinary account-level block fail-closed until
+		// an explicit clear or a versioned snapshot arrives. The sole exception
+		// is the administrator utilization-threshold block when a fresh paid
+		// credit snapshot is available; that is the documented credit override
+		// and is safe to retire locally.
+		if rawReason, ok := s.openaiAccountRuntimeBlockReason.Load(account.ID); ok &&
+			strings.TrimSpace(fmt.Sprint(rawReason)) == "account_scheduling_threshold" &&
+			account.HasAvailableCodexCredits() {
+			return false
+		}
+		return true
 	}
 	if observedUpdatedAt.IsZero() {
 		return false

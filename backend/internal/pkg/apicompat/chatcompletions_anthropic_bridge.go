@@ -27,8 +27,9 @@ import (
 //
 // Helper functions from the Responses bridges (anthropicImageToDataURI,
 // extractAnthropicTextFromBlocks, fromResponsesCallID, sanitizeAnthropicToolUseInput,
-// parseAnthropicSystemContentParts, isReasoningModel, mapAnthropicEffortToResponses,
-// normalizeToolParameters) are reused so the conversion semantics stay identical.
+// parseAnthropicSystemContentParts, rejectsSamplingParameters,
+// mapAnthropicEffortToResponses, normalizeToolParameters) are reused so the
+// conversion semantics stay identical.
 
 // ---------------------------------------------------------------------------
 // Request: AnthropicRequest → ChatCompletionsRequest
@@ -56,7 +57,7 @@ func AnthropicToChatCompletionsRequest(req *AnthropicRequest) (*ChatCompletionsR
 	}
 
 	// Sampling params: reasoning models (gpt-5.x) reject temperature/top_p.
-	if !isReasoningModel(req.Model) {
+	if !rejectsSamplingParameters(req.Model) {
 		out.Temperature = req.Temperature
 		out.TopP = req.TopP
 	}

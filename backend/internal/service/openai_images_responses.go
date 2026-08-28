@@ -1958,9 +1958,23 @@ func (s *OpenAIGatewayService) forwardOpenAIImagesOAuth(
 }
 
 const (
-	openAIImagesOAuthUnavailableCooldown = 30 * time.Minute
+	openAIImagesOAuthUnavailableDefaultCooldown = time.Duration(openAIImagesOAuthUnavailableDefaultCooldownMinutes) * time.Minute
+	// Keep the pre-configuration name as an internal compatibility alias for
+	// existing tests and callers in this package.  New code should use the
+	// explicit Default name above.
+	openAIImagesOAuthUnavailableCooldown = openAIImagesOAuthUnavailableDefaultCooldown
 	openAIImagesOAuthUnavailableReason   = "openai_images_oauth_tool_unavailable"
+	// Settings are operational metadata, not part of the upstream request.  A
+	// slow/unavailable settings store must not hold an image request open.
+	openAIImagesOAuthUnavailableSettingReadTimeout = 250 * time.Millisecond
+	// A custom settings repository that ignores context cancellation can leave
+	// the bounded read goroutine behind. Cap those outstanding reads so a
+	// settings outage cannot create an unbounded number of goroutines on a
+	// concurrent image-error storm; callers that hit the cap use the default.
+	openAIImagesOAuthUnavailableMaxPendingReads = 16
 )
+
+var openAIImagesOAuthUnavailableReadSlots = make(chan struct{}, openAIImagesOAuthUnavailableMaxPendingReads)
 
 // shouldCoolOpenAIImagesToolForError decides whether an image_generation_unavailable
 // verdict is durable enough to park the account's image tool for
@@ -1982,13 +1996,71 @@ func shouldCoolOpenAIImagesToolForError(upstreamErr *OpenAIImagesUpstreamError) 
 	return upstreamErr != nil && !upstreamErr.SynthesizedFromModelText
 }
 
+type openAIImagesOAuthUnavailableCooldownReadResult struct {
+	settings *OpenAIImagesOAuthUnavailableCooldownSettings
+	err      error
+}
+
+// openAIImagesOAuthUnavailableCooldownForRequest reads the optional setting
+// with a small, independent timeout.  The image failover path always has a
+// usable default, so a settings-store error or timeout is logged and ignored.
+// The read runs in a bounded goroutine because a custom SettingRepository may
+// not honor context cancellation; this keeps a broken settings backend from
+// delaying the upstream response.
+func (s *OpenAIGatewayService) openAIImagesOAuthUnavailableCooldownForRequest(ctx context.Context) time.Duration {
+	defaultCooldown := openAIImagesOAuthUnavailableDefaultCooldown
+	if s == nil || s.settingService == nil {
+		return defaultCooldown
+	}
+
+	readBase := context.Background()
+	if ctx != nil {
+		readBase = context.WithoutCancel(ctx)
+	}
+	readCtx, cancel := context.WithTimeout(readBase, openAIImagesOAuthUnavailableSettingReadTimeout)
+	select {
+	case openAIImagesOAuthUnavailableReadSlots <- struct{}{}:
+		// The worker releases the slot when the repository call returns. This is
+		// deliberately owned by the worker so a caller timeout cannot release a
+		// slot still in use by a stuck repository.
+	default:
+		cancel()
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Images OAuth tool cooldown setting reads saturated; using default=%s", defaultCooldown)
+		return defaultCooldown
+	}
+	resultCh := make(chan openAIImagesOAuthUnavailableCooldownReadResult, 1)
+	go func() {
+		defer func() { <-openAIImagesOAuthUnavailableReadSlots }()
+		settings, err := s.settingService.GetOpenAIImagesOAuthUnavailableCooldownSettings(readCtx)
+		resultCh <- openAIImagesOAuthUnavailableCooldownReadResult{settings: settings, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		cancel()
+		if result.err != nil {
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Images OAuth tool cooldown setting read failed error=%v", result.err)
+			return defaultCooldown
+		}
+		if result.settings == nil || result.settings.CooldownMinutes < 1 || result.settings.CooldownMinutes > openAIImagesOAuthUnavailableMaxCooldownMinutes {
+			return defaultCooldown
+		}
+		return time.Duration(result.settings.CooldownMinutes) * time.Minute
+	case <-readCtx.Done():
+		cancel()
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Images OAuth tool cooldown setting read timed out; using default=%s", defaultCooldown)
+		return defaultCooldown
+	}
+}
+
 func (s *OpenAIGatewayService) coolOpenAIImagesOAuthTool(ctx context.Context, account *Account) {
 	if s == nil || s.accountRepo == nil || account == nil || account.Platform != PlatformOpenAI {
 		return
 	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
-	resetAt := time.Now().Add(openAIImagesOAuthUnavailableCooldown)
+	cooldown := s.openAIImagesOAuthUnavailableCooldownForRequest(stateCtx)
+	resetAt := time.Now().Add(cooldown)
 	if err := s.accountRepo.SetModelRateLimit(stateCtx, account.ID, openAIImageGenerationRateLimitKey, resetAt, openAIImagesOAuthUnavailableReason); err != nil {
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Images OAuth tool cooldown write failed account_id=%d error=%v", account.ID, err)
 		return

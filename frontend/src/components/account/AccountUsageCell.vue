@@ -658,6 +658,10 @@ import { cnQuotaCellVisible as cnQuotaCellVisibleFn, cnBalanceCellVisible as cnB
 // Module-level cache shared across all AccountUsageCell instances
 const _usageCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
 const USAGE_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+// An active OpenAI usage probe already refreshes the account snapshot. Keep
+// the row-key watcher from immediately issuing a second /usage request when
+// that snapshot is emitted back to the parent list.
+const SUPPRESS_USAGE_REFRESH_WINDOW_MS = 2_000
 
 const props = withDefaults(
   defineProps<{
@@ -691,6 +695,8 @@ const desktopViewportQuery = '(min-width: 768px)'
 
 const unmounted = ref(false)
 onBeforeUnmount(() => { unmounted.value = true })
+
+const suppressOpenAIUsageRefreshUntil = ref(0)
 
 const loading = ref(false)
 const activeQueryLoading = ref(false)
@@ -1639,6 +1645,11 @@ watch(
 watch(openAIUsageRefreshKey, (nextKey, prevKey) => {
   if (!prevKey || nextKey === prevKey) return
   if (props.account.platform !== 'openai' || props.account.type !== 'oauth') return
+
+  if (Date.now() < suppressOpenAIUsageRefreshUntil.value) {
+    suppressOpenAIUsageRefreshUntil.value = 0
+    return
+  }
 
   if (isBatchManaged.value) {
     requestParentBatchUsage({ force: true })
