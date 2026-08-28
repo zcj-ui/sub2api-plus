@@ -365,6 +365,13 @@ type OpsUpstreamErrorEvent struct {
 	AccountID   int64  `json:"account_id,omitempty"`
 	AccountName string `json:"account_name,omitempty"`
 
+	// Proxy attribution is an immutable, credential-free snapshot of the route
+	// used by this attempt. ProxyID is null for direct and unknown routes;
+	// ProxyName distinguishes direct/no_proxy from unknown.
+	// Never add proxy URLs or credentials to this event.
+	ProxyID   *int64 `json:"proxy_id"`
+	ProxyName string `json:"proxy_name"`
+
 	// Outcome
 	UpstreamStatusCode int    `json:"upstream_status_code,omitempty"`
 	UpstreamRequestID  string `json:"upstream_request_id,omitempty"`
@@ -394,6 +401,11 @@ type OpsUpstreamErrorEvent struct {
 	SkipMonitoring bool `json:"-"`
 }
 
+const (
+	opsProxyNameDirect  = "direct/no_proxy"
+	opsProxyNameUnknown = "unknown"
+)
+
 func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
 	if c == nil {
 		return
@@ -402,6 +414,7 @@ func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
 		ev.AtUnixMs = time.Now().UnixMilli()
 	}
 	ev.Platform = strings.TrimSpace(ev.Platform)
+	normalizeOpsUpstreamProxyAttribution(&ev)
 	ev.UpstreamRequestID = strings.TrimSpace(ev.UpstreamRequestID)
 	ev.UpstreamResponseBody = strings.TrimSpace(ev.UpstreamResponseBody)
 	ev.Kind = strings.TrimSpace(ev.Kind)
@@ -427,6 +440,55 @@ func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
 	c.Set(OpsUpstreamErrorsKey, existing)
 
 	checkSkipMonitoringForUpstreamEvent(c, &evCopy)
+}
+
+// The event is assembled at the failure site. Forwarding code builds managed
+// proxy routes from Proxy, so that event-time object is authoritative.
+func opsUpstreamProxyID(account *Account) *int64 {
+	if account == nil || account.ProxyID == nil || account.Proxy == nil || account.Proxy.ID <= 0 || account.Proxy.ID != *account.ProxyID {
+		return nil
+	}
+	proxyID := account.Proxy.ID
+	return &proxyID
+}
+
+func opsUpstreamProxyName(account *Account) string {
+	if account == nil {
+		return opsProxyNameUnknown
+	}
+	if account.ProxyID == nil {
+		return opsProxyNameDirect
+	}
+	if account.Proxy == nil || account.Proxy.ID <= 0 || account.Proxy.ID != *account.ProxyID {
+		return opsProxyNameUnknown
+	}
+	if name := strings.TrimSpace(account.Proxy.Name); name != "" {
+		return name
+	}
+	return "proxy"
+}
+
+func setUnknownOpsUpstreamProxy(ev *OpsUpstreamErrorEvent) {
+	if ev == nil {
+		return
+	}
+	ev.ProxyID = nil
+	ev.ProxyName = opsProxyNameUnknown
+}
+
+// normalizeOpsUpstreamProxyAttribution makes legacy events explicit without
+// pretending that the account's current proxy is historical evidence.
+func normalizeOpsUpstreamProxyAttribution(ev *OpsUpstreamErrorEvent) {
+	if ev == nil {
+		return
+	}
+	if ev.ProxyID != nil && *ev.ProxyID <= 0 {
+		ev.ProxyID = nil
+	}
+	ev.ProxyName = strings.TrimSpace(ev.ProxyName)
+	if ev.ProxyName == "" {
+		setUnknownOpsUpstreamProxy(ev)
+	}
 }
 
 // checkSkipMonitoringForUpstreamEvent snapshots whether this attempt matches a
@@ -479,7 +541,26 @@ func ParseOpsUpstreamErrors(raw string) ([]*OpsUpstreamErrorEvent, error) {
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
 		return nil, err
 	}
+	for _, ev := range out {
+		normalizeOpsUpstreamProxyAttribution(ev)
+	}
 	return out, nil
+}
+
+func normalizeOpsUpstreamErrorsJSON(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw, nil
+	}
+	events, err := ParseOpsUpstreamErrors(raw)
+	if err != nil {
+		return "", err
+	}
+	normalized, err := json.Marshal(events)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
 }
 
 // safeUpstreamURL returns scheme + host + path from a URL, stripping query/fragment

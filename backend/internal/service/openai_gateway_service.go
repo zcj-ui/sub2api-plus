@@ -978,7 +978,17 @@ func (s *OpenAIGatewayService) writeOpenAIWSFallbackErrorResponse(c *gin.Context
 
 	setOpsUpstreamError(c, statusCode, upstreamMessage, "")
 	if account != nil {
+		proxyID := opsUpstreamProxyID(account)
+		proxyName := opsUpstreamProxyName(account)
+		// The existing WS client uses the configured proxy only when both fields
+		// are present; otherwise http.DefaultClient may select an environment proxy.
+		if account.ProxyID == nil || account.Proxy == nil {
+			proxyID = nil
+			proxyName = opsProxyNameUnknown
+		}
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			ProxyID:            proxyID,
+			ProxyName:          proxyName,
 			Platform:           account.Platform,
 			AccountID:          account.ID,
 			AccountName:        account.Name,

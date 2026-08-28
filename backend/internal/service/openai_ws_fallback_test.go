@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	coderws "github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
 
@@ -228,6 +230,28 @@ func TestResolveOpenAIWSFallbackErrorResponse(t *testing.T) {
 		_, _, _, _, ok := resolveOpenAIWSFallbackErrorResponse(errors.New("plain error"))
 		require.False(t, ok)
 	})
+}
+
+func TestWriteOpenAIWSFallbackErrorResponseMarksDefaultClientRouteUnknown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	svc := &OpenAIGatewayService{}
+	account := &Account{ID: 42, Name: "default-client", Platform: PlatformOpenAI}
+
+	written := svc.writeOpenAIWSFallbackErrorResponse(
+		c,
+		account,
+		wrapOpenAIWSFallback("auth_failed", errors.New("unauthorized")),
+	)
+	require.True(t, written)
+
+	raw, ok := c.Get(OpsUpstreamErrorsKey)
+	require.True(t, ok)
+	events, ok := raw.([]*OpsUpstreamErrorEvent)
+	require.True(t, ok)
+	require.Len(t, events, 1)
+	require.Nil(t, events[0].ProxyID)
+	require.Equal(t, opsProxyNameUnknown, events[0].ProxyName)
 }
 
 func TestOpenAIWSFallbackCooling(t *testing.T) {

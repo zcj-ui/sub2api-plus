@@ -133,6 +133,8 @@ func (s *GatewayService) ForwardAsChatCompletions(
 			_ = resp.Body.Close()
 		}
 		return nil, s.handleUpstreamTransportError(ctx, c, account, err, OpsUpstreamErrorEvent{
+			ProxyID:     opsUpstreamProxyID(account),
+			ProxyName:   opsUpstreamProxyName(account),
 			UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
 		})
 	}
@@ -149,6 +151,8 @@ func (s *GatewayService) ForwardAsChatCompletions(
 
 		if s.shouldFailoverUpstreamError(resp.StatusCode) {
 			appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+				ProxyID:            opsUpstreamProxyID(account),
+				ProxyName:          opsUpstreamProxyName(account),
 				Platform:           account.Platform,
 				AccountID:          account.ID,
 				AccountName:        account.Name,

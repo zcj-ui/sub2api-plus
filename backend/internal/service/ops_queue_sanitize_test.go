@@ -8,7 +8,10 @@ import (
 func TestSanitizeOpsUpstreamErrorsForQueueBoundsAndRedacts(t *testing.T) {
 	entry := &OpsInsertErrorLogInput{}
 	for i := 0; i < 20; i++ {
+		proxyID := int64(i + 1)
 		entry.UpstreamErrors = append(entry.UpstreamErrors, &OpsUpstreamErrorEvent{
+			ProxyID:              &proxyID,
+			ProxyName:            "proxy-" + string(rune('a'+i)),
 			Platform:             strings.Repeat("p", 100),
 			AccountName:          strings.Repeat("a", 300),
 			UpstreamStatusCode:   500,
@@ -32,10 +35,13 @@ func TestSanitizeOpsUpstreamErrorsForQueueBoundsAndRedacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 16 {
-		t.Fatalf("event count = %d, want 16", len(events))
+	if len(events) != 20 {
+		t.Fatalf("event count = %d, want 20", len(events))
 	}
-	for _, event := range events {
+	for i, event := range events {
+		if event.ProxyID == nil || *event.ProxyID != int64(i+1) {
+			t.Fatalf("event %d proxy id = %v, want %d", i, event.ProxyID, i+1)
+		}
 		if len(event.Platform) > 32 || len(event.AccountName) > 128 || len(event.UpstreamURL) > 2048 || len(event.Message) > 2048 {
 			t.Fatalf("event fields were not bounded: %+v", event)
 		}
@@ -44,6 +50,9 @@ func TestSanitizeOpsUpstreamErrorsForQueueBoundsAndRedacts(t *testing.T) {
 		}
 		if strings.Contains(event.UpstreamResponseBody, "Bearer secret") || strings.Contains(event.Detail, `"secret"`) {
 			t.Fatal("credential material was not redacted")
+		}
+		if i < 4 && (event.UpstreamResponseBody != "" || event.Detail != "") {
+			t.Fatal("older event retained a large body outside the queue body window")
 		}
 	}
 }

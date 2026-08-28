@@ -978,6 +978,7 @@
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintMode') }}</label>
           <input
+            id="bulk-edit-codex-fingerprint-mode-enabled"
             v-model="enableCodexFingerprintMode"
             type="checkbox"
             data-testid="bulk-codex-fingerprint-mode-enabled"
@@ -2168,11 +2169,9 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
 
   if (enableCodexFingerprintMode.value && allOpenAIOAuthOnly.value) {
     const extra = ensureExtra()
-    // Bulk updates use JSONB merge semantics; null explicitly clears a
-    // previous account-level override while off remains the default.
-    extra.codex_fingerprint_mode = codexFingerprintMode.value === 'off'
-      ? null
-      : codexFingerprintMode.value
+    // Bulk updates use JSONB merge semantics, so off must be explicit to
+    // replace an existing account-level override.
+    extra.codex_fingerprint_mode = codexFingerprintMode.value
   }
 
   if (enableCodex429Guard.value && allOpenAIOAuthOnly.value) {

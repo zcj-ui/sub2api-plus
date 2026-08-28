@@ -699,6 +699,7 @@ func (s *OpenAIGatewayService) clearAllOpenAIRuntimeBlockState() {
 	clear(&s.openaiAccountRuntimeBlockUntil)
 	clear(&s.openaiAccountRuntimeBlockReason)
 	clear(&s.openaiAccountRuntimeBlockObservedUpdatedAt)
+	clear(&s.openaiAccountRuntimeBlockLocks)
 	clear(&s.openaiAccountRuntimeBlockGeneration)
 	clear(&s.openaiOAuth429RetryStartedAt)
 }
