@@ -80,6 +80,10 @@ function mountModal(extraProps: Record<string, unknown> = {}) {
   })
 }
 
+async function confirmFilteredScope(wrapper: ReturnType<typeof mountModal>) {
+  await wrapper.get('[data-testid="bulk-edit-filtered-confirm"]').setValue(true)
+}
+
 describe('BulkEditAccountModal', () => {
   beforeEach(() => {
     vi.mocked(adminAPI.accounts.bulkUpdate).mockReset()
@@ -796,6 +800,7 @@ describe('BulkEditAccountModal', () => {
       .toContain('admin.accounts.bulkEdit.longContextShadowHint')
     await wrapper.get('#bulk-edit-openai-long-context-billing-enabled').setValue(true)
     await wrapper.get('[data-testid="bulk-edit-openai-long-context-billing-toggle"]').trigger('click')
+    await confirmFilteredScope(wrapper)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 
@@ -803,6 +808,31 @@ describe('BulkEditAccountModal', () => {
       filters: { platform: 'openai', type: 'oauth', status: 'active' },
       extra: { openai_long_context_billing_enabled: true }
     })
+  })
+
+  it('筛选全量模式提交前必须确认完整目标范围', async () => {
+    const wrapper = mountModal({
+      accountIds: [],
+      selectedPlatforms: [],
+      selectedTypes: [],
+      target: {
+        mode: 'filtered',
+        filters: { platform: 'openai', status: 'active' },
+        previewCount: 20,
+        selectedPlatforms: ['openai'],
+        selectedTypes: ['oauth']
+      }
+    })
+
+    expect(wrapper.get('[data-testid="bulk-edit-filtered-warning"]').text()).toContain(
+      'admin.accounts.bulkEdit.filteredScopeWarning'
+    )
+    await wrapper.get('#bulk-edit-status-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(adminAPI.accounts.bulkUpdate).not.toHaveBeenCalled()
+    expect(showError).toHaveBeenCalledWith('admin.accounts.bulkEdit.filteredScopeConfirmRequired')
   })
 
   it('成功响应包含影子继承数量时展示专用提示', async () => {
@@ -942,6 +972,7 @@ describe('BulkEditAccountModal', () => {
     })
 
     await wrapper.get('#bulk-edit-upstream-billing-auto-probe-enabled').setValue(true)
+    await confirmFilteredScope(wrapper)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 
@@ -973,6 +1004,7 @@ describe('BulkEditAccountModal', () => {
     const inputs = wrapper.findAll('[data-testid="bulk-edit-openai-compact-model-mapping-input"]')
     await inputs[0].setValue('gpt-5.4')
     await inputs[1].setValue('gpt-5.4-openai-compact')
+    await confirmFilteredScope(wrapper)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 
@@ -1050,6 +1082,7 @@ describe('BulkEditAccountModal', () => {
     })
 
     await wrapper.get('#bulk-edit-status-enabled').setValue(true)
+    await confirmFilteredScope(wrapper)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 

@@ -1,11 +1,17 @@
 package setup
 
 import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestDecideAdminBootstrap(t *testing.T) {
@@ -223,6 +229,27 @@ func TestWriteConfigFileIncludesRedisUsername(t *testing.T) {
 
 	if !strings.Contains(string(data), "username: app-user") {
 		t.Fatalf("config missing Redis username, got:\n%s", string(data))
+	}
+}
+
+func TestSetupBodyLimitRejectsOversizedWizardPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(setupBodyLimit())
+	router.POST("/", func(c *gin.Context) {
+		_, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.String(http.StatusRequestEntityTooLarge, "body too large")
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(bytes.Repeat([]byte{'x'}, int(setupMaxBodyBytes)+1)))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("setup body limit status=%d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
 	}
 }
 

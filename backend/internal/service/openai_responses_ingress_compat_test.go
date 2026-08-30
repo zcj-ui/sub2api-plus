@@ -14,7 +14,7 @@ func TestNormalizeOpenAIResponsesLegacyIngressMessagesOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.False(t, gjson.GetBytes(normalized, "messages").Exists())
-	require.False(t, gjson.GetBytes(normalized, "previous_response_id").Exists())
+	require.Equal(t, "resp_stale", gjson.GetBytes(normalized, "previous_response_id").String())
 	require.Equal(t, "system", gjson.GetBytes(normalized, "input.0.role").String())
 	require.Equal(t, "repo policy", gjson.GetBytes(normalized, "input.0.content").String())
 	require.Equal(t, "function_call", gjson.GetBytes(normalized, "input.1.type").String())
@@ -22,6 +22,16 @@ func TestNormalizeOpenAIResponsesLegacyIngressMessagesOnly(t *testing.T) {
 	require.Equal(t, "function_call_output", gjson.GetBytes(normalized, "input.2.type").String())
 	require.Equal(t, "call_1", gjson.GetBytes(normalized, "input.2.call_id").String())
 	require.Equal(t, gjson.False, gjson.GetBytes(normalized, "stream").Type)
+}
+
+func TestNormalizeOpenAIResponsesLegacyIngressPreservesPlainFollowupPreviousResponseID(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6","messages":[{"role":"user","content":"follow up"}],"previous_response_id":"resp_prior"}`)
+
+	normalized, changed, err := normalizeOpenAIResponsesLegacyIngress(body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "resp_prior", gjson.GetBytes(normalized, "previous_response_id").String())
+	require.Equal(t, "follow up", gjson.GetBytes(normalized, "input.0.content").String())
 }
 
 func TestNormalizeOpenAIResponsesLegacyIngressConvertsChatTopLevelFields(t *testing.T) {

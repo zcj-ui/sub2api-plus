@@ -203,18 +203,27 @@ func restoreInheritedResponsesClientToolDeclarations(lowered []any, mapping Resp
 		switch {
 		case mapping.ToolSearch && name == toolSearchProxyName:
 			restored = append(restored, map[string]any{"type": "tool_search"})
-		case mapping.CustomTools[name]:
-			copy := copyClientTool(tool)
-			copy["type"] = "custom"
-			restored = append(restored, copy)
 		case mapping.NamespaceTools[name].Namespace != "":
+			// Namespace children are represented as flattened function names on
+			// the upstream declaration list.  Rebuild the namespace wrapper before
+			// the generic CustomTools case; otherwise a custom child such as
+			// functions__exec would come back as a top-level custom tool and lose
+			// its namespace on the next continuation.
 			identity := mapping.NamespaceTools[name]
 			child := copyClientTool(tool)
-			child["type"] = "function"
+			if identity.Custom {
+				child["type"] = "custom"
+			} else {
+				child["type"] = "function"
+			}
 			child["name"] = identity.Name
 			restored = append(restored, map[string]any{
 				"type": "namespace", "name": identity.Namespace, "tools": []any{child},
 			})
+		case mapping.CustomTools[name]:
+			copy := copyClientTool(tool)
+			copy["type"] = "custom"
+			restored = append(restored, copy)
 		default:
 			restored = append(restored, copyClientTool(tool))
 		}

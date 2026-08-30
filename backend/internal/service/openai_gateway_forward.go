@@ -645,7 +645,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if gjson.GetBytes(body, "max_completion_tokens").Exists() && (account.Type == AccountTypeAPIKey || account.Platform != PlatformOpenAI) {
 			markPatchDelete("max_completion_tokens")
 		}
-		for _, unsupportedField := range []string{"prompt_cache_retention", "safety_identifier", "prompt_cache_options"} {
+		// `prompt_cache_retention` and `prompt_cache_options` are resolved at the
+		// final egress boundary after account/model/host mapping.  Keep the
+		// generic early cleanup limited to the field that is unsupported for all
+		// non-Codex Responses routes.
+		for _, unsupportedField := range []string{"safety_identifier"} {
 			if gjson.GetBytes(body, unsupportedField).Exists() {
 				markPatchDelete(unsupportedField)
 			}
@@ -665,8 +669,16 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 
-	if rawTier := requestView.ServiceTier; rawTier != "" {
-		if normTier := normalizedOpenAIServiceTierValue(rawTier); normTier != "" {
+	// Treat an explicit JSON null the same as an omitted tier.  The body/WS
+	// policy helpers already use that interpretation; keeping the request-view
+	// fast path aligned prevents a null value from bypassing a configured
+	// `service_tier=missing` rule.
+	if rawTier := requestView.ServiceTier; openAIFastPolicyTierNeedsEvaluation(body, rawTier) {
+		normTier := normalizedOpenAIServiceTierValue(rawTier)
+		if rawTier == "" {
+			normTier = OpenAIFastTierMissing
+		}
+		if normTier != "" {
 			action, errMsg := s.evaluateOpenAIFastPolicy(ctx, account, upstreamModel, normTier)
 			switch action {
 			case BetaPolicyActionBlock:
@@ -684,7 +696,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					markPatchSet("service_tier", OpenAIFastTierPriority)
 				}
 			default:
-				if normTier != rawTier {
+				if normTier != OpenAIFastTierMissing && normTier != rawTier {
 					markPatchSet("service_tier", normTier)
 				}
 			}
@@ -1126,6 +1138,17 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				}
 				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
 			}
+			if account.IsOpenAIOAuth() && isChatGPTInternalCodexEndpointForAccount(account, upstreamReq.URL.String()) {
+				if retryBody, reason, changed, retryErr := normalizeOpenAIChatGPTOptionalRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
+					return nil, fmt.Errorf("normalize ChatGPT optional rejected Responses field retry body: %w", retryErr)
+				} else if changed && rejectedFieldRetryState.Allow(retryBody) {
+					body = retryBody
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 ChatGPT request after %s (account: %s)", reason, account.Name)
+					continue
+				}
+			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)
 			} else if changed && rejectedFieldRetryState.Allow(retryBody) {
@@ -1283,7 +1306,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 		if account.UsesOpenAICodexProtocol() && !account.IsShadow() {
 			if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
-				s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
+				s.updateCodexUsageSnapshot(ctx, account.ID, snapshot, account)
 			}
 		} else if account.IsShadow() && account.ParentAccountID != nil {
 			notifyOpenAIAutoReset(*account.ParentAccountID)
@@ -1325,6 +1348,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 		return forwardResult, nil
 	}
+}
+
+func openAIFastPolicyTierNeedsEvaluation(body []byte, rawTier string) bool {
+	if strings.TrimSpace(rawTier) != "" {
+		return true
+	}
+	tierResult := gjson.GetBytes(body, "service_tier")
+	return !tierResult.Exists() || tierResult.Type == gjson.Null
 }
 
 func shouldForwardOpenAIResponsesViaRawChatCompletions(account *Account) bool {
@@ -1385,6 +1416,12 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, body); changed {
 		body = scrubbed
 	}
+	// Final egress guard for ChatGPT internal OAuth requests.  Several earlier
+	// compatibility branches can rebuild the body after their field cleanup;
+	// this single boundary keeps unsupported optional fields from reaching the
+	// internal endpoint and records only field names when it catches a leak.
+	body = applyOpenAIPromptCacheFieldsForEgress(account, targetURL, body)
+	body = applyChatGPTInternalEgressStripForURL(ctx, account, targetURL, body, openAIEgressForward)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
 	if err != nil {

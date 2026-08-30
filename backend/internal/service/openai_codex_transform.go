@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -114,8 +115,15 @@ func isCodexSyntheticAgentContextCallID(id string) bool {
 	if id == "" {
 		return false
 	}
+	// A normal Responses transform can normalize a custom tool call's
+	// `call_...` identifier into the `ctc_...` namespace.  Treat all of the
+	// representations as the same synthetic checkpoint; otherwise a replayed
+	// checkpoint would be mistaken for a real tool continuation and a later
+	// user message could receive a second injected pair.
+	suffix := strings.TrimPrefix(codexSyntheticAgentContextCallPrefix, "call_")
 	return strings.HasPrefix(id, codexSyntheticAgentContextCallPrefix) ||
-		strings.HasPrefix(id, codexCallIDPrefix+strings.TrimPrefix(codexSyntheticAgentContextCallPrefix, "call_"))
+		strings.HasPrefix(id, codexCallIDPrefix+suffix) ||
+		strings.HasPrefix(id, "ctc_"+suffix)
 }
 
 func normalizeCodexCallID(id string) string {
@@ -170,9 +178,9 @@ var openAIChatGPTInternalUnsupportedFields = []string{
 	"user",
 	"metadata",
 	"prompt_cache_retention",
+	"prompt_cache_options",
 	"safety_identifier",
 	"stream_options",
-	"truncation",
 	"stop_sequences",
 }
 
@@ -205,6 +213,20 @@ func openAICodexOAuthUnsupportedFieldsForRequest(model string, compact bool) []s
 		fields = append(fields, openAICodexOAuthSamplingFields...)
 	}
 	return fields
+}
+
+// stripCodexOAuthDisabledTruncation mirrors the ChatGPT/Codex OAuth client's
+// compatibility behavior: the internal endpoint accepts the normal
+// truncation policy (for example, "auto"), but rejects the legacy
+// "disabled" value.  Keep this separate from the generic unsupported-field
+// list so that accepted policies are preserved end to end.
+func stripCodexOAuthDisabledTruncation(reqBody map[string]any) bool {
+	truncation, ok := reqBody["truncation"].(string)
+	if !ok || truncation != "disabled" {
+		return false
+	}
+	delete(reqBody, "truncation")
+	return true
 }
 
 func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact bool) codexTransformResult {
@@ -265,6 +287,9 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 			delete(reqBody, key)
 			result.Modified = true
 		}
+	}
+	if stripCodexOAuthDisabledTruncation(reqBody) {
+		result.Modified = true
 	}
 
 	// 请求带 reasoning 时补齐 include:["reasoning.encrypted_content"]，与真实 Codex 对齐
@@ -402,7 +427,7 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 }
 
 func appendCodexSyntheticAgentContextPair(reqBody map[string]any) bool {
-	if reqBody == nil || isOpenAICompatMessagesBridgeRequestBody(reqBody) {
+	if reqBody == nil || isOpenAICompatMessagesBridgeRequestBody(reqBody) || isCodexExplicitImageGenerationRequest(reqBody) {
 		return false
 	}
 	input, ok := reqBody["input"].([]any)
@@ -447,6 +472,14 @@ func newCodexSyntheticAgentContextCallID() (string, bool) {
 
 func appendCodexSyntheticAgentContextPairToBody(body []byte) ([]byte, bool, error) {
 	if len(body) == 0 || len(body) > codexSyntheticAgentContextMaxBody {
+		return body, false, nil
+	}
+	// The checkpoint is for ordinary text turns.  Native image-generation
+	// requests have their own tool lifecycle and must not receive an unrelated
+	// synthetic exec call.  Use the explicit detector so a passive image_gen
+	// namespace advertisement on an otherwise ordinary Codex request remains
+	// eligible for the normal text path.
+	if isCodexExplicitImageGenerationBody(body) {
 		return body, false, nil
 	}
 	var document struct {
@@ -513,6 +546,28 @@ func appendCodexSyntheticAgentContextPairToBody(body []byte) ([]byte, bool, erro
 	return updated, true, nil
 }
 
+func isCodexExplicitImageGenerationRequest(reqBody map[string]any) bool {
+	if reqBody == nil {
+		return false
+	}
+	return IsExplicitImageGenerationIntentMap(
+		openAIResponsesEndpoint,
+		firstNonEmptyString(reqBody["model"]),
+		reqBody,
+	)
+}
+
+func isCodexExplicitImageGenerationBody(body []byte) bool {
+	if len(body) == 0 || !json.Valid(body) {
+		return false
+	}
+	return IsExplicitImageGenerationIntent(
+		openAIResponsesEndpoint,
+		strings.TrimSpace(gjson.GetBytes(body, "model").String()),
+		body,
+	)
+}
+
 func normalizeCodexSyntheticPairRawInput(raw json.RawMessage) ([]json.RawMessage, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -569,7 +624,10 @@ func codexSyntheticPairEligibleTail(itemType, role string) bool {
 		"image_generation_call", "computer_call", "computer_call_output":
 		return false
 	case "", "message":
-		return role == "" || role == "user" || role == "assistant" || role == "system" || role == "developer"
+		// Do not hide a malformed message (missing role) behind the synthetic
+		// checkpoint.  The upstream would reject it; leave the original request
+		// untouched so the client receives the canonical validation error.
+		return role == "user" || role == "assistant" || role == "system" || role == "developer"
 	case "text", "input_text":
 		return role == ""
 	default:

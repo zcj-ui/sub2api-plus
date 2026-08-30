@@ -14,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/tidwall/gjson"
 )
 
@@ -29,6 +30,13 @@ const responsesProbeMaxBodyBytes = 256 * 1024
 // 推理型模型可能把预算全烧在 reasoning 上,还没轮到 function_call 就被截断——
 // 那种响应不能用来判定工具能力,见 responsesProbeVerdictIsConclusive。
 const openaiResponsesProbeMaxOutputTokens = 512
+
+// openaiResponsesProbeMaxModels bounds the number of concrete mapped models
+// exercised by one asynchronous capability probe.  A model-specific 404 must
+// not disable Responses for the whole account (#5275), but an account with a
+// very large mapping should not turn account creation into an unbounded burst
+// of upstream requests.
+const openaiResponsesProbeMaxModels = 8
 
 // openaiResponsesProbePayload 构造探测用的 Responses 请求体。
 //
@@ -73,6 +81,49 @@ func openaiResponsesProbePayload(modelID string) []byte {
 	return body
 }
 
+// selectResponsesProbeModels returns concrete upstream model IDs that can be
+// probed independently.  The old implementation selected only the first
+// lexicographically sorted value, which made a model-specific 404 look like an
+// account-wide Responses failure.  Keep the ordering deterministic and bound
+// the work so callers can safely try the candidates in order.
+func selectResponsesProbeModels(account *Account) []string {
+	models, _ := selectResponsesProbeModelsBounded(account)
+	return models
+}
+
+// selectResponsesProbeModelsBounded is the implementation behind
+// selectResponsesProbeModels.  The second return value tells the caller that
+// some concrete mappings were intentionally left unprobed; in that case a set
+// of negative results must not be promoted to an account-wide false verdict.
+func selectResponsesProbeModelsBounded(account *Account) ([]string, bool) {
+	if account == nil {
+		return []string{openai.DefaultTestModel}, false
+	}
+	mapping := account.GetModelMapping()
+	candidates := make([]string, 0, len(mapping))
+	seen := make(map[string]struct{}, len(mapping))
+	for _, upstream := range mapping {
+		upstream = strings.TrimSpace(upstream)
+		if upstream == "" || strings.Contains(upstream, "*") {
+			continue
+		}
+		if _, exists := seen[upstream]; exists {
+			continue
+		}
+		seen[upstream] = struct{}{}
+		candidates = append(candidates, upstream)
+	}
+	if len(candidates) == 0 {
+		return []string{openai.DefaultTestModel}, false
+	}
+	sort.Strings(candidates)
+	truncated := len(candidates) > openaiResponsesProbeMaxModels
+	if len(candidates) > openaiResponsesProbeMaxModels {
+		candidates = candidates[:openaiResponsesProbeMaxModels]
+	}
+	return candidates, truncated
+}
+
 // selectResponsesProbeModel 选出用于探测的上游模型。
 //
 // 工具能力探测必须用上游真实存在的模型——用占位模型(DefaultTestModel)打第三方
@@ -80,20 +131,7 @@ func openaiResponsesProbePayload(modelID string) []byte {
 // 的上游模型(值),按字典序取首个具体(非通配符)模型以保证可复现;无映射时回退
 // DefaultTestModel(适配 OpenAI 官方 APIKey 账号)。
 func selectResponsesProbeModel(account *Account) string {
-	mapping := account.GetModelMapping()
-	candidates := make([]string, 0, len(mapping))
-	for _, upstream := range mapping {
-		upstream = strings.TrimSpace(upstream)
-		if upstream == "" || strings.Contains(upstream, "*") {
-			continue
-		}
-		candidates = append(candidates, upstream)
-	}
-	if len(candidates) == 0 {
-		return openai.DefaultTestModel
-	}
-	sort.Strings(candidates)
-	return candidates[0]
+	return selectResponsesProbeModels(account)[0]
 }
 
 // ProbeOpenAIAPIKeyResponsesSupport 探测 OpenAI APIKey 账号上游是否支持
@@ -114,6 +152,12 @@ func selectResponsesProbeModel(account *Account) string {
 // 关于失败处理：探测本身的失败不应阻塞账号创建——账号能创建/更新成功就够了，
 // 探测结果只影响后续路由优化。所有错误都仅记录日志，不向调用方传播。
 func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Context, accountID int64) {
+	if !beginOpenAIResponsesProbe(accountID) {
+		logger.LegacyPrintf("service.openai_probe", "probe_already_in_flight: account_id=%d", accountID)
+		return
+	}
+	defer endOpenAIResponsesProbe(accountID)
+
 	account, err := s.accountRepo.GetByID(ctx, accountID)
 	if err != nil {
 		logger.LegacyPrintf("service.openai_probe", "probe_load_account_failed: account_id=%d err=%v", accountID, err)
@@ -162,63 +206,145 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 	}
 
 	probeURL := buildOpenAIResponsesURL(normalizedBaseURL)
-	probeModel := selectResponsesProbeModel(account)
+	probeModels, probeModelsTruncated := selectResponsesProbeModelsBounded(account)
 
 	probeCtx, cancel := context.WithTimeout(ctx, openaiResponsesProbeTimeout)
 	defer cancel()
-
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, probeURL, bytes.NewReader(openaiResponsesProbePayload(probeModel)))
-	if err != nil {
-		logger.LegacyPrintf("service.openai_probe", "probe_build_request_failed: account_id=%d err=%v", accountID, err)
-		return
-	}
-	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Accept", "application/json")
-	applyOpenAICodexProbeHeaders(req.Header)
-
-	// 账号级请求头覆写：能力探测与真实转发保持一致的最终头
-	account.ApplyHeaderOverrides(req.Header)
 
 	proxyURL, proxyErr := accountTestProxyURL(account)
 	if proxyErr != nil {
 		logger.LegacyPrintf("service.openai_probe", "probe_proxy_unavailable: account_id=%d err=%v", accountID, proxyErr)
 		return
 	}
-
-	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
-	if err != nil {
-		// 网络层失败：不写标记，保持 unknown，下次重试或由网关 fallback 处理
-		logger.LegacyPrintf("service.openai_probe", "probe_request_failed: account_id=%d url=%s err=%v", accountID, probeURL, err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, responsesProbeMaxBodyBytes))
-	// 有界排空剩余响应体:既帮助连接复用,又避免行为异常的上游用超大响应体拖住探测。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responsesProbeMaxBodyBytes))
-	if readErr != nil {
-		// 响应体读取失败(部分读取/传输错误):按网络层失败处理,保持 unknown,
-		// 不写标记——否则可能给一个 2xx 响应误写 supported=false。
-		logger.LegacyPrintf("service.openai_probe", "probe_read_body_failed: account_id=%d url=%s err=%v", accountID, probeURL, readErr)
+	if s.httpUpstream == nil {
+		logger.LegacyPrintf("service.openai_probe", "probe_http_upstream_unavailable: account_id=%d", accountID)
 		return
 	}
 
-	// 本次响应不足以下结论时保持 unknown，与网络层失败、响应体读取失败一致：
-	// 标记一旦写成 false 就会一直粘住（只有下次账号创建/更新才重探），网关会静默
-	// 改走 /v1/chat/completions —— 对 Codex 客户端意味着 prompt 缓存前缀被打散。
-	// 宁可不写，让请求继续走既有的 Responses 路径。
-	if !responsesProbeVerdictIsConclusive(resp.StatusCode, bodyBytes) {
+	// Probe each concrete mapped model until a positive result is found.  A
+	// model-level not-found/unsupported error is deliberately treated as
+	// unknown and does not veto another mapped model.  Only an endpoint-level
+	// 404/405 (or all conclusive negative tool-capability results) can persist a
+	// legacy account-wide false value.
+	var (
+		supported           bool
+		sawConclusiveNo     bool
+		sawInconclusive     bool
+		sawUnknownEvidence  bool
+		sawEndpointAbsent   bool
+		lastProbeModel      string
+		lastProbeStatus     int
+		lastProbeConclusive bool
+	)
+	for _, probeModel := range probeModels {
+		if err := probeCtx.Err(); err != nil {
+			sawInconclusive = true
+			break
+		}
+		lastProbeModel = probeModel
+		req, buildErr := http.NewRequestWithContext(probeCtx, http.MethodPost, probeURL, bytes.NewReader(openaiResponsesProbePayload(probeModel)))
+		if buildErr != nil {
+			logger.LegacyPrintf("service.openai_probe", "probe_build_request_failed: account_id=%d model=%s err=%v", accountID, probeModel, buildErr)
+			sawInconclusive = true
+			continue
+		}
+		req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Accept", "application/json")
+		applyOpenAICodexProbeHeaders(req.Header)
+		// 账号级请求头覆写：能力探测与真实转发保持一致的最终头
+		account.ApplyHeaderOverrides(req.Header)
+
+		// Lightweight test fixtures and migrations may construct an
+		// AccountTestService without the optional profile service.  Passing a
+		// nil profile keeps the transport on its ordinary path; dereferencing
+		// the optional dependency here would turn a background capability probe
+		// into a panic.
+		var tlsProfile *tlsfingerprint.Profile
+		if s.tlsFPProfileService != nil {
+			tlsProfile = s.tlsFPProfileService.ResolveTLSProfile(account)
+		}
+		resp, requestErr := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+		if requestErr != nil {
+			// 网络层失败：不写标记，保持 unknown；仍可尝试下一个映射模型。
+			logger.LegacyPrintf("service.openai_probe", "probe_request_failed: account_id=%d model=%s url=%s err=%v", accountID, probeModel, probeURL, requestErr)
+			sawInconclusive = true
+			continue
+		}
+		if resp == nil || resp.Body == nil {
+			// A custom transport must not be able to turn a malformed response
+			// into an account-wide negative (and must not make the probe panic).
+			logger.LegacyPrintf("service.openai_probe", "probe_empty_response: account_id=%d model=%s", accountID, probeModel)
+			sawInconclusive = true
+			continue
+		}
+		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, responsesProbeMaxBodyBytes))
+		// 有界排空剩余响应体:既帮助连接复用,又避免行为异常的上游用超大响应体拖住探测。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, responsesProbeMaxBodyBytes))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			// 响应体读取失败(部分读取/传输错误):按网络层失败处理,保持 unknown。
+			logger.LegacyPrintf("service.openai_probe", "probe_read_body_failed: account_id=%d model=%s url=%s err=%v", accountID, probeModel, probeURL, readErr)
+			sawInconclusive = true
+			continue
+		}
+
+		lastProbeStatus = resp.StatusCode
+		lastProbeConclusive = responsesProbeVerdictIsConclusive(resp.StatusCode, bodyBytes)
+		if !lastProbeConclusive {
+			logger.LegacyPrintf("service.openai_probe",
+				"probe_inconclusive_keep_unknown: account_id=%d base_url=%s probe_model=%s status=%d response_status=%s reason=%s",
+				accountID, normalizedBaseURL, probeModel, resp.StatusCode,
+				gjson.GetBytes(bodyBytes, "status").String(),
+				gjson.GetBytes(bodyBytes, "incomplete_details.reason").String(),
+			)
+			sawInconclusive = true
+			sawUnknownEvidence = true
+			continue
+		}
+		if responsesProbeBodyIndicatesModelSpecificFailure(bodyBytes) {
+			// 404/400 model-not-found and model/protocol unsupported errors are
+			// scoped to this candidate; they are not evidence about the account
+			// or any other mapped model (#5275).
+			logger.LegacyPrintf("service.openai_probe",
+				"probe_model_specific_failure_keep_unknown: account_id=%d base_url=%s probe_model=%s status=%d",
+				accountID, normalizedBaseURL, probeModel, resp.StatusCode,
+			)
+			sawInconclusive = true
+			sawUnknownEvidence = true
+			continue
+		}
+
+		candidateSupported := decideResponsesProbeSupport(resp.StatusCode, bodyBytes)
+		if candidateSupported {
+			supported = true
+			break
+		}
+		sawConclusiveNo = true
+		// A genuine endpoint-level 404/405 applies to every model on this base
+		// URL, so avoid spending the remaining probe budget.
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+			sawEndpointAbsent = true
+			break
+		}
+	}
+
+	if !supported && (!sawConclusiveNo || sawInconclusive || (probeModelsTruncated && !sawEndpointAbsent)) {
+		// A previous one-shot probe may have persisted false before a model
+		// mapping was corrected.  Once this run receives real model-scoped or
+		// otherwise inconclusive evidence, clear that stale verdict while
+		// preserving any explicit force_* routing override.  Network-only
+		// failures do not clear a previously conclusive result.
+		if sawUnknownEvidence || (probeModelsTruncated && !sawEndpointAbsent) {
+			clearStaleResponsesProbeVerdictIfAuto(ctx, s.accountRepo, account)
+		}
 		logger.LegacyPrintf("service.openai_probe",
-			"probe_inconclusive_keep_unknown: account_id=%d base_url=%s probe_model=%s status=%d response_status=%s reason=%s",
-			accountID, normalizedBaseURL, probeModel, resp.StatusCode,
-			gjson.GetBytes(bodyBytes, "status").String(),
-			gjson.GetBytes(bodyBytes, "incomplete_details.reason").String(),
+			"probe_no_account_wide_verdict: account_id=%d base_url=%s probe_model=%s status=%d conclusive=%v inconclusive=%v models_truncated=%v",
+			accountID, normalizedBaseURL, lastProbeModel, lastProbeStatus, lastProbeConclusive, sawInconclusive, probeModelsTruncated,
 		)
 		return
 	}
-
-	supported := decideResponsesProbeSupport(resp.StatusCode, bodyBytes)
 
 	if err := s.accountRepo.UpdateExtra(ctx, accountID, map[string]any{
 		openai_compat.ExtraKeyResponsesSupported: supported,
@@ -235,15 +361,44 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 			"account_id", accountID,
 			"account_name", account.Name,
 			"base_url", normalizedBaseURL,
-			"probe_model", probeModel,
-			"upstream_status", resp.StatusCode,
+			"probe_model", lastProbeModel,
+			"upstream_status", lastProbeStatus,
 		)
 	}
 
 	logger.LegacyPrintf("service.openai_probe",
 		"probe_done: account_id=%d base_url=%s probe_model=%s status=%d supported=%v",
-		accountID, normalizedBaseURL, probeModel, resp.StatusCode, supported,
+		accountID, normalizedBaseURL, lastProbeModel, lastProbeStatus, supported,
 	)
+}
+
+// clearStaleResponsesProbeVerdictIfAuto moves an old false probe result back
+// to the unknown state after a later run proves that the sampled model/error
+// cannot establish an account-wide verdict.  Manual force_responses and
+// force_chat_completions modes always win and are left untouched.
+func clearStaleResponsesProbeVerdictIfAuto(ctx context.Context, repo AccountRepository, account *Account) {
+	if repo == nil || account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeAPIKey {
+		return
+	}
+	mode := ""
+	if raw, ok := account.Extra[openai_compat.ExtraKeyResponsesMode]; ok {
+		if value, ok := raw.(string); ok {
+			mode = value
+		}
+	}
+	if openai_compat.NormalizeResponsesSupportMode(mode) != openai_compat.ResponsesSupportModeAuto {
+		return
+	}
+	if raw, exists := account.Extra[openai_compat.ExtraKeyResponsesSupported]; !exists {
+		return
+	} else if supported, ok := raw.(bool); !ok || supported {
+		return
+	}
+	if err := repo.UpdateExtra(ctx, account.ID, map[string]any{
+		openai_compat.ExtraKeyResponsesSupported: nil,
+	}); err != nil {
+		logger.LegacyPrintf("service.openai_probe", "clear_stale_probe_verdict_failed: account_id=%d err=%v", account.ID, err)
+	}
 }
 
 // responsesProbeVerdictIsConclusive 判断本次探测响应是否足以对「上游是否支持带工具的
@@ -311,6 +466,85 @@ func decideResponsesProbeSupport(status int, body []byte) bool {
 		return true
 	}
 	return responsesProbeBodyHasFunctionCall(body)
+}
+
+// responsesProbeBodyIndicatesModelSpecificFailure reports whether an error
+// body clearly scopes the failure to the requested model (or to that model's
+// protocol support).  OpenAI-compatible gateways frequently return 404 for a
+// missing model as well as for a missing route; treating both forms alike is
+// the account-wide false-negative described in #5275.  Keep this detector
+// intentionally conservative: an unstructured/generic 404 remains an
+// endpoint-level negative, while an explicit model marker becomes unknown and
+// lets the caller try another mapped model.
+func responsesProbeBodyIndicatesModelSpecificFailure(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	paths := []string{
+		"error.code",
+		"error.type",
+		"error.param",
+		"error.message",
+		"error",
+		"error.details",
+		"errors.0.code",
+		"errors.0.type",
+		"errors.0.param",
+		"errors.0.message",
+		"detail",
+		"message",
+		"code",
+		"type",
+		"param",
+	}
+	parts := make([]string, 0, len(paths))
+	for _, path := range paths {
+		value := gjson.GetBytes(body, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		if text := strings.TrimSpace(value.String()); text != "" {
+			parts = append(parts, strings.ToLower(text))
+		}
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	text := strings.Join(parts, " ")
+	for _, marker := range []string{
+		"model_not_found",
+		"model-not-found",
+		"model not found",
+		"model_not_supported",
+		"model-not-supported",
+		"model not supported",
+		"unsupported model",
+		"unknown model",
+		"model does not exist",
+		"model doesn't exist",
+		"model is not available",
+		"model unavailable",
+		"model is unavailable",
+		"does not support responses",
+		"does not support the responses",
+		"does not support this endpoint",
+		"doesn't support responses",
+		"doesn't support the responses",
+		"doesn't support this endpoint",
+		"responses not supported",
+		"responses api not supported by model",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	// Some providers only return "model" as the parameter and a generic
+	// "not found" message.  The explicit parameter is enough to scope it.
+	if strings.Contains(text, "model") &&
+		(strings.Contains(text, "not found") || strings.Contains(text, "not exist") || strings.Contains(text, "unavailable")) {
+		return true
+	}
+	return false
 }
 
 // responsesProbeBodyHasFunctionCall 判断非流式 Responses 响应体的 output 数组里

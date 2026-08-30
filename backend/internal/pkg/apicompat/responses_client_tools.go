@@ -11,7 +11,11 @@ import (
 // native Responses request is sent to an upstream that only understands
 // function tools.
 type ResponsesClientToolMapping struct {
-	CustomTools    map[string]bool
+	CustomTools map[string]bool
+	// FunctionTools records ordinary function declarations so an inherited or
+	// hand-built mapping cannot reclassify a same-named function as a custom
+	// namespace child during response restoration.
+	FunctionTools  map[string]bool
 	ToolSearch     bool
 	NamespaceTools map[string]ResponsesNamespaceName
 }
@@ -61,6 +65,9 @@ func AdaptResponsesClientTools(req map[string]any) (ResponsesClientToolMapping, 
 		if functionNames[name] {
 			return ResponsesClientToolMapping{}, false, fmt.Errorf("custom tool %q conflicts with a function tool of the same name; this upstream cannot disambiguate them, rename one of the tools", name)
 		}
+	}
+	if len(functionNames) > 0 {
+		adapter.FunctionTools = functionNames
 	}
 	if adapter.ToolSearch && (functionNames[toolSearchProxyName] || customNames[toolSearchProxyName]) {
 		return ResponsesClientToolMapping{}, false, fmt.Errorf("built-in tool_search conflicts with a declared tool named %q; this upstream cannot disambiguate them, rename the tool", toolSearchProxyName)
@@ -180,7 +187,7 @@ func AdaptResponsesClientToolsWithInheritedMapping(
 	if _, toolsPresent := req["tools"]; toolsPresent {
 		return AdaptResponsesClientTools(req)
 	}
-	if len(inherited.CustomTools) == 0 && !inherited.ToolSearch && len(inherited.NamespaceTools) == 0 {
+	if len(inherited.CustomTools) == 0 && len(inherited.FunctionTools) == 0 && !inherited.ToolSearch && len(inherited.NamespaceTools) == 0 {
 		return ResponsesClientToolMapping{}, false, nil
 	}
 	if len(inheritedLoweredTools) > 0 && len(inheritedLoweredTools[0]) > 0 {
@@ -188,17 +195,26 @@ func AdaptResponsesClientToolsWithInheritedMapping(
 		return AdaptResponsesClientTools(req)
 	}
 
+	// Flatten namespace-qualified custom/function history before lowering client
+	// tool kinds.  Follow-up requests often omit `tools`, so this ordering is
+	// what lets a remembered namespace custom child (functions/exec) reach the
+	// function-only upstream with the same flattened name as the first turn.
+	namespaceHistoryPresent := len(inherited.NamespaceTools) > 0
+	if namespaceHistoryPresent {
+		rewriteNamespaceQualifiedCalls(req["input"], inherited.NamespaceTools)
+		if choice, ok := req["tool_choice"].(map[string]any); ok {
+			rewriteNamespaceQualifiedCall(choice, inherited.NamespaceTools)
+		}
+	}
 	changed, err := rewriteClientToolHistory(req["input"], &inherited)
 	if err != nil {
 		return ResponsesClientToolMapping{}, false, err
 	}
-	if len(inherited.NamespaceTools) > 0 {
-		before := changed
-		rewriteNamespaceQualifiedCalls(req["input"], inherited.NamespaceTools)
-		// Namespace rewriting does not currently report whether it changed a
-		// value. A retained namespace mapping is only used for follow-up
-		// history, so conservatively rebuild the request when input exists.
-		if _, inputPresent := req["input"]; inputPresent && !before {
+	if namespaceHistoryPresent {
+		// Namespace rewriting intentionally has no per-value change counter;
+		// the request carries an inherited mapping, so conservatively mark it as
+		// changed whenever the input path is present.
+		if _, inputPresent := req["input"]; inputPresent {
 			changed = true
 		}
 	}
@@ -231,7 +247,13 @@ func rewriteClientToolHistory(value any, adapter *ResponsesClientToolMapping) (b
 			typ := strings.TrimSpace(stringValue(typed["type"]))
 			switch typ {
 			case "custom_tool_call":
-				if adapter.CustomTools[strings.TrimSpace(stringValue(typed["name"]))] {
+				name := strings.TrimSpace(stringValue(typed["name"]))
+				if namespaceCustom, ok := namespacedCustomToolCall(name, adapter.FunctionTools, adapter.NamespaceTools); ok {
+					name = flattenNamespaceToolName(namespaceCustom.Namespace, namespaceCustom.Name)
+					typed["name"] = name
+					delete(typed, "namespace")
+				}
+				if adapter.CustomTools[name] {
 					typed["type"] = "function_call"
 					typed["arguments"] = customToolCallArguments(stringValue(typed["input"]))
 					delete(typed, "input")
@@ -511,7 +533,15 @@ func restoreClientToolValue(value any, adapter *ResponsesClientToolMapping) bool
 	case map[string]any:
 		if strings.TrimSpace(stringValue(typed["type"])) == "function_call" {
 			name := strings.TrimSpace(stringValue(typed["name"]))
-			if adapter.CustomTools[name] {
+			if ns, ok := namespacedCustomToolCall(name, adapter.FunctionTools, adapter.NamespaceTools); ok {
+				typed["type"] = "custom_tool_call"
+				typed["name"] = ns.Name
+				typed["namespace"] = ns.Namespace
+				retypeResponsesToolCallItemID(typed, "custom_tool_call")
+				typed["input"] = extractCustomToolCallInput(rawObjectString(typed["arguments"]))
+				delete(typed, "arguments")
+				changed = true
+			} else if adapter.CustomTools[name] {
 				typed["type"] = "custom_tool_call"
 				retypeResponsesToolCallItemID(typed, "custom_tool_call")
 				typed["input"] = extractCustomToolCallInput(rawObjectString(typed["arguments"]))
@@ -547,8 +577,9 @@ type ResponsesClientToolStreamRestorer struct {
 }
 
 type responsesClientToolStreamCall struct {
-	kind string
-	name string
+	kind      string
+	name      string
+	namespace string
 	// callID and itemID stay as the upstream sent them so later upstream
 	// events keep matching this call; clientItemID is what we emit.
 	callID       string
@@ -585,9 +616,10 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 		if call := r.recordItem(event); call != nil {
 			if call.kind == "custom" {
 				event.Item.Type = "custom_tool_call"
+				event.Item.Name = call.name
 				event.Item.Input = ""
 				event.Item.Arguments = ""
-				event.Item.Namespace = ""
+				event.Item.Namespace = call.namespace
 			} else {
 				event.Item.Type = "tool_search_call"
 				event.Item.Name = ""
@@ -625,9 +657,10 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 		if call := r.recordItem(event); call != nil {
 			if call.kind == "custom" {
 				event.Item.Type = "custom_tool_call"
+				event.Item.Name = call.name
 				event.Item.Input = extractCustomToolCallInput(call.arguments.String())
 				event.Item.Arguments = ""
-				event.Item.Namespace = ""
+				event.Item.Namespace = call.namespace
 			} else {
 				event.Item.Type = "tool_search_call"
 				event.Item.Name = ""
@@ -733,10 +766,13 @@ func (r *ResponsesClientToolStreamRestorer) clientToolEventPayload(payload []byt
 		if raw.Item.Type != "function_call" {
 			return false
 		}
+		if _, isCustom := namespacedCustomToolCall(raw.Item.Name, r.adapter.FunctionTools, r.adapter.NamespaceTools); isCustom {
+			return true
+		}
 		_, namespaceTool := r.adapter.NamespaceTools[raw.Item.Name]
 		return r.adapter.CustomTools[raw.Item.Name] || (r.adapter.ToolSearch && raw.Item.Name == toolSearchProxyName) || namespaceTool || r.calls[raw.Item.ID] != nil || r.calls[raw.Item.CallID] != nil
 	}
-	if _, namespaceTool := r.adapter.NamespaceTools[raw.Name]; namespaceTool {
+	if _, namespaceTool := resolveNamespaceToolCallName(raw.Name, r.adapter.NamespaceTools); namespaceTool {
 		return true
 	}
 	if r.calls[raw.ItemID] != nil || r.calls[raw.CallID] != nil || r.byOutput[raw.OutputIndex] != nil {
@@ -789,9 +825,15 @@ func (r *ResponsesClientToolStreamRestorer) recordItem(event ResponsesStreamEven
 	if event.Item == nil || event.Item.Type != "function_call" {
 		return nil
 	}
-	name := event.Item.Name
+	sourceName := event.Item.Name
+	name := sourceName
 	kind := ""
-	if r.adapter.CustomTools[name] {
+	namespace := ""
+	if ns, isCustom := namespacedCustomToolCall(name, r.adapter.FunctionTools, r.adapter.NamespaceTools); isCustom {
+		kind = "custom"
+		name = ns.Name
+		namespace = ns.Namespace
+	} else if r.adapter.CustomTools[name] {
 		kind = "custom"
 	} else if r.adapter.ToolSearch && name == toolSearchProxyName {
 		kind = "tool_search"
@@ -808,6 +850,7 @@ func (r *ResponsesClientToolStreamRestorer) recordItem(event ResponsesStreamEven
 		call = &responsesClientToolStreamCall{
 			kind:         kind,
 			name:         name,
+			namespace:    namespace,
 			callID:       event.Item.CallID,
 			itemID:       event.Item.ID,
 			clientItemID: retypedResponsesToolCallItemID(event.Item.ID, responsesClientToolItemType(kind)),
@@ -846,13 +889,14 @@ func (r *ResponsesClientToolStreamRestorer) restoreNamespaceEvent(event Response
 		return event
 	}
 	if event.Item != nil && event.Item.Type == "function_call" {
-		if name, ok := r.adapter.NamespaceTools[event.Item.Name]; ok {
+		if flat, ok := resolveNamespaceToolCallName(event.Item.Name, r.adapter.NamespaceTools); ok {
+			name := r.adapter.NamespaceTools[flat]
 			event.Item.Name, event.Item.Namespace = name.Name, name.Namespace
 		}
 	}
 	if event.Type == "response.function_call_arguments.delta" || event.Type == "response.function_call_arguments.done" {
-		if name, ok := r.adapter.NamespaceTools[event.Name]; ok {
-			event.Name = name.Name
+		if flat, ok := resolveNamespaceToolCallName(event.Name, r.adapter.NamespaceTools); ok {
+			event.Name = r.adapter.NamespaceTools[flat].Name
 		}
 	}
 	return event
@@ -864,7 +908,14 @@ func restoreResponsesOutputClientTools(outputs []ResponsesOutput, adapter *Respo
 		if output.Type != "function_call" {
 			continue
 		}
-		if adapter.CustomTools[output.Name] {
+		if ns, ok := namespacedCustomToolCall(output.Name, adapter.FunctionTools, adapter.NamespaceTools); ok {
+			output.Type = "custom_tool_call"
+			output.Name = ns.Name
+			output.Namespace = ns.Namespace
+			output.ID = retypedResponsesToolCallItemID(output.ID, output.Type)
+			output.Input = extractCustomToolCallInput(output.Arguments)
+			output.Arguments = ""
+		} else if adapter.CustomTools[output.Name] {
 			output.Type = "custom_tool_call"
 			output.ID = retypedResponsesToolCallItemID(output.ID, output.Type)
 			output.Input = extractCustomToolCallInput(output.Arguments)

@@ -96,7 +96,7 @@ func TestLoadHTTPIngressSafetyDefaults(t *testing.T) {
 	require.Equal(t, 64*1024, cfg.Server.MaxHeaderBytes)
 	require.Empty(t, cfg.Server.TrustedProxies)
 	require.False(t, cfg.Server.TrustedProxiesConfigured)
-	require.True(t, cfg.TrustForwardedIPForAPIKeyACL())
+	require.False(t, cfg.TrustForwardedIPForAPIKeyACL())
 	require.Equal(t, int64(32*1024*1024), cfg.Gateway.TextMaxBodySize)
 	require.True(t, cfg.APIKeyAuth.InvalidAbuse.Enabled)
 	require.Equal(t, 120, cfg.APIKeyAuth.InvalidAbuse.Threshold)
@@ -502,6 +502,12 @@ func TestLoadDefaultOpenAIWSConfig(t *testing.T) {
 	}
 	if cfg.Gateway.OpenAIWS.HTTPBridgeThresholdBytes != 15*1024*1024 {
 		t.Fatalf("Gateway.OpenAIWS.HTTPBridgeThresholdBytes = %d, want %d", cfg.Gateway.OpenAIWS.HTTPBridgeThresholdBytes, 15*1024*1024)
+	}
+	if cfg.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds != 20 {
+		t.Fatalf("Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds = %d, want 20", cfg.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds)
+	}
+	if cfg.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds != 5 {
+		t.Fatalf("Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds = %d, want 5", cfg.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds)
 	}
 	if cfg.Gateway.OpenAIWS.RetryBackoffInitialMS != 120 {
 		t.Fatalf("Gateway.OpenAIWS.RetryBackoffInitialMS = %d, want 120", cfg.Gateway.OpenAIWS.RetryBackoffInitialMS)
@@ -1991,6 +1997,11 @@ func TestValidateConfigErrors(t *testing.T) {
 			wantErr: "gateway.max_line_size must be non-negative",
 		},
 		{
+			name:    "gateway max line size upper bound",
+			mutate:  func(c *Config) { c.Gateway.MaxLineSize = MaxMaxLineSize + 1 },
+			wantErr: "gateway.max_line_size must be at most",
+		},
+		{
 			name:    "gateway usage record worker count",
 			mutate:  func(c *Config) { c.Gateway.UsageRecord.WorkerCount = 0 },
 			wantErr: "gateway.usage_record.worker_count",
@@ -2203,6 +2214,37 @@ func TestValidateConfig_OpenAIWSRules(t *testing.T) {
 			name:    "max_ingress_connections_per_api_key 不能为负数",
 			mutate:  func(c *Config) { c.Gateway.OpenAIWS.MaxIngressConnectionsPerAPIKey = -1 },
 			wantErr: "gateway.openai_ws.max_ingress_connections_per_api_key",
+		},
+		{
+			name:    "passthrough downstream ping interval 不能为负数",
+			mutate:  func(c *Config) { c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds = -1 },
+			wantErr: "gateway.openai_ws.passthrough_downstream_ping_interval_seconds",
+		},
+		{
+			name:    "passthrough downstream ping interval must stay bounded",
+			mutate:  func(c *Config) { c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds = 4 },
+			wantErr: "0 or between 5-60",
+		},
+		{
+			name: "passthrough downstream ping timeout must be shorter than interval",
+			mutate: func(c *Config) {
+				c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds = 20
+				c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds = 20
+			},
+			wantErr: "must be less than passthrough_downstream_ping_interval_seconds",
+		},
+		{
+			name:    "passthrough downstream ping timeout 不能为负数",
+			mutate:  func(c *Config) { c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds = -1 },
+			wantErr: "gateway.openai_ws.passthrough_downstream_ping_timeout_seconds",
+		},
+		{
+			name: "passthrough downstream ping requires timeout",
+			mutate: func(c *Config) {
+				c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds = 20
+				c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds = 0
+			},
+			wantErr: "gateway.openai_ws.passthrough_downstream_ping_timeout_seconds must be positive",
 		},
 		{
 			name:    "min_idle_per_account 不能为负数",

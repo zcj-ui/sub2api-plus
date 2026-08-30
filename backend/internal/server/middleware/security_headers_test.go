@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -294,6 +295,51 @@ func TestSecurityHeaders(t *testing.T) {
 			nonces[nonce] = true
 		}
 	})
+}
+
+func TestFailClosedCSPPolicyRemovesExecutableNonceFallback(t *testing.T) {
+	policy := "default-src 'self'; script-src 'self' __CSP_NONCE__ 'unsafe-inline' https://cdn.example; script-src-elem 'self' __CSP_NONCE__ 'unsafe-inline'; script-src-attr 'unsafe-inline'; style-src 'unsafe-inline'"
+	got := failClosedCSPPolicy(policy)
+
+	assert.NotContains(t, got, NonceTemplate)
+	assert.NotContains(t, got, "script-src 'self' __CSP_NONCE__")
+	assert.NotContains(t, strings.ToLower(got), "script-src 'self' 'unsafe-inline'")
+	assert.Contains(t, got, "script-src 'self' https://cdn.example")
+	assert.Contains(t, got, "script-src-elem 'self'")
+	assert.Contains(t, got, "script-src-attr")
+	assert.NotContains(t, strings.ToLower(got), "script-src-elem 'self' 'unsafe-inline'")
+	assert.NotContains(t, strings.ToLower(got), "script-src-attr 'unsafe-inline'")
+	// Style inline support is unrelated to JavaScript execution and remains
+	// available for existing payment/captcha widgets.
+	assert.Contains(t, got, "style-src 'unsafe-inline'")
+}
+
+func TestSecurityHeadersNonceFailureFailsClosed(t *testing.T) {
+	cfg := config.CSPConfig{
+		Enabled: true,
+		Policy:  "default-src 'self'; script-src 'self' __CSP_NONCE__ 'unsafe-inline'",
+	}
+	middleware := securityHeadersWithNonceGenerator(cfg, nil, func() (string, error) {
+		return "", errors.New("entropy unavailable")
+	})
+
+	nextCalled := false
+	router := gin.New()
+	router.Use(middleware)
+	router.GET("/", func(c *gin.Context) {
+		nextCalled = true
+		c.String(http.StatusOK, "ok")
+	})
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	assert.True(t, nextCalled)
+	assert.Equal(t, http.StatusOK, w.Code)
+	csp := w.Header().Get("Content-Security-Policy")
+	assert.NotEmpty(t, csp)
+	assert.NotContains(t, csp, NonceTemplate)
+	assert.NotContains(t, strings.ToLower(csp), "'unsafe-inline'")
+	assert.Contains(t, csp, "script-src 'self'")
 }
 
 func TestCSPNonceKey(t *testing.T) {

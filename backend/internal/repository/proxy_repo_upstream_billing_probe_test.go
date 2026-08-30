@@ -26,18 +26,18 @@ func TestProxyUpdateInvalidatesBoundProbeSnapshotsAndEnqueuesOutboxAtomically(t 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "old.example", 8080, "user", "pass", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "fallback_mode", "expires_at", "backup_proxy_id", "expiry_warn_days"}).
+			AddRow("http", "old.example", 8080, "user", "pass", service.StatusActive, service.FallbackModeNone, nil, nil, 0))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectProxyUpdateReload(mock, 9, "new.example", "user", "pass")
-	mock.ExpectQuery(`(?s)UPDATE accounts.*- 'upstream_billing_probe'.*- 'ollama_cloud_usage_snapshot'.*type = 'apikey'.*extra \? 'upstream_billing_probe'.*platform IN \('openai', 'anthropic'\).*extra \? 'ollama_cloud_usage_snapshot'.*RETURNING id`).
+	mock.ExpectQuery(`(?s)UPDATE accounts.*WHERE proxy_id = \$1.*deleted_at IS NULL.*RETURNING id`).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)).AddRow(int64(18)))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)).AddRow(int64(18)).AddRow(int64(19)))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)")).
-		WithArgs(service.SchedulerOutboxEventAccountBulkChanged, nil, nil, accountIDsPayloadMatcher{want: []int64{17, 18}}).
+		WithArgs(service.SchedulerOutboxEventAccountBulkChanged, nil, nil, accountIDsPayloadMatcher{want: []int64{17, 18, 19}}).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -69,14 +69,14 @@ func TestProxyUpdateRollsBackWhenProbeInvalidationOutboxFails(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "old.example", 8080, "", "", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "fallback_mode", "expires_at", "backup_proxy_id", "expiry_warn_days"}).
+			AddRow("http", "old.example", 8080, "", "", service.StatusActive, service.FallbackModeNone, nil, nil, 0))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectProxyUpdateReload(mock, 9, "new.example", "", "")
-	mock.ExpectQuery(`(?s)UPDATE accounts.*- 'upstream_billing_probe'.*- 'ollama_cloud_usage_snapshot'.*type = 'apikey'.*extra \? 'upstream_billing_probe'.*platform IN \('openai', 'anthropic'\).*extra \? 'ollama_cloud_usage_snapshot'.*RETURNING id`).
+	mock.ExpectQuery(`(?s)UPDATE accounts.*WHERE proxy_id = \$1.*deleted_at IS NULL.*RETURNING id`).
 		WithArgs(int64(9)).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox (event_type, account_id, group_id, payload)")).
@@ -102,8 +102,8 @@ func TestProxyUpdateSkipsProbeInvalidationForNonIdentityChange(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)` + regexp.QuoteMeta("SELECT protocol, host, port") + `.*` + regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status"}).
-			AddRow("http", "same.example", 8080, "", "", service.StatusActive))
+		WillReturnRows(sqlmock.NewRows([]string{"protocol", "host", "port", "username", "password", "status", "fallback_mode", "expires_at", "backup_proxy_id", "expiry_warn_days"}).
+			AddRow("http", "same.example", 8080, "", "", service.StatusActive, service.FallbackModeNone, nil, nil, 0))
 	mock.ExpectExec(`(?s)UPDATE "proxies" SET`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE "proxies" SET "backup_proxy_id" = NULL WHERE "backup_proxy_id" = \$1`).
 		WithArgs(int64(9)).

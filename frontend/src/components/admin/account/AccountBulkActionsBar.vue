@@ -55,7 +55,7 @@
         <button @click="$emit('edit-selected')" class="btn btn-primary btn-sm">{{ t('admin.accounts.bulkActions.edit') }}</button>
       </template>
       <button @click="$emit('edit-filtered')" class="btn btn-primary btn-sm">
-        {{ t('admin.accounts.bulkEdit.submit') }}
+        {{ t('admin.accounts.bulkActions.editFiltered') }}
       </button>
     </div>
   </div>

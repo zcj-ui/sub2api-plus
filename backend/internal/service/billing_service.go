@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 )
 
@@ -229,6 +230,36 @@ func resolvedChannelTimeMultiplier(resolved *ResolvedPricing, at time.Time) floa
 // ErrModelPricingUnavailable indicates that none of the configured pricing
 // sources can price the requested model.
 var ErrModelPricingUnavailable = errors.New("pricing not found")
+
+// DeepSeek official off-peak rates (USD/token, effective 2026-08-23).
+// Peak windows are handled by deepseekPeakMultiplierAt below.
+const (
+	deepseekFlashOffPeakInputPrice  = 2.2e-7
+	deepseekFlashOffPeakOutputPrice = 6.6e-7
+	deepseekFlashOffPeakCacheRead   = 7e-9
+	deepseekProOffPeakInputPrice    = 6.6e-7
+	deepseekProOffPeakOutputPrice   = 1.98e-6
+	deepseekProOffPeakCacheRead     = 2.2e-8
+)
+
+func isDeepSeekModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek-")
+}
+
+// deepseekPeakMultiplierAt follows DeepSeek's official schedule: 01:00–04:00
+// and 06:00–10:00 UTC on weekdays are 2x; Beijing Saturday/Sunday is always
+// off-peak. The half-open intervals make boundary behavior deterministic.
+func deepseekPeakMultiplierAt(now time.Time) float64 {
+	beijing := now.In(time.FixedZone("Asia/Shanghai", 8*3600))
+	if beijing.Weekday() == time.Saturday || beijing.Weekday() == time.Sunday {
+		return 1
+	}
+	h := now.UTC().Hour()
+	if (h >= 1 && h < 4) || (h >= 6 && h < 10) {
+		return 2
+	}
+	return 1
+}
 
 // BillingService 计费服务
 type BillingService struct {
@@ -466,19 +497,25 @@ func (s *BillingService) initFallbackPricing() {
 	// 覆盖逻辑见同文件 getFallbackPricing()
 	// ============================================================
 
-	// ---- DeepSeek V4 系列 ----
+	// ---- DeepSeek 系列 ----
 	// Source: https://api-docs.deepseek.com/quick_start/pricing
-	// （deepseek-chat / deepseek-reasoner 为 deepseek-v4-flash 的兼容别名，2026/07/24 弃用）
+	// 官方低谷价；工作日高峰时段按 2x 计价（见 deepseekPeakMultiplierAt）。
 	s.fallbackPrices["deepseek-v4-pro"] = &ModelPricing{
-		InputPricePerToken:     4.35e-7,  // $0.435 per MTok (cache miss)
-		OutputPricePerToken:    8.7e-7,   // $0.87 per MTok
-		CacheReadPricePerToken: 3.625e-9, // $0.003625 per MTok (cache hit)
+		InputPricePerToken:     deepseekProOffPeakInputPrice,
+		OutputPricePerToken:    deepseekProOffPeakOutputPrice,
+		CacheReadPricePerToken: deepseekProOffPeakCacheRead,
 		SupportsCacheBreakdown: false,
 	}
 	s.fallbackPrices["deepseek-v4-flash"] = &ModelPricing{
-		InputPricePerToken:     1.4e-7, // $0.14 per MTok (cache miss)
-		OutputPricePerToken:    2.8e-7, // $0.28 per MTok
-		CacheReadPricePerToken: 2.8e-9, // $0.0028 per MTok (cache hit)
+		InputPricePerToken:     deepseekFlashOffPeakInputPrice,
+		OutputPricePerToken:    deepseekFlashOffPeakOutputPrice,
+		CacheReadPricePerToken: deepseekFlashOffPeakCacheRead,
+		SupportsCacheBreakdown: false,
+	}
+	s.fallbackPrices["deepseek-v4-flash-vision-exp"] = &ModelPricing{
+		InputPricePerToken:     deepseekFlashOffPeakInputPrice,
+		OutputPricePerToken:    deepseekFlashOffPeakOutputPrice,
+		CacheReadPricePerToken: deepseekFlashOffPeakCacheRead,
 		SupportsCacheBreakdown: false,
 	}
 
@@ -796,15 +833,19 @@ func (s *BillingService) getFallbackPricing(model string) *ModelPricing {
 		return s.fallbackPrices["gemini-3.6-flash"]
 	}
 
-	// DeepSeek V4 系列：仅匹配已知 V4 Pro/Flash 与官方兼容别名
-	// （deepseek-chat / deepseek-reasoner → V4 Flash），未知 deepseek-* 型号不回退，避免误计价。
+	// DeepSeek 系列：V4 Pro/Flash（含 vision-exp）按各自价卡；其余
+	// deepseek-*（包括兼容别名和未来未知型号）按 flash 价兜底，避免新模型
+	// 因价格表短暂落后而被按 $0 计费或直接中断。
+	if strings.Contains(modelLower, "deepseek-v4-flash-vision-exp") {
+		return s.fallbackPrices["deepseek-v4-flash-vision-exp"]
+	}
 	if strings.Contains(modelLower, "deepseek-v4-flash") {
 		return s.fallbackPrices["deepseek-v4-flash"]
 	}
 	if strings.Contains(modelLower, "deepseek-v4-pro") {
 		return s.fallbackPrices["deepseek-v4-pro"]
 	}
-	if strings.Contains(modelLower, "deepseek-chat") || strings.Contains(modelLower, "deepseek-reasoner") {
+	if strings.HasPrefix(modelLower, "deepseek-") {
 		return s.fallbackPrices["deepseek-v4-flash"]
 	}
 
@@ -1246,7 +1287,22 @@ func (s *BillingService) calculateTokenCost(resolved *ResolvedPricing, input Cos
 		return nil, fmt.Errorf("no pricing available for model: %s: %w", input.Model, ErrModelPricingUnavailable)
 	}
 
-	pricing = s.applyModelSpecificPricingPolicy(input.Model, pricing)
+	// Apply official DeepSeek pricing and other model policies only to the
+	// default price source. Group/channel custom prices remain authoritative.
+	pricing = s.applyModelSpecificPricingPolicyEx(input.Model, pricing, resolved.Source == PricingSourceLiteLLM)
+	if resolved.Source == PricingSourceLiteLLM && isDeepSeekModel(input.Model) {
+		pricingAt := input.PricingAt
+		if pricingAt.IsZero() {
+			pricingAt = timezone.Now()
+		}
+		if multiplier := deepseekPeakMultiplierAt(pricingAt); multiplier > 1 {
+			cloned := *pricing
+			cloned.InputPricePerToken *= multiplier
+			cloned.OutputPricePerToken *= multiplier
+			cloned.CacheReadPricePerToken *= multiplier
+			pricing = &cloned
+		}
+	}
 
 	// 官方长上下文阶梯仅在无区间定价时应用（区间定价已包含上下文分层）。
 	applyLongCtx := len(resolved.Intervals) == 0 && contextTierPricingEnabled
@@ -1490,8 +1546,25 @@ func (s *BillingService) calculateCostInternalWithPolicy(
 }
 
 func (s *BillingService) applyModelSpecificPricingPolicy(model string, pricing *ModelPricing) *ModelPricing {
+	return s.applyModelSpecificPricingPolicyEx(model, pricing, true)
+}
+
+func (s *BillingService) applyModelSpecificPricingPolicyEx(model string, pricing *ModelPricing, forceDeepSeekRates bool) *ModelPricing {
 	if pricing == nil {
 		return nil
+	}
+	if forceDeepSeekRates && isDeepSeekModel(model) {
+		cloned := *pricing
+		if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "deepseek-v4-pro") {
+			cloned.InputPricePerToken = deepseekProOffPeakInputPrice
+			cloned.OutputPricePerToken = deepseekProOffPeakOutputPrice
+			cloned.CacheReadPricePerToken = deepseekProOffPeakCacheRead
+		} else {
+			cloned.InputPricePerToken = deepseekFlashOffPeakInputPrice
+			cloned.OutputPricePerToken = deepseekFlashOffPeakOutputPrice
+			cloned.CacheReadPricePerToken = deepseekFlashOffPeakCacheRead
+		}
+		return &cloned
 	}
 	normalized := normalizeKnownOpenAICodexModel(model)
 	isGPT56 := isOpenAIGPT56Model(normalized)

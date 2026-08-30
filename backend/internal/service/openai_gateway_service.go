@@ -213,6 +213,20 @@ func (s *OpenAICodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	if s == nil {
 		return nil
 	}
+	validReset := func(value *int) *int {
+		if value == nil || *value < 0 || int64(*value) > maxCodexResetAfterSeconds {
+			return nil
+		}
+		copyValue := *value
+		return &copyValue
+	}
+	validWindow := func(value *int) *int {
+		if value == nil || *value <= 0 || int64(*value) > maxCodexWindowMinutes {
+			return nil
+		}
+		copyValue := *value
+		return &copyValue
+	}
 
 	result := &NormalizedCodexLimits{}
 
@@ -220,13 +234,17 @@ func (s *OpenAICodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	secondaryMins := 0
 	hasPrimaryWindow := false
 	hasSecondaryWindow := false
+	primaryWindow := validWindow(s.PrimaryWindowMinutes)
+	secondaryWindow := validWindow(s.SecondaryWindowMinutes)
+	primaryReset := validReset(s.PrimaryResetAfterSeconds)
+	secondaryReset := validReset(s.SecondaryResetAfterSeconds)
 
-	if s.PrimaryWindowMinutes != nil {
-		primaryMins = *s.PrimaryWindowMinutes
+	if primaryWindow != nil {
+		primaryMins = *primaryWindow
 		hasPrimaryWindow = true
 	}
-	if s.SecondaryWindowMinutes != nil {
-		secondaryMins = *s.SecondaryWindowMinutes
+	if secondaryWindow != nil {
+		secondaryMins = *secondaryWindow
 		hasSecondaryWindow = true
 	}
 
@@ -265,18 +283,18 @@ func (s *OpenAICodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	// Assign values
 	if use5hFromPrimary {
 		result.Used5hPercent = s.PrimaryUsedPercent
-		result.Reset5hSeconds = s.PrimaryResetAfterSeconds
-		result.Window5hMinutes = s.PrimaryWindowMinutes
+		result.Reset5hSeconds = primaryReset
+		result.Window5hMinutes = primaryWindow
 		result.Used7dPercent = s.SecondaryUsedPercent
-		result.Reset7dSeconds = s.SecondaryResetAfterSeconds
-		result.Window7dMinutes = s.SecondaryWindowMinutes
+		result.Reset7dSeconds = secondaryReset
+		result.Window7dMinutes = secondaryWindow
 	} else if use7dFromPrimary {
 		result.Used7dPercent = s.PrimaryUsedPercent
-		result.Reset7dSeconds = s.PrimaryResetAfterSeconds
-		result.Window7dMinutes = s.PrimaryWindowMinutes
+		result.Reset7dSeconds = primaryReset
+		result.Window7dMinutes = primaryWindow
 		result.Used5hPercent = s.SecondaryUsedPercent
-		result.Reset5hSeconds = s.SecondaryResetAfterSeconds
-		result.Window5hMinutes = s.SecondaryWindowMinutes
+		result.Reset5hSeconds = secondaryReset
+		result.Window5hMinutes = secondaryWindow
 	}
 
 	return result
@@ -316,8 +334,9 @@ type OpenAIForwardResult struct {
 	// UpstreamEndpoint is the actual upstream API path used for this request.
 	// It avoids guessing when one downstream protocol can use multiple upstream endpoints.
 	UpstreamEndpoint string
-	// ServiceTier 优先取上游实际响应回显的 tier；缺失时回退到最终出站 body 的
-	// tier。nil 表示两者都无识别 tier。
+	// ServiceTier is the final tier sent upstream after policy rewriting.
+	// UpstreamResponseServiceTier is kept separate and reconciled at usage time,
+	// where the selected credential protocol is available.
 	ServiceTier *string
 	// ReasoningEffort is extracted from request body (reasoning.effort) or derived from model suffix
 	// after group policy rewriting and model-family remapping.
@@ -444,15 +463,67 @@ type openAIWSRetryMetrics struct {
 }
 
 type accountWriteThrottle struct {
-	minInterval time.Duration
-	mu          sync.Mutex
-	lastByID    map[int64]time.Time
+	minInterval      time.Duration
+	mu               sync.Mutex
+	lastByID         map[int64]time.Time
+	criticalLastByID map[int64]time.Time
+}
+
+type accountWriteLockEntry struct {
+	orderMu sync.Mutex
+	writeMu sync.Mutex
+	refs    int
+}
+
+type accountWriteLockMap struct {
+	mu    sync.Mutex
+	locks map[int64]*accountWriteLockEntry
+}
+
+// LockIfAllowed serializes the throttle decision and the subsequent write for
+// one account. An older ordinary snapshot that already passed throttling cannot
+// overtake a newer threshold-crossing snapshot.
+func (m *accountWriteLockMap) LockIfAllowed(id int64, allow func() bool) (func(), bool) {
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[int64]*accountWriteLockEntry)
+	}
+	entry := m.locks[id]
+	if entry == nil {
+		entry = &accountWriteLockEntry{}
+		m.locks[id] = entry
+	}
+	entry.refs++
+	m.mu.Unlock()
+
+	entry.orderMu.Lock()
+	if allow != nil && !allow() {
+		entry.orderMu.Unlock()
+		m.release(id, entry)
+		return nil, false
+	}
+	entry.writeMu.Lock()
+	entry.orderMu.Unlock()
+	return func() {
+		entry.writeMu.Unlock()
+		m.release(id, entry)
+	}, true
+}
+
+func (m *accountWriteLockMap) release(id int64, entry *accountWriteLockEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 && m.locks[id] == entry {
+		delete(m.locks, id)
+	}
 }
 
 func newAccountWriteThrottle(minInterval time.Duration) *accountWriteThrottle {
 	return &accountWriteThrottle{
-		minInterval: minInterval,
-		lastByID:    make(map[int64]time.Time),
+		minInterval:      minInterval,
+		lastByID:         make(map[int64]time.Time),
+		criticalLastByID: make(map[int64]time.Time),
 	}
 }
 
@@ -468,17 +539,57 @@ func (t *accountWriteThrottle) Allow(id int64, now time.Time) bool {
 		return false
 	}
 	t.lastByID[id] = now
-
-	if len(t.lastByID) > 4096 {
-		cutoff := now.Add(-4 * t.minInterval)
-		for accountID, writtenAt := range t.lastByID {
-			if writtenAt.Before(cutoff) {
-				delete(t.lastByID, accountID)
-			}
-		}
-	}
+	t.pruneLocked(now)
 
 	return true
+}
+
+// AllowCritical bypasses a recent ordinary write once per interval while
+// still coalescing a burst of threshold-crossing responses.
+func (t *accountWriteThrottle) AllowCritical(id int64, now time.Time) bool {
+	if t == nil || id <= 0 || t.minInterval <= 0 {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if last, ok := t.criticalLastByID[id]; ok && now.Sub(last) < t.minInterval {
+		return false
+	}
+	t.criticalLastByID[id] = now
+	t.lastByID[id] = now
+	t.pruneLocked(now)
+	return true
+}
+
+func (t *accountWriteThrottle) CancelCritical(id int64, allowedAt time.Time) {
+	if t == nil || id <= 0 || t.minInterval <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if last, ok := t.criticalLastByID[id]; ok && last.Equal(allowedAt) {
+		delete(t.criticalLastByID, id)
+	}
+	if last, ok := t.lastByID[id]; ok && last.Equal(allowedAt) {
+		delete(t.lastByID, id)
+	}
+}
+
+func (t *accountWriteThrottle) pruneLocked(now time.Time) {
+	if len(t.lastByID) <= 4096 && len(t.criticalLastByID) <= 4096 {
+		return
+	}
+	cutoff := now.Add(-4 * t.minInterval)
+	for accountID, writtenAt := range t.lastByID {
+		if writtenAt.Before(cutoff) {
+			delete(t.lastByID, accountID)
+		}
+	}
+	for accountID, writtenAt := range t.criticalLastByID {
+		if writtenAt.Before(cutoff) {
+			delete(t.criticalLastByID, accountID)
+		}
+	}
 }
 
 var defaultOpenAICodexSnapshotPersistThrottle = newAccountWriteThrottle(openAICodexSnapshotPersistMinInterval)
@@ -489,12 +600,17 @@ var ErrNoAvailableCompactAccounts = errors.New("no available accounts support /r
 
 // OpenAIGatewayService handles OpenAI API gateway operations
 type OpenAIGatewayService struct {
-	accountRepo           AccountRepository
-	usageLogRepo          UsageLogRepository
-	usageBillingRepo      UsageBillingRepository
-	userRepo              UserRepository
-	userSubRepo           UserSubscriptionRepository
-	cache                 GatewayCache
+	accountRepo      AccountRepository
+	usageLogRepo     UsageLogRepository
+	usageBillingRepo UsageBillingRepository
+	userRepo         UserRepository
+	userSubRepo      UserSubscriptionRepository
+	cache            GatewayCache
+	// sessionLimitCache tracks active sticky sessions for accounts with an
+	// explicit max_sessions setting.  It is shared with the generic gateway so
+	// OpenAI API-key pools enforce the same cap without changing request wire
+	// formats.  The field is installed during server wiring before requests.
+	sessionLimitCache     SessionLimitCache
 	cfg                   *config.Config
 	codexDetector         CodexClientRestrictionDetector
 	schedulerSnapshot     *SchedulerSnapshotService
@@ -505,6 +621,10 @@ type OpenAIGatewayService struct {
 	userGroupRateResolver *userGroupRateResolver
 	httpUpstream          HTTPUpstream
 	pluginManager         *PluginManager
+	// tlsFPProfileService is injected by the gateway handler provider so the
+	// OpenAI forwarding hot path can honor account-level profiles before
+	// falling back to the built-in Codex OAuth profile.
+	tlsFPProfileService   *TLSFingerprintProfileService
 	deferredService       *DeferredService
 	openAITokenProvider   *OpenAITokenProvider
 	grokTokenProvider     *GrokTokenProvider
@@ -544,20 +664,26 @@ type OpenAIGatewayService struct {
 	// a successfully persisted/cleared cooldown on another instance from a
 	// failed persistence attempt that must continue to block locally.
 	openaiAccountRuntimeBlockObservedUpdatedAt sync.Map // key: int64(accountID), value: time.Time
-	openaiAccountRuntimeBlockLocks             sync.Map // key: int64(accountID), value: *sync.Mutex
-	openaiAccountRuntimeBlockGeneration        sync.Map // key: int64(accountID), value: uint64
-	openaiAccountRuntimeBlockSequence          atomic.Uint64
-	openaiOAuth429RetryStartedAt               sync.Map // key: int64(accountID), value: time.Time
-	grokCredentialMutationLocks                sync.Map // key: int64(accountID), value: *sync.Mutex
-	openaiOAuth429WindowStartUnixNano          atomic.Int64
-	openaiOAuth429WindowCount                  atomic.Int64
-	openaiOAuth429Streak                       sync.Map // key: int64(accountID), value: openAIOAuth429StreakState
-	openaiWSRetryMetrics                       openAIWSRetryMetrics
-	responseHeaderFilter                       *responseheaders.CompiledHeaderFilter
-	codexSnapshotThrottle                      *accountWriteThrottle
-	codexModelsManifestCache                   codexModelsManifestCache
-	openaiCompatSessionResponses               sync.Map
-	openaiCompatAnthropicDigestSessions        sync.Map
+	// openaiAccountRuntimeBlockInstalledAt records when the current local
+	// generation was installed.  Scheduler outbox reconciliation carries a
+	// lower-bound timestamp; a block installed after that event is newer and
+	// must survive the reconciliation even when its durable write is pending.
+	openaiAccountRuntimeBlockInstalledAt sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockLocks       sync.Map // key: int64(accountID), value: *sync.Mutex
+	openaiAccountRuntimeBlockGeneration  sync.Map // key: int64(accountID), value: uint64
+	openaiAccountRuntimeBlockSequence    atomic.Uint64
+	openaiOAuth429RetryStartedAt         sync.Map // key: int64(accountID), value: time.Time
+	grokCredentialMutationLocks          sync.Map // key: int64(accountID), value: *sync.Mutex
+	openaiOAuth429WindowStartUnixNano    atomic.Int64
+	openaiOAuth429WindowCount            atomic.Int64
+	openaiOAuth429Streak                 sync.Map // key: int64(accountID), value: openAIOAuth429StreakState
+	openaiWSRetryMetrics                 openAIWSRetryMetrics
+	responseHeaderFilter                 *responseheaders.CompiledHeaderFilter
+	codexSnapshotThrottle                *accountWriteThrottle
+	codexSnapshotWriteLocks              accountWriteLockMap
+	codexModelsManifestCache             codexModelsManifestCache
+	openaiCompatSessionResponses         sync.Map
+	openaiCompatAnthropicDigestSessions  sync.Map
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
 	// 记录最近一次向该会话下发 x-codex-turn-state 的铸造账号，供出站守卫
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
@@ -636,11 +762,28 @@ func NewOpenAIGatewayService(
 	if rateLimitService != nil {
 		rateLimitService.SetAccountRuntimeBlocker(svc)
 	}
+	if schedulerSnapshot != nil {
+		// SchedulerSnapshotService may already be running its outbox worker by
+		// the time this service is constructed.  Registering the observer here
+		// lets fresh cross-instance account snapshots retire stale process-local
+		// runtime blocks without introducing a second Redis invalidation channel.
+		schedulerSnapshot.SetAccountRuntimeBlockObserver(svc)
+	}
 	if openAITokenProvider != nil {
 		openAITokenProvider.SetAccountRuntimeBlocker(svc)
 	}
 	svc.logOpenAIWSModeBootstrap()
 	return svc
+}
+
+// SetSessionLimitCache wires the shared Redis-backed session tracker into the
+// OpenAI scheduler.  Keeping this as a small startup setter preserves source
+// compatibility for lightweight/unit constructors that do not provide Redis.
+func (s *OpenAIGatewayService) SetSessionLimitCache(cache SessionLimitCache) {
+	if s == nil {
+		return
+	}
+	s.sessionLimitCache = cache
 }
 
 // ResolveChannelMapping 解析渠道级模型映射（代理到 ChannelService）

@@ -109,6 +109,20 @@ func GetNonceFromContext(c *gin.Context) string {
 // getFrameSrcOrigins is an optional function that returns extra origins to inject into frame-src;
 // pass nil to disable dynamic frame-src injection.
 func SecurityHeaders(cfg config.CSPConfig, getFrameSrcOrigins func() []string) gin.HandlerFunc {
+	return securityHeadersWithNonceGenerator(cfg, getFrameSrcOrigins, GenerateNonce)
+}
+
+// securityHeadersWithNonceGenerator is split out so the nonce-failure path can
+// be exercised without replacing crypto/rand globally in tests.  Production
+// callers should use SecurityHeaders, which supplies GenerateNonce.
+func securityHeadersWithNonceGenerator(
+	cfg config.CSPConfig,
+	getFrameSrcOrigins func() []string,
+	generateNonce func() (string, error),
+) gin.HandlerFunc {
+	if generateNonce == nil {
+		generateNonce = GenerateNonce
+	}
 	policy := strings.TrimSpace(cfg.Policy)
 	if policy == "" {
 		policy = config.DefaultCSPPolicy
@@ -137,11 +151,17 @@ func SecurityHeaders(cfg config.CSPConfig, getFrameSrcOrigins func() []string) g
 
 		if cfg.Enabled {
 			// Generate nonce for this request
-			nonce, err := GenerateNonce()
+			nonce, err := generateNonce()
+			if err == nil && strings.TrimSpace(nonce) == "" {
+				err = fmt.Errorf("nonce generator returned an empty value")
+			}
 			if err != nil {
-				// crypto/rand 失败时降级为无 nonce 的 CSP 策略
-				log.Printf("[SecurityHeaders] %v — 降级为无 nonce 的 CSP", err)
-				c.Header("Content-Security-Policy", strings.ReplaceAll(finalPolicy, NonceTemplate, "'unsafe-inline'"))
+				// Never turn a nonce-generation failure into executable inline
+				// script policy.  Removing the nonce source (and any script-src
+				// unsafe-inline token supplied by a legacy policy) deliberately
+				// blocks the inline bootstrap until entropy is available again.
+				log.Printf("[SecurityHeaders] %v — 使用 fail-closed CSP", err)
+				c.Header("Content-Security-Policy", failClosedCSPPolicy(finalPolicy))
 			} else {
 				c.Set(CSPNonceKey, nonce)
 				c.Header("Content-Security-Policy", strings.ReplaceAll(finalPolicy, NonceTemplate, "'nonce-"+nonce+"'"))
@@ -149,6 +169,34 @@ func SecurityHeaders(cfg config.CSPConfig, getFrameSrcOrigins func() []string) g
 		}
 		c.Next()
 	}
+}
+
+// failClosedCSPPolicy removes the per-request nonce placeholder from the
+// script-src family and strips JavaScript's unsafe-inline fallback.  Style
+// directives are left untouched because many third-party payment/captcha
+// widgets require inline styles and they do not grant JavaScript execution.
+func failClosedCSPPolicy(policy string) string {
+	directives := strings.Split(policy, ";")
+	for i, raw := range directives {
+		fields := strings.Fields(raw)
+		if len(fields) == 0 {
+			continue
+		}
+		directive := strings.ToLower(fields[0])
+		if directive != "script-src" && directive != "script-src-elem" && directive != "script-src-attr" {
+			continue
+		}
+		filtered := make([]string, 0, len(fields))
+		filtered = append(filtered, fields[0])
+		for _, value := range fields[1:] {
+			if value == NonceTemplate || strings.EqualFold(value, "'unsafe-inline'") {
+				continue
+			}
+			filtered = append(filtered, value)
+		}
+		directives[i] = strings.Join(filtered, " ")
+	}
+	return strings.Join(directives, ";")
 }
 
 func isAPIRoutePath(c *gin.Context) bool {

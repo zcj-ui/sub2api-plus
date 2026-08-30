@@ -65,10 +65,20 @@ type ChannelMonitorQuotaFetcher struct {
 	// balanceThreshold cn_balance 余额告警阈值（与账号停调共用配置，见 monitorBalanceThreshold）。
 	balanceThreshold float64
 
-	mu     sync.Mutex
-	cache  map[int64]monitorQuotaCacheEntry
-	flight singleflight.Group
+	mu    sync.Mutex
+	cache map[int64]monitorQuotaCacheEntry
+	// cacheEpoch invalidates in-flight fetches' write-back after an account
+	// configuration change.  A global epoch is intentional: an unrelated
+	// invalidation may suppress one concurrent write, but it never serves stale
+	// data and the next Fetch repopulates the entry.
+	cacheEpoch uint64
+	flight     singleflight.Group
 }
+
+// monitorQuotaCacheMaxEntries bounds the process-local cache.  Monitors can
+// be deleted or reassigned over time; without a bound, every historical
+// account ID that was ever checked would remain resident until process exit.
+const monitorQuotaCacheMaxEntries = 4096
 
 type monitorQuotaCacheEntry struct {
 	snapshot *domain.MonitorQuotaSnapshot
@@ -120,6 +130,12 @@ func (f *ChannelMonitorQuotaFetcher) LoadAccount(ctx context.Context, id int64) 
 	if f == nil || f.accounts == nil {
 		return nil, fmt.Errorf("quota fetcher is not configured")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if id <= 0 {
+		return nil, fmt.Errorf("invalid account id")
+	}
 	return f.accounts.GetByID(ctx, id)
 }
 
@@ -130,8 +146,14 @@ func (f *ChannelMonitorQuotaFetcher) Fetch(ctx context.Context, accountID int64)
 		// fail-closed：fetcher 未注入（存量测试构造）时不 panic，降级为错误快照。
 		return quotaErrorSnapshot("usage", "quota fetcher is not configured", time.Now())
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	now := time.Now()
+	if accountID <= 0 {
+		return quotaErrorSnapshot("usage", "invalid account id", now)
+	}
 
 	if cached, ok := f.cachedSnapshot(accountID, now); ok {
 		return cached
@@ -170,6 +192,9 @@ func (f *ChannelMonitorQuotaFetcher) fetchShared(accountID int64) *domain.Monito
 	if cached, ok := f.cachedSnapshot(accountID, time.Now()); ok {
 		return cached
 	}
+	f.mu.Lock()
+	fetchEpoch := f.cacheEpoch
+	f.mu.Unlock()
 	fetchCtx, cancel := context.WithTimeout(context.Background(), monitorQuotaFetchTimeout)
 	defer cancel()
 	snapshot := f.fetchUncached(fetchCtx, accountID, time.Now())
@@ -178,7 +203,7 @@ func (f *ChannelMonitorQuotaFetcher) fetchShared(accountID int64) *domain.Monito
 	if !snapshot.Success {
 		ttl = monitorQuotaErrorCacheTTL
 	}
-	f.storeSnapshot(accountID, snapshot, time.Now().Add(ttl))
+	f.storeSnapshotIfEpoch(accountID, snapshot, time.Now().Add(ttl), fetchEpoch)
 	return snapshot
 }
 
@@ -186,7 +211,13 @@ func (f *ChannelMonitorQuotaFetcher) cachedSnapshot(accountID int64, now time.Ti
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	entry, ok := f.cache[accountID]
-	if !ok || now.After(entry.expiry) {
+	if !ok {
+		return nil, false
+	}
+	// Treat the exact expiry instant as expired as well.  Delete the tombstone
+	// while holding the same lock so stale entries do not accumulate forever.
+	if !now.Before(entry.expiry) {
+		delete(f.cache, accountID)
 		return nil, false
 	}
 	return entry.snapshot, true
@@ -195,12 +226,83 @@ func (f *ChannelMonitorQuotaFetcher) cachedSnapshot(accountID int64, now time.Ti
 func (f *ChannelMonitorQuotaFetcher) storeSnapshot(accountID int64, snapshot *domain.MonitorQuotaSnapshot, expiry time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.storeSnapshotLocked(accountID, snapshot, expiry)
+}
+
+func (f *ChannelMonitorQuotaFetcher) storeSnapshotLocked(accountID int64, snapshot *domain.MonitorQuotaSnapshot, expiry time.Time) {
+	if f.cache == nil {
+		f.cache = make(map[int64]monitorQuotaCacheEntry)
+	}
+	if len(f.cache) >= monitorQuotaCacheMaxEntries {
+		// Sweep expired entries first.  This is intentionally triggered only at
+		// the bound, avoiding a background ticker for a best-effort cache.
+		now := time.Now()
+		for id, entry := range f.cache {
+			if !now.Before(entry.expiry) {
+				delete(f.cache, id)
+			}
+		}
+		// If the map is still full, evict the entries with the nearest expiry in
+		// one pass.  Sorting the small overflow set avoids the O(n²) repeated
+		// full-map scan that a malformed/pre-populated cache could trigger.
+		excess := len(f.cache) - monitorQuotaCacheMaxEntries + 1
+		if excess > 0 {
+			type cacheCandidate struct {
+				id     int64
+				expiry time.Time
+			}
+			candidates := make([]cacheCandidate, 0, len(f.cache))
+			for id, entry := range f.cache {
+				candidates = append(candidates, cacheCandidate{id: id, expiry: entry.expiry})
+			}
+			sort.Slice(candidates, func(i, j int) bool {
+				if candidates[i].expiry.Equal(candidates[j].expiry) {
+					return candidates[i].id < candidates[j].id
+				}
+				return candidates[i].expiry.Before(candidates[j].expiry)
+			})
+			if excess > len(candidates) {
+				excess = len(candidates)
+			}
+			for _, candidate := range candidates[:excess] {
+				delete(f.cache, candidate.id)
+			}
+		}
+	}
 	f.cache[accountID] = monitorQuotaCacheEntry{snapshot: snapshot, expiry: expiry}
+}
+
+func (f *ChannelMonitorQuotaFetcher) storeSnapshotIfEpoch(accountID int64, snapshot *domain.MonitorQuotaSnapshot, expiry time.Time, epoch uint64) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cacheEpoch != epoch {
+		return
+	}
+	f.storeSnapshotLocked(accountID, snapshot, expiry)
+}
+
+// Invalidate drops a cached snapshot immediately.  Callers that change an
+// account's credentials, platform, proxy, or monitor association can use this
+// to avoid serving a result produced from the previous configuration.
+func (f *ChannelMonitorQuotaFetcher) Invalidate(accountID int64) {
+	if f == nil || accountID <= 0 {
+		return
+	}
+	f.mu.Lock()
+	delete(f.cache, accountID)
+	f.cacheEpoch++
+	f.mu.Unlock()
 }
 
 func (f *ChannelMonitorQuotaFetcher) fetchUncached(ctx context.Context, accountID int64, now time.Time) *domain.MonitorQuotaSnapshot {
 	if f == nil {
 		return quotaErrorSnapshot("usage", "quota fetcher is not configured", now)
+	}
+	if accountID <= 0 {
+		return quotaErrorSnapshot("usage", "invalid account id", now)
 	}
 
 	account, err := f.LoadAccount(ctx, accountID)
@@ -376,6 +478,9 @@ func (f *ChannelMonitorQuotaFetcher) fetchCNQuota(ctx context.Context, account *
 			FetchedAt:         now,
 		}
 	}
+	if result == nil {
+		return quotaErrorSnapshot("cn_quota", "cn quota service returned no data", now)
+	}
 	snapshot := &domain.MonitorQuotaSnapshot{
 		Source:    "cn_quota",
 		Success:   result.Success,
@@ -420,6 +525,9 @@ func (f *ChannelMonitorQuotaFetcher) fetchCNBalance(ctx context.Context, account
 			Error:             msg,
 			FetchedAt:         now,
 		}
+	}
+	if result == nil {
+		return quotaErrorSnapshot("cn_balance", "cn balance service returned no data", now)
 	}
 	snapshot := &domain.MonitorQuotaSnapshot{
 		Source:    "cn_balance",

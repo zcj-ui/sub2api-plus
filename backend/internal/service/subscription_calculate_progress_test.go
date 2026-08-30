@@ -115,6 +115,24 @@ func TestCalculateProgress_WeeklyUsage(t *testing.T) {
 	assert.Equal(t, 50.0, progress.Weekly.Percentage)
 }
 
+func TestCalculateProgress_WeeklyResetsAt_LegacyMidnightAnchor(t *testing.T) {
+	svc := newTestSubscriptionService()
+	startsAt := time.Date(2026, 7, 31, 13, 37, 6, 0, time.FixedZone("UTC+8", 8*3600))
+	weeklyStart := startOfDay(startsAt)
+	sub := &UserSubscription{
+		ID:                1,
+		StartsAt:          startsAt,
+		ExpiresAt:         startsAt.AddDate(0, 0, 30),
+		WeeklyUsageUSD:    2000.18,
+		WeeklyWindowStart: ptrTime(weeklyStart),
+	}
+	group := &Group{Name: "Pro", WeeklyLimitUSD: ptrFloat64(2000.0)}
+
+	progress := svc.calculateProgress(sub, group)
+	require.NotNil(t, progress.Weekly)
+	assert.True(t, startsAt.Add(7*24*time.Hour).Equal(progress.Weekly.ResetsAt))
+}
+
 func TestCalculateProgress_MonthlyUsage(t *testing.T) {
 	svc := newTestSubscriptionService()
 	now := time.Now()

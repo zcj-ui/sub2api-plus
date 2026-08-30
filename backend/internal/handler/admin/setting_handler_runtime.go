@@ -154,6 +154,61 @@ func (h *SettingHandler) UpdateRateLimit429CooldownSettings(c *gin.Context) {
 	})
 }
 
+// GetOpenAI403CooldownSettings 获取 OpenAI 403 临时冷却配置
+// GET /api/v1/admin/settings/openai-403-cooldown
+func (h *SettingHandler) GetOpenAI403CooldownSettings(c *gin.Context) {
+	settings, err := h.settingService.GetOpenAI403CooldownSettings(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, dto.OpenAI403CooldownSettings{
+		Enabled:          settings.Enabled,
+		CooldownMinutes:  settings.CooldownMinutes,
+		DisableThreshold: settings.DisableThreshold,
+		WindowMinutes:    settings.WindowMinutes,
+	})
+}
+
+// UpdateOpenAI403CooldownSettingsRequest 更新 OpenAI 403 临时冷却配置请求
+type UpdateOpenAI403CooldownSettingsRequest struct {
+	Enabled          bool `json:"enabled"`
+	CooldownMinutes  int  `json:"cooldown_minutes"`
+	DisableThreshold int  `json:"disable_threshold"`
+	WindowMinutes    int  `json:"window_minutes"`
+}
+
+// UpdateOpenAI403CooldownSettings 更新 OpenAI 403 临时冷却配置
+// PUT /api/v1/admin/settings/openai-403-cooldown
+func (h *SettingHandler) UpdateOpenAI403CooldownSettings(c *gin.Context) {
+	var req UpdateOpenAI403CooldownSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	settings := &service.OpenAI403CooldownSettings{
+		Enabled:          req.Enabled,
+		CooldownMinutes:  req.CooldownMinutes,
+		DisableThreshold: req.DisableThreshold,
+		WindowMinutes:    req.WindowMinutes,
+	}
+	if err := h.settingService.SetOpenAI403CooldownSettings(c.Request.Context(), settings); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	updated, err := h.settingService.GetOpenAI403CooldownSettings(c.Request.Context())
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, dto.OpenAI403CooldownSettings{
+		Enabled:          updated.Enabled,
+		CooldownMinutes:  updated.CooldownMinutes,
+		DisableThreshold: updated.DisableThreshold,
+		WindowMinutes:    updated.WindowMinutes,
+	})
+}
+
 // GetOpenAIImagesOAuthUnavailableCooldownSettings 获取 OpenAI OAuth 生图工具不可用冷却配置
 // GET /api/v1/admin/settings/openai-images-oauth-unavailable-cooldown
 func (h *SettingHandler) GetOpenAIImagesOAuthUnavailableCooldownSettings(c *gin.Context) {

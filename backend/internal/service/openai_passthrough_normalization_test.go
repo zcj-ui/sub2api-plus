@@ -37,8 +37,30 @@ func TestNormalizeOpenAIPassthroughOAuthBody_NormalizesCompatibilityFields(t *te
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.Equal(t, "hello", gjson.GetBytes(normalized, "input.0.content").String())
-	for _, field := range []string{"prompt", "commands", "truncation", "stop_sequences", "chat_template_kwargs"} {
+	for _, field := range []string{"prompt", "commands", "stop_sequences", "chat_template_kwargs"} {
 		require.False(t, gjson.GetBytes(normalized, field).Exists(), field)
+	}
+	require.Equal(t, "auto", gjson.GetBytes(normalized, "truncation").String())
+}
+
+func TestNormalizeOpenAIPassthroughOAuthBody_StripsOnlyDisabledTruncation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		value      string
+		wantExists bool
+	}{
+		{name: "disabled", value: "disabled", wantExists: false},
+		{name: "auto", value: "auto", wantExists: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt-5.4","input":"hello","truncation":"` + tc.value + `"}`)
+			normalized, _, err := normalizeOpenAIPassthroughOAuthBody(body, false)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantExists, gjson.GetBytes(normalized, "truncation").Exists())
+			if tc.wantExists {
+				require.Equal(t, tc.value, gjson.GetBytes(normalized, "truncation").String())
+			}
+		})
 	}
 }
 
@@ -69,14 +91,28 @@ func TestNormalizeOpenAIResponsesWebSocketCompatibilityBody_OnlyStripsOAuthField
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.Equal(t, "hello", gjson.GetBytes(oauthBody, "input").String())
-	for _, field := range []string{"prompt", "commands", "truncation", "stop_sequences", "chat_template_kwargs"} {
+	for _, field := range []string{"prompt", "commands", "stop_sequences", "chat_template_kwargs"} {
 		require.False(t, gjson.GetBytes(oauthBody, field).Exists(), field)
 	}
+	require.Equal(t, "auto", gjson.GetBytes(oauthBody, "truncation").String())
 
 	apiKeyBody, changed, err := normalizeOpenAIResponsesWebSocketCompatibilityBody(body, &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, false)
 	require.NoError(t, err)
 	require.False(t, changed)
 	require.JSONEq(t, string(body), string(apiKeyBody))
+}
+
+func TestNormalizeOpenAIResponsesWebSocketCompatibilityBody_LeavesTruncationForAPIKeyAndClaude(t *testing.T) {
+	body := []byte(`{"type":"response.create","model":"gpt-5.4","input":"hi","truncation":"auto"}`)
+	for _, account := range []*Account{
+		{Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
+		{Platform: PlatformAnthropic, Type: AccountTypeOAuth},
+	} {
+		normalized, changed, err := normalizeOpenAIResponsesWebSocketCompatibilityBody(body, account, false)
+		require.NoError(t, err)
+		require.False(t, changed)
+		require.JSONEq(t, string(body), string(normalized))
+	}
 }
 
 func TestNormalizeOpenAIResponsesWebSocketCompatibilityBody_SanitizesNativeItemIDs(t *testing.T) {

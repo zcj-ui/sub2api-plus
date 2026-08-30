@@ -31,7 +31,7 @@ func TestNormalizeOpenAIResponsesCompactRequest_RemoteV2StaysOnResponses(t *test
 		userAgent  string
 	}{
 		{name: "declared_header", betaHeader: "remote_compaction_v2"},
-		{name: "codex_desktop_user_agent", userAgent: "Codex Desktop/0.139.0 (Mac OS X 14; arm64) unknown"},
+		{name: "headerless_protocol_shape", userAgent: ""},
 	}
 
 	for _, tt := range tests {
@@ -252,7 +252,7 @@ func TestNormalizeOpenAIResponsesCompactRequest_CodexDirectAliasPromoted(t *test
 	require.Equal(t, "/backend-api/codex/responses/compact", c.Request.URL.Path)
 }
 
-func TestNormalizeOpenAIResponsesCompactRequest_NativeV2RequiresHeaderOrModernDesktop(t *testing.T) {
+func TestNormalizeOpenAIResponsesCompactRequest_NativeV2FollowsProtocolShape(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	tests := []struct {
 		name       string
@@ -262,18 +262,21 @@ func TestNormalizeOpenAIResponsesCompactRequest_NativeV2RequiresHeaderOrModernDe
 		wantNative bool
 	}{
 		{
-			name: "no_header",
-			body: []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
+			name:       "no_header",
+			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
+			wantNative: true,
 		},
 		{
 			name:       "unrelated_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "responses_websockets_v2",
+			wantNative: true,
 		},
 		{
 			name:       "wrong_case_header",
 			body:       []byte(`{"model":"gpt-5.5","stream":true,"input":[{"type":"compaction_trigger"}]}`),
 			betaHeader: "REMOTE_COMPACTION_V2",
+			wantNative: true,
 		},
 		{
 			name:       "headerless_modern_desktop",

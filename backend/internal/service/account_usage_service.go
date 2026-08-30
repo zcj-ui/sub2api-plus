@@ -146,12 +146,17 @@ type WindowStats struct {
 
 // UsageProgress 使用量进度
 type UsageProgress struct {
-	Utilization      float64      `json:"utilization"`            // 使用率百分比 (0-100+，100表示100%)
-	ResetsAt         *time.Time   `json:"resets_at"`              // 重置时间
-	RemainingSeconds int          `json:"remaining_seconds"`      // 距重置剩余秒数
-	WindowStats      *WindowStats `json:"window_stats,omitempty"` // 窗口期统计（从窗口开始到当前的使用量）
-	UsedRequests     int64        `json:"used_requests,omitempty"`
-	LimitRequests    int64        `json:"limit_requests,omitempty"`
+	Utilization      float64    `json:"utilization"`       // 使用率百分比 (0-100+，100表示100%)
+	ResetsAt         *time.Time `json:"resets_at"`         // 重置时间
+	RemainingSeconds int        `json:"remaining_seconds"` // 距重置剩余秒数
+	// WindowSeconds is the upstream-reported rolling window length when it is
+	// known. OpenAI free plans use a monthly (2592000s) primary window while
+	// paid Codex uses 5h/7d; exposing the length prevents the UI from labelling
+	// a monthly window as a misleading 7d bar.
+	WindowSeconds int64        `json:"window_seconds,omitempty"`
+	WindowStats   *WindowStats `json:"window_stats,omitempty"` // 窗口期统计（从窗口开始到当前的使用量）
+	UsedRequests  int64        `json:"used_requests,omitempty"`
+	LimitRequests int64        `json:"limit_requests,omitempty"`
 }
 
 // AntigravityModelQuota Antigravity 单个模型的配额信息
@@ -181,8 +186,12 @@ type AICredit struct {
 
 // UsageInfo 账号使用量信息
 type UsageInfo struct {
-	Source             string         `json:"source,omitempty"`               // "passive" or "active"
-	UpdatedAt          *time.Time     `json:"updated_at,omitempty"`           // 更新时间
+	Source    string     `json:"source,omitempty"`     // "passive" or "active"
+	UpdatedAt *time.Time `json:"updated_at,omitempty"` // 更新时间
+	// PlanType is the upstream ChatGPT/Codex subscription tier when the quota
+	// endpoint exposes it. It lets the UI distinguish free monthly windows from
+	// paid 5h/7d windows without changing the account credential manually.
+	PlanType           string         `json:"plan_type,omitempty"`
 	FiveHour           *UsageProgress `json:"five_hour"`                      // 5小时窗口
 	SevenDay           *UsageProgress `json:"seven_day,omitempty"`            // 7天窗口
 	SevenDaySonnet     *UsageProgress `json:"seven_day_sonnet,omitempty"`     // 7天Sonnet窗口
@@ -715,6 +724,12 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	if account == nil {
 		return usage, nil
 	}
+	usage.PlanType = strings.TrimSpace(account.GetCredential("plan_type"))
+	if usage.PlanType == "" {
+		if raw, ok := account.Extra[OpenAIQuotaPlanTypeExtraKey]; ok {
+			usage.PlanType = strings.TrimSpace(fmt.Sprint(raw))
+		}
+	}
 
 	applyExtraToUsage(usage, account.Extra, now)
 
@@ -746,13 +761,38 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 			}
 		} else if s.openAIQuotaService != nil {
 			if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
+				if quotaUsage != nil {
+					if planType := strings.TrimSpace(quotaUsage.PlanType); planType != "" {
+						usage.PlanType = planType
+					}
+				}
 				if cacheErr := s.openAIQuotaService.CacheUsageSnapshot(ctx, account.ID, quotaUsage); cacheErr == nil {
 					updates := buildOpenAIQuotaExtraUpdates(account, quotaUsage, now)
-					mergeAccountExtra(account, updates)
+					// CacheUsageSnapshot orders concurrent observations in the
+					// repository. Do not merge this request's candidate blindly into
+					// the caller's pre-query object: a delayed response may have lost
+					// that durable CAS to a newer snapshot. Reload the authoritative
+					// row when possible; otherwise apply a private copy only for the
+					// current response and leave the shared account untouched.
+					if s.accountRepo != nil {
+						if latest, reloadErr := s.accountRepo.GetByID(ctx, account.ID); reloadErr == nil && latest != nil {
+							account = latest
+							updates = nil
+						}
+					}
 					if usage.UpdatedAt == nil {
 						usage.UpdatedAt = &now
 					}
-					applyExtraToUsage(usage, account.Extra, now)
+					if len(updates) > 0 {
+						mergedAccount := &Account{Extra: make(map[string]any, len(account.Extra)+len(updates))}
+						for key, value := range account.Extra {
+							mergedAccount.Extra[key] = value
+						}
+						mergeAccountExtra(mergedAccount, updates)
+						applyExtraToUsage(usage, mergedAccount.Extra, now)
+					} else {
+						applyExtraToUsage(usage, account.Extra, now)
+					}
 					probeSucceeded = true
 				}
 			}
@@ -777,18 +817,16 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 		return usage, nil
 	}
 
-	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.FiveHour, 5*time.Hour, now)); err == nil {
-		if usage.FiveHour == nil {
-			usage.FiveHour = &UsageProgress{Utilization: 0}
+	if usage.FiveHour != nil {
+		if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.FiveHour, 5*time.Hour, now)); err == nil {
+			usage.FiveHour.WindowStats = windowStatsFromAccountStats(stats)
 		}
-		usage.FiveHour.WindowStats = windowStatsFromAccountStats(stats)
 	}
 
-	if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.SevenDay, 7*24*time.Hour, now)); err == nil {
-		if usage.SevenDay == nil {
-			usage.SevenDay = &UsageProgress{Utilization: 0}
+	if usage.SevenDay != nil {
+		if stats, err := s.usageLogRepo.GetAccountWindowStats(ctx, account.ID, codexWindowStatsStart(usage.SevenDay, 7*24*time.Hour, now)); err == nil {
+			usage.SevenDay.WindowStats = windowStatsFromAccountStats(stats)
 		}
-		usage.SevenDay.WindowStats = windowStatsFromAccountStats(stats)
 	}
 
 	return usage, nil
@@ -806,13 +844,35 @@ func shouldRefreshOpenAICodexSnapshot(account *Account, usage *UsageInfo, now ti
 	if usage == nil {
 		return true
 	}
-	if usage.FiveHour == nil || usage.SevenDay == nil {
+	if usage.SevenDay == nil {
+		return true
+	}
+	if usage.FiveHour == nil && !isOpenAIWeeklyOnlySnapshot(account.Extra) {
 		return true
 	}
 	if account.IsRateLimited() {
 		return true
 	}
 	return isOpenAICodexSnapshotStale(account, now)
+}
+
+// isOpenAIWeeklyOnlySnapshot recognizes a valid one-window response (Free/
+// workspace plans may expose only a weekly or monthly bucket).  The 5h
+// canonical fields are deliberately tombstoned by the quota builder; treating
+// that shape as incomplete would immediately probe /wham/usage again on every
+// account-list refresh.
+func isOpenAIWeeklyOnlySnapshot(extra map[string]any) bool {
+	if len(extra) == 0 {
+		return false
+	}
+	used5h, hasUsed5h := extra[OpenAIQuotaUsed5hPercentExtraKey]
+	reset5h, hasReset5h := extra[OpenAIQuotaReset5hSecondsExtraKey]
+	window5h, hasWindow5h := extra[OpenAIQuotaWindow5hMinutesExtraKey]
+	if (hasUsed5h && used5h != nil) || (hasReset5h && reset5h != nil) || (hasWindow5h && window5h != nil) {
+		return false
+	}
+	window7d := parseExtraInt(extra[OpenAIQuotaWindow7dMinutesExtraKey])
+	return window7d > 360
 }
 
 func isOpenAICodexSnapshotStale(account *Account, now time.Time) bool {
@@ -834,7 +894,10 @@ func isOpenAICodexSnapshotStale(account *Account, now time.Time) bool {
 	if err != nil {
 		return true
 	}
-	return now.Sub(ts) >= openAIProbeCacheTTL
+	// A future observation usually means a clock jump or an imported stale
+	// snapshot.  Treat it as stale instead of allowing it to suppress probes
+	// until local time catches up.
+	return ts.After(now) || now.Sub(ts) >= openAIProbeCacheTTL
 }
 
 func (s *AccountUsageService) shouldProbeOpenAICodexSnapshot(accountID int64, now time.Time, force ...bool) bool {
@@ -851,7 +914,7 @@ func (s *AccountUsageService) shouldProbeOpenAICodexSnapshot(accountID int64, no
 		if !loaded {
 			return true
 		}
-		if ts, ok := cached.(time.Time); ok && now.Sub(ts) < openAIProbeCacheTTL {
+		if ts, ok := cached.(time.Time); ok && !ts.After(now) && now.Sub(ts) < openAIProbeCacheTTL {
 			return false
 		}
 		if s.cache.openAIProbeCache.CompareAndSwap(accountID, cached, now) {
@@ -997,12 +1060,11 @@ func applyExtraToUsage(usage *UsageInfo, extra map[string]any, now time.Time) {
 	if usage == nil {
 		return
 	}
-	if progress := buildCodexUsageProgressFromExtra(extra, "5h", now); progress != nil {
-		usage.FiveHour = progress
-	}
-	if progress := buildCodexUsageProgressFromExtra(extra, "7d", now); progress != nil {
-		usage.SevenDay = progress
-	}
+	// Replace both slots, including with nil.  A quota refresh can explicitly
+	// tombstone a disappeared weekly/5h window; retaining the pre-query pointer
+	// would re-render stale usage and trigger another probe on every request.
+	usage.FiveHour = buildCodexUsageProgressFromExtra(extra, "5h", now)
+	usage.SevenDay = buildCodexUsageProgressFromExtra(extra, "7d", now)
 }
 
 func (s *AccountUsageService) getGeminiUsage(ctx context.Context, account *Account) (*UsageInfo, error) {
@@ -1283,7 +1345,7 @@ func grokBillingSnapshotNeedsRefresh(account *Account, now time.Time) bool {
 		stamp = strings.TrimSpace(billing.FetchedAt)
 	}
 	updatedAt, err := parseTime(stamp)
-	return err != nil || now.Sub(updatedAt) >= openAIProbeCacheTTL
+	return err != nil || updatedAt.After(now) || now.Sub(updatedAt) >= openAIProbeCacheTTL
 }
 
 func (s *AccountUsageService) shouldProbeGrokBilling(accountID int64, now time.Time, force bool) bool {
@@ -1291,7 +1353,7 @@ func (s *AccountUsageService) shouldProbeGrokBilling(accountID int64, now time.T
 		return true
 	}
 	if cached, ok := s.cache.grokProbeCache.Load(accountID); ok {
-		if ts, ok := cached.(time.Time); ok && now.Sub(ts) < grokProbeRetryTTL {
+		if ts, ok := cached.(time.Time); ok && !ts.After(now) && now.Sub(ts) < grokProbeRetryTTL {
 			return false
 		}
 	}
@@ -1549,11 +1611,16 @@ func buildCodexUsageProgressFromExtra(extra map[string]any, window string, now t
 	}
 
 	usedRaw, ok := extra[usedPercentKey]
-	if !ok {
+	if !ok || usedRaw == nil {
 		return nil
 	}
 
 	progress := &UsageProgress{Utilization: parseExtraFloat64(usedRaw)}
+	if windowMinutesRaw, ok := extra[windowMinutesKeyForCodexWindow(window)]; ok {
+		if windowMinutes := parseExtraInt(windowMinutesRaw); windowMinutes > 0 {
+			progress.WindowSeconds = int64(windowMinutes) * 60
+		}
+	}
 	if resetAtRaw, ok := extra[resetAtKey]; ok {
 		if resetAt, err := parseTime(fmt.Sprint(resetAtRaw)); err == nil {
 			progress.ResetsAt = &resetAt
@@ -1586,6 +1653,17 @@ func buildCodexUsageProgressFromExtra(extra map[string]any, window string, now t
 	}
 
 	return progress
+}
+
+func windowMinutesKeyForCodexWindow(window string) string {
+	switch window {
+	case "5h":
+		return "codex_5h_window_minutes"
+	case "7d":
+		return "codex_7d_window_minutes"
+	default:
+		return ""
+	}
 }
 
 func codexWindowStatsStart(progress *UsageProgress, fallbackWindow time.Duration, now time.Time) time.Time {

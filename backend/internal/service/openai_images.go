@@ -1346,7 +1346,11 @@ func normalizeOpenAIImageBase64(raw string) string {
 		}
 	}
 	raw = strings.TrimSpace(raw)
-	raw = strings.TrimRight(raw, "=") + strings.Repeat("=", (4-len(raw)%4)%4)
+	// Normalize padding after stripping any existing suffix.  Calculating the
+	// remainder from the padded input leaves valid values such as "aGk="
+	// unpadded after TrimRight, which then makes a second Decode fail.
+	raw = strings.TrimRight(raw, "=")
+	raw += strings.Repeat("=", (4-len(raw)%4)%4)
 	if raw == "" {
 		return ""
 	}
@@ -1494,11 +1498,19 @@ func fetchOpenAIImageDownloadURL(
 }
 
 func downloadOpenAIImageBytes(ctx context.Context, client *req.Client, headers http.Header, downloadURL string, errorBodyReadLimit int64) ([]byte, error) {
-	request := client.R().
+	validatedURL, err := validateOpenAIImageDownloadURL(downloadURL)
+	if err != nil {
+		return nil, err
+	}
+	safeClient, err := safeOpenAIImageClient(client)
+	if err != nil {
+		return nil, err
+	}
+	request := safeClient.R().
 		SetContext(ctx).
 		DisableAutoReadResponse()
 
-	if strings.HasPrefix(downloadURL, openAIChatGPTStartURL) {
+	if strings.HasPrefix(validatedURL, openAIChatGPTStartURL) {
 		downloadHeaders := cloneHTTPHeader(headers)
 		downloadHeaders.Set("Accept", "image/*,*/*;q=0.8")
 		downloadHeaders.Del("Content-Type")
@@ -1511,7 +1523,7 @@ func downloadOpenAIImageBytes(ctx context.Context, client *req.Client, headers h
 		request.SetHeader("User-Agent", userAgent)
 	}
 
-	resp, err := request.Get(downloadURL)
+	resp, err := request.Get(validatedURL)
 	if err != nil {
 		return nil, err
 	}

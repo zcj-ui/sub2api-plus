@@ -103,6 +103,11 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 	protocolOptions := openAIWSResponseCreateProtocolOptionsFromHeaders(inboundHeaders, turnState)
 	normalizeOpenAIWSResponseCreatePayload(payload, protocolOptions)
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey {
+		// Sanitize before optional prewarm/handshake work as well as at the final
+		// write below; both operations may serialize the request payload.
+		normalizeOpenAIPromptCacheFields(payload, account, strings.TrimSpace(openAIWSPayloadString(payload, "model")))
+	}
 	payloadEventType := openAIWSPayloadString(payload, "type")
 	if payloadEventType == "" {
 		payloadEventType = "response.create"
@@ -285,7 +290,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		var dialErr *openAIWSDialError
 		if errors.As(err, &dialErr) && dialErr != nil {
 			if dialStatus, rateLimited := openAIWSDialRateLimitStatus(err); rateLimited {
-				s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), dialStatus)
+				// Handshake 429 responses often carry no JSON body.  Pass the
+				// mapped model explicitly so Spark remains model-scoped.
+				s.persistOpenAIWSRateLimitSignalForModel(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(err.Error()), mappedModel, dialStatus)
 			}
 		}
 		// A confirmed 429 guard deliberately keeps a healthy old socket alive.
@@ -406,6 +413,13 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	// Match the CLI's per-send timing stamp. This follows optional prewarm so
 	// the business request never reuses the prewarm timestamp.
 	normalizeOpenAIWSResponseCreatePayload(payload, protocolOptions)
+	// Apply the final-model prompt-cache capability gate immediately before the
+	// frame leaves the process. OAuth/Codex and non-OpenAI accounts are excluded
+	// by the helper; API-key custom relays use the same explicit capability and
+	// model policy as the HTTP paths.
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey {
+		normalizeOpenAIPromptCacheFields(payload, account, strings.TrimSpace(openAIWSPayloadString(payload, "model")))
+	}
 	if err := lease.WriteJSONWithContextTimeout(ctx, payload, s.openAIWSWriteTimeout()); err != nil {
 		lease.MarkBroken()
 		logOpenAIWSModeInfo(
@@ -440,6 +454,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		mappedModelBytes = []byte(mappedModel)
 	}
 	bufferedStreamEvents := make([][]byte, 0, 4)
+	var bufferedStreamEventBytes int64
+	defer clearOpenAIWSBufferedStreamEvents(&bufferedStreamEvents, &bufferedStreamEventBytes)
 	eventCount := 0
 	tokenEventCount := 0
 	terminalEventCount := 0
@@ -472,7 +488,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	}
 
 	clientDisconnected := false
-	rateLimitSignalHandled := false
+	rateLimitSignalTracker := &openAIWSRateLimitSignalTracker{}
+	rateLimitSignalObserved := false
 	guardLeaseMayRetain := func() bool {
 		if !lease.openAI429GuardActiveAtAcquire {
 			return true
@@ -485,15 +502,24 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 	recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
 		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
-		if !isRateLimit || rateLimitSignalHandled {
-			return isRateLimit
+		isRateLimit, applySideEffect := rateLimitSignalTracker.observe(isRateLimit, explicit429)
+		if !isRateLimit {
+			return false
+		}
+		// The terminal helper's duplicate guard applies to OpenAI account
+		// confirmation only. Keep Grok-compatible relays on their historical
+		// terminal side-effect path.
+		if account != nil && account.Platform == PlatformOpenAI {
+			rateLimitSignalObserved = true
+		}
+		if !applySideEffect {
+			return true
 		}
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
-			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
+			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody, mappedModel)
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
+			s.persistOpenAIWSRateLimitSignalForModel(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, mappedModel, upstreamStatus)
 		}
-		rateLimitSignalHandled = true
 		if explicit429 && guardLeaseMayRetain() {
 			s.markOpenAI429GuardConnectionProof(account, lease)
 			if s.pinOpenAI429GuardConnection(account, lease.ConnID()) {
@@ -545,7 +571,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		for _, buffered := range bufferedStreamEvents {
 			emitStreamMessage(buffered, false)
 		}
-		bufferedStreamEvents = bufferedStreamEvents[:0]
+		clearOpenAIWSBufferedStreamEvents(&bufferedStreamEvents, &bufferedStreamEventBytes)
 		flushStreamWriter(true)
 		flushedBufferedEventCount += flushed
 		if debugEnabled {
@@ -907,9 +933,36 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			// 以便上游早期断连时仍可安全回退到 HTTP，不给下游发送半截流。
 			shouldBuffer := firstTokenMs == nil && !isTokenEvent && !isTerminalEvent
 			if shouldBuffer {
-				buffered := make([]byte, len(message))
-				copy(buffered, message)
-				bufferedStreamEvents = append(bufferedStreamEvents, buffered)
+				if err := appendOpenAIWSBufferedStreamEvent(
+					&bufferedStreamEvents,
+					&bufferedStreamEventBytes,
+					message,
+					openAIWSBufferedStreamEventsMaxBytes,
+					openAIWSBufferedStreamEventsMaxCount,
+				); err != nil {
+					// The queue exists only to keep pre-output frames private. Once it
+					// exceeds the bounded budget, evict this socket and let the
+					// request-scoped failover path select another account. Do not call
+					// account-health handlers: oversized/misbehaving preambles are not
+					// evidence that this credential is unhealthy.
+					headers := lease.HandshakeHeaders()
+					lease.MarkBroken()
+					logger.LegacyPrintf(
+						"service.openai_gateway",
+						"[OpenAI WS Mode] pre-output buffered event limit exceeded: account=%d max_bytes=%d max_events=%d error=%v",
+						account.ID,
+						openAIWSBufferedStreamEventsMaxBytes,
+						openAIWSBufferedStreamEventsMaxCount,
+						err,
+					)
+					return nil, newOpenAIPreOutputBufferFailoverError(
+						c,
+						account,
+						false,
+						strings.TrimSpace(headers.Get("x-request-id")),
+						headers,
+					)
+				}
 				bufferedEventCount++
 				if debugEnabled && shouldLogOpenAIWSBufferedEvent(bufferedEventCount) {
 					logOpenAIWSModeDebug(
@@ -936,7 +989,14 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			if !clientDisconnected {
 				markOpenAIWSClientVisibleFailure(c, eventType, message)
 			}
-			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailure(ctx, account, mappedModel, lease.HandshakeHeaders(), message)
+			upstreamTerminalEvent = s.handleOpenAIWSTerminalTransientFailureAfterRateLimitSignal(
+				ctx,
+				account,
+				mappedModel,
+				lease.HandshakeHeaders(),
+				message,
+				rateLimitSignalObserved,
+			)
 			// A terminal event must be the final JSON document in its WS message.
 			// Ignore any tail for the completed client turn, but never reuse the
 			// ambiguous upstream connection for another request.
@@ -1037,6 +1097,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 
 	return &OpenAIForwardResult{
 		RequestID:                     responseID,
+		ResponseID:                    responseID,
 		Usage:                         *usage,
 		Model:                         originalModel,
 		UpstreamModel:                 mappedModel,

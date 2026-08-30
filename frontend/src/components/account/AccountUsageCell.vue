@@ -119,10 +119,29 @@
 
     <!-- OpenAI OAuth accounts: single source from /usage API -->
     <template v-else-if="account.platform === 'openai' && account.type === 'oauth'">
-      <div v-if="hasOpenAIUsageFallback" class="space-y-1">
+      <!-- Free ChatGPT accounts expose a monthly primary window. Do not show
+           a stale paid 5h/7d pair from an earlier snapshot on that row. -->
+      <div v-if="isOpenAIFreePlan" class="space-y-1">
+        <UsageProgressBar
+          v-if="openAIFreeWindow"
+          :label="openAIWindowLabel(openAIFreeWindow, '30d')"
+          :utilization="openAIFreeWindow.utilization"
+          :resets-at="openAIFreeWindow.resets_at"
+          :window-stats="openAIFreeWindow.window_stats"
+          :show-now-when-idle="true"
+          color="indigo"
+        />
+        <div v-else class="text-xs text-gray-400">-</div>
+        <OpenAIQuotaResetCell
+          :account="account"
+          class="mt-1"
+          @account-updated="handleQuotaResetAccountUpdated"
+        />
+      </div>
+      <div v-else-if="hasOpenAIUsageFallback" class="space-y-1">
         <UsageProgressBar
           v-if="usageInfo?.five_hour"
-          label="5h"
+          :label="openAIWindowLabel(usageInfo.five_hour, '5h')"
           :utilization="usageInfo.five_hour.utilization"
           :resets-at="usageInfo.five_hour.resets_at"
           :window-stats="usageInfo.five_hour.window_stats"
@@ -131,7 +150,7 @@
         />
         <UsageProgressBar
           v-if="usageInfo?.seven_day"
-          label="7d"
+          :label="openAIWindowLabel(usageInfo.seven_day, '7d')"
           :utilization="usageInfo.seven_day.utilization"
           :resets-at="usageInfo.seven_day.resets_at"
           :window-stats="usageInfo.seven_day.window_stats"
@@ -658,6 +677,24 @@ import { cnQuotaCellVisible as cnQuotaCellVisibleFn, cnBalanceCellVisible as cnB
 // Module-level cache shared across all AccountUsageCell instances
 const _usageCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
 const USAGE_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+const USAGE_CACHE_MAX_ENTRIES = 4096
+
+// Account IDs are monotonic in normal deployments.  Lazy loading can therefore
+// leave historical rows in this module-level cache after an import/delete
+// cycle; prune only when the cache is touched so no background timer survives
+// a page and no active row is affected.
+const pruneUsageCache = (now = Date.now()) => {
+  for (const [accountId, entry] of _usageCache) {
+    if (now - entry.ts >= USAGE_CACHE_TTL) _usageCache.delete(accountId)
+  }
+  if (_usageCache.size <= USAGE_CACHE_MAX_ENTRIES) return
+  const entries = [..._usageCache.entries()].sort((a, b) => a[1].ts - b[1].ts)
+  const removeCount = _usageCache.size - USAGE_CACHE_MAX_ENTRIES
+  for (let index = 0; index < removeCount; index += 1) {
+    const accountId = entries[index]?.[0]
+    if (accountId !== undefined) _usageCache.delete(accountId)
+  }
+}
 // An active OpenAI usage probe already refreshes the account snapshot. Keep
 // the row-key watcher from immediately issuing a second /usage request when
 // that snapshot is emitted back to the parent list.
@@ -782,6 +819,42 @@ const hasOpenAIUsageFallback = computed(() => {
   if (props.account.platform !== 'openai' || props.account.type !== 'oauth') return false
   return !!usageInfo.value?.five_hour || !!usageInfo.value?.seven_day
 })
+
+const isOpenAIFreePlan = computed(() => {
+  if (props.account.platform !== 'openai' || props.account.type !== 'oauth') return false
+  const raw = usageInfo.value?.plan_type || props.account.credentials?.plan_type || props.account.extra?.codex_plan_type || ''
+  const plan = String(raw).trim().toLowerCase().replace(/[-\s]/g, '_')
+  if (plan === 'free' || plan === 'free_workspace' || plan === 'chatgpt_free') return true
+  return [usageInfo.value?.five_hour, usageInfo.value?.seven_day].some((window) =>
+    Number(window?.window_seconds) >= 25 * 24 * 60 * 60,
+  )
+})
+
+const openAIFreeWindow = computed(() => {
+  const candidates = [usageInfo.value?.five_hour, usageInfo.value?.seven_day].filter(Boolean) as NonNullable<AccountUsageInfo['five_hour']>[]
+  if (candidates.length === 0) return null
+  // Prefer the longest reported window (monthly free plans normally land in
+  // the canonical seven_day slot after normalization).
+  return candidates.reduce((current, candidate) => {
+    const currentSeconds = Number(current.window_seconds || 0)
+    const candidateSeconds = Number(candidate.window_seconds || 0)
+    return candidateSeconds > currentSeconds ? candidate : current
+  })
+})
+
+// OpenAI free/workspace plans may expose a monthly or daily primary window.
+// The backend carries the upstream window length so the canonical five_hour /
+// seven_day slots can still render an honest label instead of hard-coding 5h/7d.
+const openAIWindowLabel = (progress: AccountUsageInfo['five_hour'], fallback: string) => {
+  const seconds = Number(progress?.window_seconds)
+  if (!Number.isFinite(seconds) || seconds <= 0) return fallback
+  if (seconds >= 25 * 24 * 60 * 60) return '30d'
+  if (seconds >= 6 * 24 * 60 * 60) return '7d'
+  if (seconds >= 20 * 60 * 60) return '1d'
+  if (seconds >= 4 * 60 * 60) return '5h'
+  const hours = Math.max(1, Math.round(seconds / 3600))
+  return `${hours}h`
+}
 
 const openAIUsageRefreshKey = computed(() => buildOpenAIUsageRefreshKey(props.account))
 
@@ -1367,6 +1440,7 @@ const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?
 
   // Check cache
   if (!options?.bypassCache) {
+    pruneUsageCache()
     const cached = _usageCache.get(props.account.id)
     if (cached && Date.now() - cached.ts < USAGE_CACHE_TTL) {
       usageInfo.value = cached.data
@@ -1386,6 +1460,7 @@ const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?
     if (!unmounted.value) {
       usageInfo.value = result
       _usageCache.set(props.account.id, { data: result, ts: Date.now() })
+      pruneUsageCache()
     }
   } catch (e: any) {
     if (!unmounted.value) {

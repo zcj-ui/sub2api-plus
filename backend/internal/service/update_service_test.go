@@ -244,6 +244,28 @@ func TestUpdateServiceAssetAndTransportFailuresAreStructured(t *testing.T) {
 	require.NotContains(t, infraerrors.Message(err), "proxy-password")
 }
 
+func TestUpdateServiceRejectsReleaseWithoutChecksumAsset(t *testing.T) {
+	// The GitHub client stub panics if DownloadFile is reached.  Rejection must
+	// happen while inspecting release metadata, before any executable bytes are
+	// written to disk.
+	svc := forceLinuxBinaryUpdateRuntime(NewUpdateService(
+		&updateServiceCacheStub{},
+		&updateServiceGitHubClientStub{},
+		"0.1.132",
+		"release",
+		"example/sub2api",
+	))
+
+	err := svc.applyReleaseAssets(context.Background(), []Asset{{
+		Name:        "sub2api_linux_amd64.tar.gz",
+		DownloadURL: "https://github.com/example/sub2api/releases/download/v0.1.133/sub2api_linux_amd64.tar.gz",
+	}})
+
+	require.ErrorIs(t, err, ErrUpdateChecksumVerificationFailed)
+	require.Equal(t, "UPDATE_CHECKSUM_VERIFICATION_FAILED", infraerrors.Reason(err))
+	require.NotContains(t, infraerrors.Message(err), "example/sub2api")
+}
+
 func TestUpdateServiceChecksumAndArchiveFailuresAreStructured(t *testing.T) {
 	dir := t.TempDir()
 	assetPath := filepath.Join(dir, "sub2api_linux_amd64.tar.gz")

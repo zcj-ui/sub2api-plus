@@ -65,6 +65,18 @@ const DefaultUpstreamResponseReadMaxBytes int64 = 128 * 1024 * 1024
 // 可通过 gateway.models_list_read_max_bytes 配置项覆盖。
 const DefaultModelsListReadMaxBytes int64 = 8 * 1024 * 1024
 
+// DefaultMaxLineSize bounds one upstream SSE line when gateway.max_line_size
+// is omitted.  SSE events are streamed incrementally; permitting hundreds of
+// megabytes for a single unterminated line lets a peer force bufio.Scanner to
+// allocate an equivalent buffer per concurrent request.
+const DefaultMaxLineSize = 16 * 1024 * 1024
+
+// MaxMaxLineSize is the hard upper bound accepted for gateway.max_line_size.
+// Keep a larger, explicit opt-in ceiling for deployments that receive unusually
+// large single SSE events (for example inline image payloads), while ensuring a
+// malformed or accidental value can never request the historical 500MB buffer.
+const MaxMaxLineSize = 64 * 1024 * 1024
+
 type Config struct {
 	Server                  ServerConfig                  `mapstructure:"server"`
 	Log                     LogConfig                     `mapstructure:"log"`
@@ -727,7 +739,8 @@ type SecurityConfig struct {
 	ProxyFallback   ProxyFallbackConfig  `mapstructure:"proxy_fallback"`
 	ProxyProbe      ProxyProbeConfig     `mapstructure:"proxy_probe"`
 	// TrustForwardedIPForAPIKeyACL enables legacy raw forwarded-header takeover.
-	// When disabled, server.trusted_proxies is authoritative for all client-IP consumers.
+	// It defaults to false for fresh installations; when disabled,
+	// server.trusted_proxies is authoritative for all client-IP consumers.
 	TrustForwardedIPForAPIKeyACL  bool                                       `mapstructure:"trust_forwarded_ip_for_api_key_acl"`
 	ForwardedClientIPHeaders      []string                                   `mapstructure:"forwarded_client_ip_headers" json:"forwarded_client_ip_headers" yaml:"forwarded_client_ip_headers"`
 	forwardedClientIPSettingsLive *atomic.Pointer[ForwardedClientIPSettings] `mapstructure:"-" json:"-" yaml:"-"`
@@ -1258,6 +1271,11 @@ type GatewayOpenAIWSConfig struct {
 	HTTPBridgeEnabled bool `mapstructure:"http_bridge_enabled"`
 	// HTTPBridgeThresholdBytes: 触发 HTTP bridge 的入站 WS payload 阈值。
 	HTTPBridgeThresholdBytes int64 `mapstructure:"http_bridge_threshold_bytes"`
+	// PassthroughDownstreamPingIntervalSeconds controls client-facing WS
+	// keepalive in passthrough mode. Zero disables it.
+	PassthroughDownstreamPingIntervalSeconds int `mapstructure:"passthrough_downstream_ping_interval_seconds"`
+	// PassthroughDownstreamPingTimeoutSeconds bounds the Pong wait.
+	PassthroughDownstreamPingTimeoutSeconds int `mapstructure:"passthrough_downstream_ping_timeout_seconds"`
 
 	// Feature 开关：v2 优先于 v1
 	ResponsesWebsockets   bool `mapstructure:"responses_websockets"`
@@ -2051,7 +2069,11 @@ func setDefaults() {
 	viper.SetDefault("security.csp.enabled", true)
 	viper.SetDefault("security.csp.policy", DefaultCSPPolicy)
 	viper.SetDefault("security.proxy_probe.insecure_skip_verify", false)
-	viper.SetDefault("security.trust_forwarded_ip_for_api_key_acl", true)
+	// Raw forwarding headers are attacker-controlled unless every ingress hop
+	// overwrites them. New installations therefore default to Gin's explicit
+	// server.trusted_proxies chain. Existing databases retain their persisted
+	// choice through the one-time compatibility migration in the setting service.
+	viper.SetDefault("security.trust_forwarded_ip_for_api_key_acl", false)
 
 	// Security - disable direct fallback on proxy error
 	viper.SetDefault("security.proxy_fallback.allow_direct_on_error", false)
@@ -2380,6 +2402,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.openai_ws.client_read_limit_bytes", 64*1024*1024)
 	viper.SetDefault("gateway.openai_ws.http_bridge_enabled", true)
 	viper.SetDefault("gateway.openai_ws.http_bridge_threshold_bytes", 15*1024*1024)
+	viper.SetDefault("gateway.openai_ws.passthrough_downstream_ping_interval_seconds", 20)
+	viper.SetDefault("gateway.openai_ws.passthrough_downstream_ping_timeout_seconds", 5)
 	viper.SetDefault("gateway.openai_ws.responses_websockets", false)
 	viper.SetDefault("gateway.openai_ws.responses_websockets_v2", true)
 	viper.SetDefault("gateway.openai_ws.max_conns_per_account", 128)
@@ -2469,7 +2493,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.image_stream_data_interval_timeout", 900)
 	viper.SetDefault("gateway.image_stream_keepalive_interval", 10)
 	viper.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
-	viper.SetDefault("gateway.max_line_size", 500*1024*1024)
+	viper.SetDefault("gateway.max_line_size", DefaultMaxLineSize)
 	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
 	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
 	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
@@ -3434,6 +3458,21 @@ func (c *Config) Validate() error {
 	if c.Gateway.OpenAIWS.HTTPBridgeEnabled && c.Gateway.OpenAIWS.HTTPBridgeThresholdBytes == 0 {
 		return fmt.Errorf("gateway.openai_ws.http_bridge_threshold_bytes must be positive when http_bridge_enabled is true")
 	}
+	if c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds != 0 &&
+		(c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds < 5 ||
+			c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds > 60) {
+		return fmt.Errorf("gateway.openai_ws.passthrough_downstream_ping_interval_seconds must be 0 or between 5-60 seconds")
+	}
+	if c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds < 0 {
+		return fmt.Errorf("gateway.openai_ws.passthrough_downstream_ping_timeout_seconds must be non-negative")
+	}
+	if c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds > 0 && c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds <= 0 {
+		return fmt.Errorf("gateway.openai_ws.passthrough_downstream_ping_timeout_seconds must be positive when downstream ping is enabled")
+	}
+	if c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds > 0 &&
+		c.Gateway.OpenAIWS.PassthroughDownstreamPingTimeoutSeconds >= c.Gateway.OpenAIWS.PassthroughDownstreamPingIntervalSeconds {
+		return fmt.Errorf("gateway.openai_ws.passthrough_downstream_ping_timeout_seconds must be less than passthrough_downstream_ping_interval_seconds")
+	}
 	if c.Gateway.OpenAIWS.FallbackCooldownSeconds < 0 {
 		return fmt.Errorf("gateway.openai_ws.fallback_cooldown_seconds must be non-negative")
 	}
@@ -3533,6 +3572,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.MaxLineSize != 0 && c.Gateway.MaxLineSize < 1024*1024 {
 		return fmt.Errorf("gateway.max_line_size must be at least 1MB")
+	}
+	if c.Gateway.MaxLineSize > MaxMaxLineSize {
+		return fmt.Errorf("gateway.max_line_size must be at most %dMB", MaxMaxLineSize/(1024*1024))
 	}
 	if c.Gateway.UsageRecord.WorkerCount <= 0 {
 		return fmt.Errorf("gateway.usage_record.worker_count must be positive")

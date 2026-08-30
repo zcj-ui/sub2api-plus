@@ -60,6 +60,9 @@ func TestTempUnscheduleRetryableErrorSkipsRequestScopedTransient(t *testing.T) {
 
 		require.Equal(t, 1, repo.tempUnschedCalls)
 	})
+
+	requestScoped := &UpstreamFailoverError{RequestScopedTransient: true, Scope: GatewayFailureScopeRequest}
+	require.False(t, requestScoped.ShouldReportAccountScheduleFailure(), "request-scoped guards must not poison account health")
 }
 
 // 非池模式账号同样要先在同账号重试：换号不改变降载因素。

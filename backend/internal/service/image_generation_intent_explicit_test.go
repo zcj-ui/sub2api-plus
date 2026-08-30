@@ -35,6 +35,49 @@ func TestIsExplicitImageGenerationIntent_DetectsNativeTool(t *testing.T) {
 		"native image_generation tool IS explicit intent")
 }
 
+func TestIsExplicitImageGenerationIntent_DetectsNativeToolInResponsesLiteAdditionalTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"additional_tools","tools":[{"type":"image_generation","model":"gpt-image-2"}]},
+			{"type":"message","role":"user","content":"draw a cat"}
+		]
+	}`)
+	assert.True(t, IsExplicitImageGenerationIntent("/v1/responses", "gpt-5.5", body),
+		"native image_generation in input.additional_tools IS explicit intent")
+}
+
+func TestIsExplicitImageGenerationIntent_IgnoresPassiveNamespaceInResponsesLiteAdditionalTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"additional_tools","tools":[{"type":"namespace","name":"image_gen"}]},
+			{"type":"message","role":"user","content":"write code"}
+		]
+	}`)
+	assert.False(t, IsExplicitImageGenerationIntent("/v1/responses", "gpt-5.5", body),
+		"passive image_gen namespace in input.additional_tools must remain non-explicit")
+}
+
+func TestIsExplicitImageGenerationIntentMapMatchesLiteNativeDetection(t *testing.T) {
+	body := map[string]any{
+		"model": "gpt-5.5",
+		"input": []any{
+			map[string]any{
+				"type":  "additional_tools",
+				"tools": []any{map[string]any{"type": "image_generation"}},
+			},
+		},
+	}
+	assert.True(t, IsExplicitImageGenerationIntentMap("/v1/responses", "gpt-5.5", body))
+
+	body["input"] = []any{map[string]any{
+		"type":  "additional_tools",
+		"tools": []any{map[string]any{"type": "namespace", "name": "image_gen"}},
+	}}
+	assert.False(t, IsExplicitImageGenerationIntentMap("/v1/responses", "gpt-5.5", body))
+}
+
 func TestIsExplicitImageGenerationIntent_DetectsImageModel(t *testing.T) {
 	assert.True(t, IsExplicitImageGenerationIntent("/v1/responses", "gpt-image-2", nil),
 		"image model IS explicit intent")

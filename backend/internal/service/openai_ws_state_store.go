@@ -161,7 +161,10 @@ func (s *defaultOpenAIWSStateStore) BindHTTPResponseOwner(ctx context.Context, g
 	if s.cache == nil {
 		return nil
 	}
-	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	// Ownership is needed for a later HTTP continuation even when the client
+	// disconnects immediately after the response.  Keep the durable write alive
+	// on a short detached context, matching BindResponseAccount's semantics.
+	cacheCtx, cancel := withOpenAIWSStateStoreRedisWriteTimeout(ctx)
 	defer cancel()
 	if err := s.cache.SetSessionAccountID(cacheCtx, groupID, openAIHTTPResponseOwnerCacheKey(openAIHTTPResponseOwnerUserPrefix, id), userID, ttl); err != nil {
 		return err

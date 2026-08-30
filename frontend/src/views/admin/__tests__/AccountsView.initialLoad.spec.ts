@@ -140,7 +140,7 @@ describe('admin AccountsView initial page load', () => {
     expect(listAccounts).toHaveBeenCalled()
     // 精简响应只含 id/name/platform/type/健康快照，会让状态、额度、指纹等列渲染损坏；
     // 首屏必须走完整列表（lite 仅保留给全选元数据这类只读 ID 的场景）。
-    const pageLoadCalls = listAccounts.mock.calls.filter(([p, size]) => size !== 1000)
+    const pageLoadCalls = listAccounts.mock.calls.filter(([_page, size]) => size !== 1000)
     expect(pageLoadCalls.length).toBeGreaterThan(0)
     for (const call of pageLoadCalls) {
       const requestParams = (call[2] ?? {}) as Record<string, unknown>

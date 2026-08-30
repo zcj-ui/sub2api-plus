@@ -135,8 +135,13 @@ func buildCompatCompactResponse(resp *apicompat.ChatCompletionsResponse, model s
 		return nil, fmt.Errorf("compact response carries no summary text")
 	}
 
+	// Chat Completions IDs (`chatcmpl_*`) are not valid Responses
+	// `previous_response_id` values.  Always expose a gateway-owned resp_* ID
+	// for this compatibility bridge; retaining the upstream opaque ID would
+	// make the next compact turn fail the Responses validator and could not be
+	// bound reliably across accounts.
 	id := strings.TrimSpace(resp.ID)
-	if id == "" {
+	if !strings.HasPrefix(id, "resp_") {
 		id = "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
 	out := &apicompat.ResponsesResponse{

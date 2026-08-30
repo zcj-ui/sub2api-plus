@@ -27,7 +27,24 @@ var (
 	openAIResponsesCacheModelRejectionPattern     = regexp.MustCompile(`(?i)["']?(prompt_cache_breakpoint|input\[\d+\]\.prompt_cache_breakpoint)["']?\s+is\s+not\s+supported\s+on\s+this\s+model\b`)
 	openAIResponsesToolParametersParamPattern     = regexp.MustCompile(`(?i)^(?:tools|input)\[\d+\](?:\.tools\[\d+\])*(?:\.function)?\.parameters$`)
 	openAIResponsesMissingSchemaTypePattern       = regexp.MustCompile(`(?i)\bgot\s+["']?type\s*:\s*["']?none["']?`)
+	// ChatGPT internal uses invalid_parameter together with a model-capability
+	// message for optional fields that the public Responses API accepts.  Keep
+	// this parser separate from the generic unknown-parameter matcher so a
+	// value-validation error cannot silently turn into a retry.
+	openAIResponsesOptionalUnsupportedMessagePattern = regexp.MustCompile(`(?i)(?:is\s+not\s+supported|unsupported\s+parameter|unknown\s+parameter)`)
 )
+
+// Only fields whose removal is equivalent to the client omitting an optional
+// request hint are eligible for this compatibility retry.  Semantic fields
+// (model/input/instructions/tools/reasoning) are intentionally absent.
+var openAIResponsesChatGPTOptionalRejectedParams = map[string]struct{}{
+	"prompt_cache_retention": {},
+	"prompt_cache_options":   {},
+	"safety_identifier":      {},
+	"stream_options":         {},
+	"metadata":               {},
+	"user":                   {},
+}
 
 type openAIResponsesRejectedFieldRetryState struct {
 	mu             sync.Mutex
@@ -201,6 +218,45 @@ func normalizeOpenAIResponsesRejectedFieldRetryBody(statusCode int, body, respon
 		return removeOpenAIResponsesRejectedReasoningContentAtIndex(body, index)
 	}
 	return nil, "", false, nil
+}
+
+// normalizeOpenAIChatGPTOptionalRejectedFieldRetryBody handles the narrow
+// ChatGPT-internal 400 form used for optional Responses hints.  The caller
+// must gate this helper to an OAuth request whose final endpoint is
+// chatgpt.com; keeping the account check at the call site prevents API-key
+// requests to third-party compatible hosts from being rewritten.
+func normalizeOpenAIChatGPTOptionalRejectedFieldRetryBody(statusCode int, body, responseBody []byte) ([]byte, string, bool, error) {
+	if statusCode != http.StatusBadRequest || len(body) == 0 || len(responseBody) == 0 || !gjson.ValidBytes(responseBody) {
+		return nil, "", false, nil
+	}
+	code := strings.ToLower(strings.TrimSpace(extractUpstreamErrorCode(responseBody)))
+	if code != "invalid_parameter" && code != "unknown_parameter" && code != "unsupported_parameter" {
+		return nil, "", false, nil
+	}
+	message := strings.TrimSpace(extractUpstreamErrorMessage(responseBody))
+	if !openAIResponsesOptionalUnsupportedMessagePattern.MatchString(message) {
+		return nil, "", false, nil
+	}
+	param := strings.ToLower(strings.TrimSpace(gjson.GetBytes(responseBody, "error.param").String()))
+	if param == "" {
+		param = strings.ToLower(strings.TrimSpace(gjson.GetBytes(responseBody, "response.error.param").String()))
+	}
+	if param == "" {
+		return nil, "", false, nil
+	}
+	topLevel := param
+	if dot := strings.IndexByte(topLevel, '.'); dot > 0 {
+		topLevel = topLevel[:dot]
+	}
+	if _, ok := openAIResponsesChatGPTOptionalRejectedParams[topLevel]; !ok ||
+		!gjson.GetBytes(body, topLevel).Exists() {
+		return nil, "", false, nil
+	}
+	retryBody, err := sjson.DeleteBytes(body, topLevel)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("delete ChatGPT optional %s: %w", topLevel, err)
+	}
+	return retryBody, topLevel + " parameter rejection", true, nil
 }
 
 func isExplicitOpenAIResponsesFieldRejection(code, message string) bool {
@@ -384,9 +440,43 @@ func removeOpenAIResponsesRejectedReasoningContentAtIndex(body []byte, index int
 	if !item.IsObject() || strings.TrimSpace(item.Get("type").String()) != "reasoning" || !content.IsArray() || len(content.Array()) == 0 {
 		return nil, "", false, nil
 	}
-	retryBody, err := sjson.DeleteBytes(body, itemPath+".content")
-	if err != nil {
-		return nil, "", false, fmt.Errorf("delete rejected reasoning content at input[%d]: %w", index, err)
+
+	// The upstream reports only the first offending index. Long Codex
+	// conversations can contain one reasoning item per turn, so deleting one
+	// item per retry exhausts the bounded retry budget before the request can
+	// succeed. The rejection proves that reasoning content is unsupported;
+	// clear it from every reasoning item in one pass while preserving message
+	// and tool-call content.
+	retryBody := body
+	cleared := 0
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		// Field deletion does not shift array indexes, so indexes from the
+		// original payload remain valid for each successive rewrite.
+		for itemIndex, candidate := range input.Array() {
+			if !candidate.IsObject() || strings.TrimSpace(candidate.Get("type").String()) != "reasoning" {
+				continue
+			}
+			candidateContent := candidate.Get("content")
+			if !candidateContent.IsArray() || len(candidateContent.Array()) == 0 {
+				continue
+			}
+			contentPath := fmt.Sprintf("input.%d.content", itemIndex)
+			next, err := sjson.DeleteBytes(retryBody, contentPath)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("delete rejected reasoning content at input[%d]: %w", itemIndex, err)
+			}
+			retryBody = next
+			cleared++
+		}
+	}
+	if cleared == 0 {
+		// The rejected item may be addressable only by the reported index when
+		// the input container is not a normal array; retain the old fallback.
+		next, err := sjson.DeleteBytes(retryBody, itemPath+".content")
+		if err != nil {
+			return nil, "", false, fmt.Errorf("delete rejected reasoning content at input[%d]: %w", index, err)
+		}
+		retryBody = next
 	}
 	return retryBody, "indexed reasoning content maximum-length rejection", true, nil
 }

@@ -109,6 +109,42 @@ func TestTLSFingerprintHTTPSProxyFallsBackWithoutBypassingProxy(t *testing.T) {
 	require.Equal(t, "https://user:pass@proxy.example:8443", resolved.String())
 }
 
+func TestTLSFingerprintHTTPProxyUsesFingerprintDialerWithoutDirectFallback(t *testing.T) {
+	proxyURL, err := url.Parse("http://user:pass@proxy.example:8080")
+	require.NoError(t, err)
+	transport, err := buildUpstreamTransportWithTLSFingerprint(
+		poolSettings{}, proxyURL, &tlsfingerprint.Profile{Name: "codex-test"},
+	)
+	require.NoError(t, err)
+	// HTTP CONNECT is performed by the fingerprint dialer itself.  Proxy must
+	// not be left on the transport (which would make net/http send a second
+	// proxy hop), and the custom dialer must be present (which proves a direct
+	// TCP fallback was not selected).
+	require.Nil(t, transport.Proxy)
+	require.NotNil(t, transport.DialTLSContext)
+}
+
+func TestTLSFingerprintDirectTransportHasNoSharedDefaultClient(t *testing.T) {
+	transport, err := buildUpstreamTransportWithTLSFingerprint(
+		poolSettings{}, nil, &tlsfingerprint.Profile{Name: "codex-test"},
+	)
+	require.NoError(t, err)
+	require.Nil(t, transport.Proxy)
+	require.NotNil(t, transport.DialTLSContext)
+	// A fresh transport is required for every isolated cache entry; using the
+	// package global DefaultTransport would leak connection state across
+	// accounts and fingerprints.
+	require.NotSame(t, http.DefaultTransport, transport)
+}
+
+func TestRedactProxyURLForLogRemovesCredentials(t *testing.T) {
+	got := redactProxyURLForLog("http://user:secret@proxy.example:8080/path")
+	require.Contains(t, got, "proxy.example:8080")
+	require.NotContains(t, got, "secret")
+	require.NotContains(t, got, "user")
+	require.Equal(t, directProxyKey, redactProxyURLForLog(""))
+}
+
 func startTestSOCKS5Proxy(t *testing.T) (string, *atomic.Int64) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -853,6 +889,44 @@ func (s *HTTPUpstreamSuite) TestOpenAIHTTP2OlderSuccessCannotResetNewFailure() {
 	state.resetErrorWindow(base.Add(-time.Second))
 	tripped, _ = state.recordFailure(base.Add(10*time.Second), 2, time.Minute, 10*time.Minute)
 	require.True(s.T(), tripped, "a success from an older request must not erase a newer transport failure")
+}
+
+func (s *HTTPUpstreamSuite) TestOpenAIHTTP2FallbackExpiredStateIsLazilyRemoved() {
+	s.cfg.Gateway.OpenAIHTTP2 = config.GatewayOpenAIHTTP2Config{
+		Enabled:                   true,
+		AllowProxyFallbackToHTTP1: true,
+		FallbackWindowSeconds:     60,
+		FallbackTTLSeconds:        600,
+	}
+	svc := s.newService()
+	proxyKey := "http://expired-proxy.local:8080"
+	svc.openAIHTTP2Fallbacks.Store(proxyKey, &openAIHTTP2FallbackState{
+		fallbackUntil: time.Now().Add(-time.Second),
+	})
+
+	require.False(s.T(), svc.isOpenAIHTTP2FallbackActive(proxyKey))
+	_, present := svc.openAIHTTP2Fallbacks.Load(proxyKey)
+	require.False(s.T(), present, "expired fallback state should be reclaimed on the next lookup")
+}
+
+func (s *HTTPUpstreamSuite) TestOpenAIHTTP2FallbackCleanupGenerationGuardKeepsNewFailure() {
+	now := time.Now()
+	state := &openAIHTTP2FallbackState{
+		fallbackUntil: now.Add(-time.Second),
+	}
+	active, empty, generation := state.expireForCleanup(now, time.Minute)
+	require.False(s.T(), active)
+	require.True(s.T(), empty)
+
+	tripped, _ := state.recordFailure(now.Add(time.Millisecond), 1, time.Minute, time.Minute)
+	require.True(s.T(), tripped)
+
+	deleted := false
+	require.False(s.T(), state.compareAndDeleteAtGeneration(generation, func() {
+		deleted = true
+	}))
+	require.False(s.T(), deleted, "a newer failure must invalidate an older cleanup token")
+	require.True(s.T(), state.isFallbackActive(now.Add(time.Millisecond)))
 }
 
 type failingReader struct{ err error }

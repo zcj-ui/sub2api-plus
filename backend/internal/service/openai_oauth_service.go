@@ -46,6 +46,9 @@ func (s *OpenAIOAuthService) resolveConfiguredProxyURL(ctx context.Context, prox
 	if err != nil || proxy == nil {
 		return "", infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_PROXY_UNAVAILABLE", "account proxy is configured but unavailable: %v", err)
 	}
+	if err := validateConfiguredOpenAIProxy(proxy); err != nil {
+		return "", infraerrors.Newf(http.StatusBadGateway, "OPENAI_OAUTH_PROXY_UNAVAILABLE", "%v", err)
+	}
 	proxyURL := strings.TrimSpace(proxy.URL())
 	if proxyURL == "" {
 		return "", infraerrors.New(http.StatusBadGateway, "OPENAI_OAUTH_PROXY_UNAVAILABLE", "account proxy URL is unavailable")

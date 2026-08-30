@@ -60,13 +60,14 @@ func TestPrepareOpenAIWSHTTPBridgeBodyStripsNoneReasoningForCompatibleEndpoint(t
 	require.Equal(t, "none", gjson.GetBytes(officialBody, "reasoning.effort").String())
 }
 
-func TestProxyOpenAIWSHTTPBridgeTurn_UpstreamDefaultServiceTierWinsOverRequest(t *testing.T) {
+func TestProxyOpenAIWSHTTPBridgeTurn_KeepsOutboundAndObservedServiceTiersSeparate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	// proxyOpenAIWSHTTPBridgeTurn 是 client WS→HTTP bridge，本身不 canonicalize
 	// fast→priority；生产入口的归一化在 openai_ws_forwarder_ingress.go 的 fast
 	// policy。本测试只覆盖局部 observer：canonical 请求 priority 被上游
-	// response.completed service_tier=default 覆盖。
+	// response.completed service_tier=default stays separate from the outbound
+	// tier; usage-time billing applies the account-specific contract.
 	sse := strings.Join([]string{
 		`data: {"type":"response.completed","response":{"id":"resp_tier","model":"gpt-5.5","status":"completed","service_tier":"default","usage":{"input_tokens":1,"output_tokens":1}}}`,
 		``,
@@ -96,14 +97,15 @@ func TestProxyOpenAIWSHTTPBridgeTurn_UpstreamDefaultServiceTierWinsOverRequest(t
 	require.NotNil(t, result)
 	require.Equal(t, "priority", gjson.GetBytes(upstream.lastBody, "service_tier").String())
 	require.NotNil(t, result.ServiceTier)
-	require.Equal(t, "default", *result.ServiceTier)
+	require.Equal(t, "priority", *result.ServiceTier)
+	require.Equal(t, "default", result.UpstreamResponseServiceTier)
 }
 
-func TestProxyOpenAIWSHTTPBridgeTurn_UpstreamDefaultWinsOverFastAlias(t *testing.T) {
+func TestProxyOpenAIWSHTTPBridgeTurn_FastAliasKeepsOutboundAndObservedTiersSeparate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	// 客户端别名 fast 同样被上游回显的 default 覆盖：局部 observer 的
-	// ServiceTier() 是唯一计费依据，绝不回退到请求侧 fast。
+	// The observed response tier is retained separately; OAuth/Codex billing
+	// resolves it later with account context.
 	sse := strings.Join([]string{
 		`data: {"type":"response.completed","response":{"id":"resp_tier2","model":"gpt-5.5","status":"completed","service_tier":"default","usage":{"input_tokens":1,"output_tokens":1}}}`,
 		``,
@@ -132,8 +134,8 @@ func TestProxyOpenAIWSHTTPBridgeTurn_UpstreamDefaultWinsOverFastAlias(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotNil(t, result.ServiceTier)
-	require.Equal(t, "default", *result.ServiceTier,
-		"local observer's upstream-echoed default must win over the fast alias")
+	require.Equal(t, "priority", *result.ServiceTier)
+	require.Equal(t, "default", result.UpstreamResponseServiceTier)
 }
 
 func TestProxyOpenAIWSHTTPBridgeTurnAPIKeyAdaptsClientTools(t *testing.T) {
@@ -724,6 +726,47 @@ func TestOpenAIWSHTTPBridgeDecisionKeepsSmallFramesOnWS(t *testing.T) {
 	svc.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = false
 	require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 1000, ""))
 	require.True(t, svc.shouldBridgeOpenAIWSHTTP(&Account{Platform: PlatformGrok}, 1, "resp_existing"))
+}
+
+func TestOpenAIWSPassthroughFirstMessageBridgeDecision(t *testing.T) {
+	const threshold = 100
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{
+			OpenAIWS: config.GatewayOpenAIWSConfig{
+				HTTPBridgeEnabled:        true,
+				HTTPBridgeThresholdBytes: threshold,
+			},
+		}},
+	}
+	exactThresholdPayload := `{"type":"response.create","input":"` +
+		strings.Repeat("x", threshold-len(`{"type":"response.create","input":""}`)) + `"}`
+
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "oversized response create", payload: `{"type":"response.create","input":"` + strings.Repeat("x", 100) + `"}`, want: true},
+		{name: "omitted type", payload: `{"input":"` + strings.Repeat("x", 100) + `"}`, want: true},
+		{name: "blank type", payload: `{"type":"   ","padding":"` + strings.Repeat("x", 100) + `"}`, want: true},
+		{name: "exact threshold", payload: exactThresholdPayload, want: true},
+		{name: "small stays passthrough", payload: `{"type":"response.create","input":"x"}`},
+		{name: "previous response id stays passthrough", payload: `{"type":"response.create","previous_response_id":"resp_previous","input":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "duplicate type stays passthrough", payload: `{"type":"response.create","type":"response.create","input":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "duplicate previous response id stays passthrough", payload: `{"type":"response.create","previous_response_id":null,"previous_response_id":null,"input":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "null type", payload: `{"type":null,"padding":"` + strings.Repeat("x", 100) + `"}`, want: true},
+		{name: "non-string type stays passthrough", payload: `{"type":123,"padding":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "oversized cancel stays passthrough", payload: `{"type":"response.cancel","padding":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "oversized other event stays passthrough", payload: `{"type":"session.update","padding":"` + strings.Repeat("x", 100) + `"}`},
+		{name: "malformed stays passthrough", payload: `{"type":"response.create","padding":"` + strings.Repeat("x", 100)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, svc.shouldBridgeOpenAIWSPassthroughFirstMessage(nil, []byte(tt.payload)))
+		})
+	}
+
+	require.True(t, svc.shouldBridgeOpenAIWSPassthroughFirstMessage(&Account{Platform: PlatformGrok}, []byte(`{"type":"session.update"}`)))
 }
 
 func TestProxyOpenAIWSHTTPBridgeTurnTransportErrorFailoverSafety(t *testing.T) {

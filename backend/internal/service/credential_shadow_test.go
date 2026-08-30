@@ -44,3 +44,77 @@ func TestResolveCredentialAccount(t *testing.T) {
 	_, err = resolveCredentialAccount(ctx, badRepo, shadow)
 	require.Error(t, err)
 }
+
+func TestInheritOpenAIShadowUpstreamProfileKeepsShadowRoutingState(t *testing.T) {
+	parentID := int64(10)
+	shadow := &Account{
+		ID: 20, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		ParentAccountID: &parentID,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{"gpt-5.3-codex-spark": "gpt-5.3-codex-spark"},
+			"access_token":  "stale-shadow-token",
+		},
+		Extra: map[string]any{
+			"openai_ws_force_http":  true,
+			"codex_7d_used_percent": 35.0,
+			PlatformOpenAI:          map[string]any{"codex_image_generation_bridge": false, "shadow_local": true},
+		},
+		QuotaDimension: QuotaDimensionSpark,
+	}
+	parent := &Account{
+		ID: 10, Platform: PlatformOpenAI, Type: AccountTypeOAuth,
+		ProxyID: func() *int64 { v := int64(77); return &v }(),
+		Proxy:   &Proxy{ID: 77, Host: "proxy.example.test", Port: 443},
+		Credentials: map[string]any{
+			"access_token":  "parent-token",
+			"base_url":      "https://parent.example.test",
+			"model_mapping": map[string]any{"parent": "mapping"},
+		},
+		Extra: map[string]any{
+			"openai_ws_force_http":   false,
+			"openai_device_id":       "parent-installation",
+			"codex_fingerprint_mode": "session",
+			PlatformOpenAI:           map[string]any{"codex_image_generation_bridge": true, "parent_only": true},
+		},
+	}
+
+	got := InheritOpenAIShadowUpstreamProfile(shadow, parent)
+	require.NotNil(t, got)
+	require.Equal(t, shadow.ID, got.ID)
+	require.Equal(t, QuotaDimensionSpark, got.QuotaDimension)
+	require.Equal(t, "parent-token", got.Credentials["access_token"])
+	require.Equal(t, "https://parent.example.test", got.Credentials["base_url"])
+	require.NotNil(t, got.ProxyID)
+	require.Equal(t, int64(77), *got.ProxyID)
+	require.Equal(t, int64(77), got.Proxy.ID)
+	require.Equal(t, shadow.Credentials["model_mapping"], got.Credentials["model_mapping"])
+	require.NotContains(t, got.Credentials, "compact_model_mapping")
+	require.Equal(t, "parent-installation", got.Extra["openai_device_id"])
+	require.Equal(t, "session", got.Extra["codex_fingerprint_mode"])
+	require.Equal(t, 35.0, got.Extra["codex_7d_used_percent"])
+	nested := got.Extra[PlatformOpenAI].(map[string]any)
+	require.Equal(t, true, nested["codex_image_generation_bridge"])
+	require.Equal(t, true, nested["shadow_local"])
+	require.Nil(t, nested["parent_only"], "unrelated parent nested state must not leak into shadow")
+
+	// Inputs must remain untouched; the projection is never persisted.
+	require.Equal(t, "stale-shadow-token", shadow.Credentials["access_token"])
+	require.Equal(t, true, shadow.Extra["openai_ws_force_http"])
+	require.Equal(t, false, shadow.Extra[PlatformOpenAI].(map[string]any)["codex_image_generation_bridge"])
+	require.Nil(t, InheritOpenAIShadowUpstreamProfile(nil, parent))
+	require.Nil(t, InheritOpenAIShadowUpstreamProfile(shadow, nil))
+}
+
+func TestEffectiveOpenAIShadowUpstreamProfileRequiresRealOAuthParent(t *testing.T) {
+	parentID := int64(10)
+	shadow := &Account{ID: 20, Platform: PlatformOpenAI, Type: AccountTypeOAuth, ParentAccountID: &parentID}
+	require.Nil(t, effectiveOpenAIShadowUpstreamProfile(shadow, func(int64) *Account { return nil }))
+	require.Nil(t, effectiveOpenAIShadowUpstreamProfile(shadow, func(int64) *Account {
+		return &Account{ID: 10, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	}))
+	got := effectiveOpenAIShadowUpstreamProfile(shadow, func(int64) *Account {
+		return &Account{ID: 10, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	})
+	require.NotNil(t, got)
+	require.Equal(t, shadow.ID, got.ID)
+}

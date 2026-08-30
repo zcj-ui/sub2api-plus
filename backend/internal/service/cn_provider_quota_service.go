@@ -536,7 +536,13 @@ func parseZhipuTokenTiers(data gjson.Result) []CNQuotaTier {
 			unclassified = append(unclassified, e)
 		}
 	}
-	var creditFallback []entry
+	// Keep the original CREDIT_LIMIT item so the fallback path can reuse the
+	// same explicit unit classification as TOKENS_LIMIT.
+	type creditCandidate struct {
+		item gjson.Result
+		e    entry
+	}
+	var creditFallback []creditCandidate
 	hasTokensLimit := false
 
 	limits := data.Get("limits")
@@ -580,14 +586,18 @@ func parseZhipuTokenTiers(data gjson.Result) []CNQuotaTier {
 			hasTokensLimit = true
 			classify(item, e)
 		} else {
-			creditFallback = append(creditFallback, e)
+			creditFallback = append(creditFallback, creditCandidate{item: item, e: e})
 		}
 		return true
 	})
 
-	// 无任何 TOKENS_LIMIT 条目（部分套餐只报信用额度）：降级用 CREDIT_LIMIT 展示。
+	// When a plan reports only CREDIT_LIMIT, classify those entries by unit
+	// before falling back to reset-time ordering. This prevents a weekly window
+	// near period rollover from being mistaken for the 5h bucket.
 	if !hasTokensLimit {
-		unclassified = append(unclassified, creditFallback...)
+		for _, candidate := range creditFallback {
+			classify(candidate.item, candidate.e)
+		}
 	}
 
 	// 无 reset 的条目排前，再按 reset 升序，依次填入仍空缺的槽位。

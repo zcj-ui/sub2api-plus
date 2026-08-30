@@ -537,6 +537,12 @@ const (
 
 	// SettingKeyRateLimit429CooldownSettings stores JSON config for 429 fallback cooldown handling.
 	SettingKeyRateLimit429CooldownSettings = "rate_limit_429_cooldown_settings"
+
+	// SettingKeyOpenAI403CooldownSettings stores JSON config for OpenAI 403
+	// temporary cooldown handling.  This setting is intentionally scoped to
+	// OpenAI accounts; Claude/CC and other provider policies keep their own
+	// existing behavior.
+	SettingKeyOpenAI403CooldownSettings = "openai_403_cooldown_settings"
 	// SettingKeyOpenAIImagesOAuthUnavailableCooldownSettings stores the
 	// configurable cooldown used when an OpenAI OAuth image tool is explicitly
 	// reported unavailable by the upstream.

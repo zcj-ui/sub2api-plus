@@ -44,7 +44,23 @@ func TestOpenAIWSConnPool_CleanupStaleAndTrimIdle(t *testing.T) {
 	require.NotNil(t, ap.conns["idle_new"], "newer idle should be kept")
 }
 
-func TestOpenAIWSConnPool_GuardPinSurvivesMaxAgeUntilTTL(t *testing.T) {
+func TestOpenAIWSConnPool_CleanupRotatesIdleCoderConnectionsWithoutReader(t *testing.T) {
+	p := newOpenAIWSConnPool(&config.Config{})
+	ap := p.getOrCreateAccountPool(101)
+	conn := newOpenAIWSConn("idle_coder", 101, &coderOpenAIWSClientConn{}, nil)
+	// Keep connection age below max-age; only the idle/no-reader policy should
+	// rotate this socket before a new first turn can reuse a stale server close.
+	conn.createdAtNano.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	conn.lastUsedNano.Store(time.Now().Add(-openAIWSConnHealthCheckIdle - time.Second).UnixNano())
+	ap.conns[conn.id] = conn
+
+	evicted := p.cleanupAccountLocked(ap, time.Now(), p.maxConnsHardCap())
+	closeOpenAIWSConns(evicted)
+	require.Len(t, evicted, 1)
+	require.NotContains(t, ap.conns, conn.id)
+}
+
+func TestOpenAIWSConnPool_NormalPinDoesNotSurviveMaxAge(t *testing.T) {
 	pool := newOpenAIWSConnPool(&config.Config{})
 	ap := pool.getOrCreateAccountPool(11)
 	conn := newOpenAIWSConn("guard_pin", 11, nil, nil)
@@ -53,13 +69,54 @@ func TestOpenAIWSConnPool_GuardPinSurvivesMaxAgeUntilTTL(t *testing.T) {
 
 	require.True(t, pool.PinConnUntil(11, conn.id, time.Now().Add(time.Minute)))
 	evicted := pool.cleanupAccountLocked(ap, time.Now(), pool.maxConnsHardCap())
-	require.Empty(t, evicted)
-	require.NotNil(t, ap.conns[conn.id])
-
-	ap.guardPinnedUntil[conn.id] = time.Now().Add(-time.Second)
-	evicted = pool.cleanupAccountLocked(ap, time.Now(), pool.maxConnsHardCap())
 	require.Len(t, evicted, 1)
+	require.NotContains(t, ap.conns, conn.id)
 	closeOpenAIWSConns(evicted)
+}
+
+func TestOpenAIWSConnPool_Permanent429GuardSurvivesMaxAge(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	ap := pool.getOrCreateAccountPool(111)
+	conn := newOpenAIWSConn("guard_permanent_old", 111, nil, nil)
+	conn.createdAtNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	ap.conns[conn.id] = conn
+	conn.guard429CandidateGeneration.Store(1)
+	require.True(t, pool.MarkAndPinGuardConnConfirmed(111, conn.id, 1))
+
+	evicted := pool.cleanupAccountLocked(ap, time.Now(), pool.maxConnsHardCap())
+	require.Empty(t, evicted)
+	require.Contains(t, ap.conns, conn.id)
+	require.False(t, conn.retireOnRelease.Load())
+}
+
+func TestOpenAIWSConnLease_ShouldRetireAndReleaseEvictsAgedSocket(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	ap := pool.getOrCreateAccountPool(112)
+	conn := newOpenAIWSConn("leased_old", 112, &openAIWSFakeConn{}, nil)
+	conn.createdAtNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	ap.conns[conn.id] = conn
+	require.True(t, conn.tryAcquire())
+	lease := &openAIWSConnLease{pool: pool, accountID: 112, conn: conn}
+	require.True(t, lease.ShouldRetire())
+
+	lease.Release()
+	ap.mu.Lock()
+	_, exists := ap.conns[conn.id]
+	ap.mu.Unlock()
+	require.False(t, exists)
+}
+
+func TestOpenAIWSConnPool_AgedSocketIsExcludedFromReuse(t *testing.T) {
+	pool := newOpenAIWSConnPool(&config.Config{})
+	ap := pool.getOrCreateAccountPool(113)
+	oldConn := newOpenAIWSConn("aged", 113, &openAIWSFakeConn{}, nil)
+	oldConn.createdAtNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	newConn := newOpenAIWSConn("fresh", 113, &openAIWSFakeConn{}, nil)
+	ap.conns[oldConn.id] = oldConn
+	ap.conns[newConn.id] = newConn
+	compat := openAIWSHandshakeCompatibilityKey{}
+	picked := pool.pickLeastBusyConnLocked(ap, "", compat, "", "")
+	require.Same(t, newConn, picked)
 }
 
 func TestOpenAIWSConnPool_StaleGuardPinDoesNotBlockProxyReplacement(t *testing.T) {

@@ -323,6 +323,10 @@ gateway:
     ingress_mode_default: ctx_pool
     # 完整读取并解压首条客户端消息的总超时（秒）；大请求或慢链路可调高到 120-300。
     client_first_message_timeout_seconds: 30
+    # passthrough 下游客户端 WebSocket 的 Ping/Pong 保活；首个业务帧写出后启用。
+    # 默认每 20 秒探测，5 秒内未收到 Pong 则优雅断开并排空上游；任一项设为 0 可关闭。
+    passthrough_downstream_ping_interval_seconds: 20
+    passthrough_downstream_ping_timeout_seconds: 5
     # Close a client WebSocket that stays idle between completed turns (seconds). Set 0 to disable.
     ingress_inter_turn_idle_timeout_seconds: 300
     # Limit live client WebSocket ingress sessions per API key across all instances. Set 0 to disable.

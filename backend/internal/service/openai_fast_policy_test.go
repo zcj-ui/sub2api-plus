@@ -139,6 +139,61 @@ func TestEvaluateOpenAIFastPolicy_ScopeFiltersOAuth(t *testing.T) {
 	require.Equal(t, BetaPolicyActionPass, action)
 }
 
+func TestEvaluateOpenAIFastPolicy_MissingTierIsDistinctFromAll(t *testing.T) {
+	settings := &OpenAIFastPolicySettings{Rules: []OpenAIFastPolicyRule{
+		{ServiceTier: OpenAIFastTierAny, Action: BetaPolicyActionFilter, Scope: BetaPolicyScopeAll},
+		{ServiceTier: OpenAIFastTierMissing, Action: OpenAIFastPolicyActionForcePriority, Scope: BetaPolicyScopeAll},
+	}}
+	svc := newOpenAIGatewayServiceWithSettings(t, settings)
+	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+
+	// `all` only matches an explicitly supplied tier; the dedicated missing
+	// rule is selected for an omitted service_tier request.
+	action, _ := svc.evaluateOpenAIFastPolicy(context.Background(), account, "gpt-5.5", OpenAIFastTierMissing)
+	require.Equal(t, OpenAIFastPolicyActionForcePriority, action)
+	action, _ = svc.evaluateOpenAIFastPolicy(context.Background(), account, "gpt-5.5", OpenAIFastTierPriority)
+	require.Equal(t, BetaPolicyActionFilter, action)
+}
+
+func TestApplyOpenAIFastPolicyToBody_MissingTierCanForcePriority(t *testing.T) {
+	settings := &OpenAIFastPolicySettings{Rules: []OpenAIFastPolicyRule{{
+		ServiceTier: OpenAIFastTierMissing,
+		Action:      OpenAIFastPolicyActionForcePriority,
+		Scope:       BetaPolicyScopeAll,
+	}}}
+	svc := newOpenAIGatewayServiceWithSettings(t, settings)
+	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	updated, err := svc.applyOpenAIFastPolicyToBody(context.Background(), account, "gpt-5.5", []byte(`{"model":"gpt-5.5"}`))
+	require.NoError(t, err)
+	require.Equal(t, OpenAIFastTierPriority, gjson.GetBytes(updated, "service_tier").String())
+}
+
+func TestOpenAIFastPolicyRequestView_NullServiceTierUsesMissingPolicy(t *testing.T) {
+	settings := &OpenAIFastPolicySettings{Rules: []OpenAIFastPolicyRule{{
+		ServiceTier: OpenAIFastTierMissing,
+		Action:      OpenAIFastPolicyActionForcePriority,
+		Scope:       BetaPolicyScopeAll,
+	}}}
+	svc := newOpenAIGatewayServiceWithSettings(t, settings)
+	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+
+	// The request-view fast path is used by Forward before the body helper.
+	// Explicit null has the same semantic meaning as an omitted tier and must
+	// not bypass the configured missing-tier rule.
+	requestView := newOpenAIRequestView([]byte(`{"model":"gpt-5.5","service_tier":null,"input":"hi"}`))
+	body := []byte(`{"model":"gpt-5.5","service_tier":null,"input":"hi"}`)
+	tier := gjson.GetBytes(body, "service_tier")
+	require.True(t, tier.Exists())
+	require.Equal(t, gjson.Null, tier.Type)
+	require.True(t, openAIFastPolicyTierNeedsEvaluation(body, requestView.ServiceTier))
+
+	// Exercise the same policy helper used after request-view patching; the
+	// regression guard above ensures null is routed into its missing branch.
+	updated, err := svc.applyOpenAIFastPolicyToBody(context.Background(), account, "gpt-5.5", body)
+	require.NoError(t, err)
+	require.Equal(t, OpenAIFastTierPriority, gjson.GetBytes(updated, "service_tier").String())
+}
+
 func TestEvaluateOpenAIFastPolicy_UserScopedRuleOverridesGlobalRule(t *testing.T) {
 	settings := &OpenAIFastPolicySettings{
 		Rules: []OpenAIFastPolicyRule{

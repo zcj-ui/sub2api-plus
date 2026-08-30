@@ -3,11 +3,15 @@ import { mount } from '@vue/test-utils'
 
 import AccountBulkActionsBar from '../AccountBulkActionsBar.vue'
 
-vi.mock('vue-i18n', () => ({
-  useI18n: () => ({
-    t: (key: string) => key
-  })
-}))
+vi.mock('vue-i18n', async () => {
+  const actual = await vi.importActual<typeof import('vue-i18n')>('vue-i18n')
+  return {
+    ...actual,
+    useI18n: () => ({
+      t: (key: string) => key
+    })
+  }
+})
 
 describe('AccountBulkActionsBar', () => {
   it('allows selecting all results before any row is selected', async () => {
@@ -120,5 +124,20 @@ describe('AccountBulkActionsBar', () => {
     )
     expect(inventoryButton?.attributes('disabled')).toBeDefined()
     expect(healthButton?.attributes('disabled')).toBeDefined()
+  })
+
+  it('labels the filter-wide update action explicitly', () => {
+    const wrapper = mount(AccountBulkActionsBar, {
+      props: {
+        selectedIds: [1],
+        totalResults: 2,
+        selectingAll: false,
+        allResultsSelected: false
+      }
+    })
+
+    const button = wrapper.findAll('button').find(item => item.text().includes('editFiltered'))
+    expect(button).toBeDefined()
+    expect(button?.text()).toContain('admin.accounts.bulkActions.editFiltered')
   })
 })

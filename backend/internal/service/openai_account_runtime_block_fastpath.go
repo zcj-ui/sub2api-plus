@@ -73,8 +73,8 @@ const (
 )
 
 // classifyOpenAIOAuth429 区分账号配额耗尽信号与普通瞬时 429。明确窗口达到
-// 100% 时以该窗口为准；没有 100% 标记但包含重置头时，沿用 v179 的兼容语义，
-// 仍视为配额限流信号。
+// 100% 时以该窗口为准；两个窗口都未耗尽时，响应头中的长窗口 reset 值不再
+// 被当作账号冷却（这类 429 通常是短暂 RPM/TPM burst）。
 func classifyOpenAIOAuth429(headers http.Header, responseBody []byte) (openAIOAuth429Disposition, *time.Time) {
 	if snapshot := ParseCodexRateLimitHeaders(headers); snapshot != nil {
 		if normalized := snapshot.Normalize(); normalized != nil {
@@ -190,6 +190,12 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	stateCtx = withTempUnschedulableModel(stateCtx, canonicalModel)
 	if s.rateLimitService != nil && len(canonicalModel) > 0 && s.rateLimitService.HandleUpstreamModelNotFound(stateCtx, account, canonicalModel[0], statusCode, responseBody) {
 		return true
+	}
+	if statusCode == http.StatusTooManyRequests && s.rateLimitService != nil && len(canonicalModel) > 0 &&
+		s.rateLimitService.HandleOpenAICodexSparkRateLimit(stateCtx, account, canonicalModel[0], statusCode, headers, responseBody) {
+		// Spark's quota is model-scoped; keep the account available for other
+		// Codex models and let the scheduler skip only this model until reset.
+		return false
 	}
 	confirmedOAuth429 := false
 	if statusCode == http.StatusTooManyRequests && isOpenAIOAuthAccount(account) &&
@@ -330,6 +336,7 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockSnapshotLocked(accountID
 	rawUntil, ok := s.openaiAccountRuntimeBlockUntil.Load(accountID)
 	if !ok {
 		s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(accountID)
+		s.openaiAccountRuntimeBlockInstalledAt.Delete(accountID)
 		return snapshot
 	}
 	until, ok := rawUntil.(time.Time)
@@ -337,6 +344,7 @@ func (s *OpenAIGatewayService) openAIAccountRuntimeBlockSnapshotLocked(accountID
 		s.openaiAccountRuntimeBlockUntil.Delete(accountID)
 		s.openaiAccountRuntimeBlockReason.Delete(accountID)
 		s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(accountID)
+		s.openaiAccountRuntimeBlockInstalledAt.Delete(accountID)
 		snapshot.Generation = s.openaiAccountRuntimeBlockSequence.Add(1)
 		s.openaiAccountRuntimeBlockGeneration.Store(accountID, snapshot.Generation)
 		snapshot.Reason = ""
@@ -420,15 +428,29 @@ func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context
 		return
 	}
 
-	cooldownUntil := time.Now().Add(openAIOAuth429FallbackCooldown)
-	if resetAt != nil && resetAt.After(time.Now()) {
-		cooldownUntil = *resetAt
-	} else if s.rateLimitService != nil {
-		if cooldown, ok := s.rateLimitService.get429FallbackCooldown(ctx, account); ok && cooldown > 0 {
-			cooldownUntil = time.Now().Add(cooldown)
-		}
+	now := time.Now()
+	// A confirmed two-strike 429 may still carry an authoritative exhausted
+	// quota-window reset.  Preserve that reset even when the short fallback
+	// cooldown switch is disabled; the switch only controls synthetic cooldowns
+	// for transient 429s.  This keeps an actually exhausted account out of
+	// rotation without reviving the old "disabled still cools" bug.
+	if resetAt != nil && resetAt.After(now) {
+		s.BlockAccountScheduling(account, *resetAt, "429")
+		s.openaiOAuth429RetryStartedAt.Delete(account.ID)
+		return
 	}
-	s.BlockAccountScheduling(account, cooldownUntil, "429")
+	if s.rateLimitService != nil {
+		cooldown, ok := s.rateLimitService.get429FallbackCooldown(ctx, account)
+		if !ok || cooldown <= 0 {
+			s.openaiOAuth429RetryStartedAt.Delete(account.ID)
+			return
+		}
+		cooldownUntil := now.Add(cooldown)
+		s.BlockAccountScheduling(account, cooldownUntil, "429")
+		s.openaiOAuth429RetryStartedAt.Delete(account.ID)
+		return
+	}
+	s.BlockAccountScheduling(account, now.Add(openAIOAuth429FallbackCooldown), "429")
 	s.openaiOAuth429RetryStartedAt.Delete(account.ID)
 }
 
@@ -632,6 +654,10 @@ func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, un
 		if extends {
 			s.openaiAccountRuntimeBlockUntil.Store(account.ID, blockUntil)
 		}
+		// Record the wall-clock installation point for the generation.  The
+		// scheduler observer uses it to distinguish a newer request racing an
+		// older cross-instance clear event.
+		s.openaiAccountRuntimeBlockInstalledAt.Store(account.ID, now.UTC())
 		return currentGeneration, true
 	}
 
@@ -647,6 +673,7 @@ func (s *OpenAIGatewayService) blockAccountSchedulingLocked(account *Account, un
 		}
 	}
 	s.openaiAccountRuntimeBlockUntil.Store(account.ID, blockUntil)
+	s.openaiAccountRuntimeBlockInstalledAt.Store(account.ID, now.UTC())
 	s.storeOpenAIAccountRuntimeBlockReason(account.ID, reason)
 	return generation, true
 }
@@ -667,6 +694,128 @@ func (s *OpenAIGatewayService) storeOpenAIAccountRuntimeBlockReason(accountID in
 	s.openaiAccountRuntimeBlockReason.Store(accountID, next)
 }
 
+// ReconcileOpenAIAccountRuntimeBlock is called by SchedulerSnapshotService
+// after it has read an authoritative account row in response to a scheduler
+// outbox event.  Runtime blocks are intentionally installed before durable
+// state writes so a failing request is stopped immediately; that means a
+// different gateway instance can clear the database and leave a stale block
+// in this process.  Retire it only when all of the following hold:
+//
+//   - the fresh row has no active durable account cooldown;
+//   - the row version is newer than the version captured for this local block;
+//   - the local block generation was installed no later than the outbox read
+//     (a newer request racing the event wins the CAS and remains blocked).
+//
+// A durable recovery retires all local guard reservations for the account. A
+// confirmed Codex 429 may have retained one exact connection, but once another
+// instance has authoritatively cleared the cooldown that socket must not keep
+// ordinary scheduling filtered; it is detached and closed below.
+func (s *OpenAIGatewayService) ReconcileOpenAIAccountRuntimeBlock(account *Account, observedAt time.Time) {
+	if s == nil || !isOpenAIAccount(account) || account.ID <= 0 || account.UpdatedAt.IsZero() {
+		return
+	}
+	if observedAt.IsZero() {
+		// Callers in production always provide the pre-read timestamp.  A zero
+		// value from a custom integration is treated conservatively as "now" so
+		// a concurrently installed block is still considered newer.
+		observedAt = time.Now().UTC()
+	}
+
+	mu := s.openAIAccountRuntimeBlockLock(account.ID)
+	mu.Lock()
+
+	// Capture the generation and installation timestamp while holding the same
+	// lock used by BlockAccountScheduling/ClearAccountSchedulingBlock.
+	rawUntil, active := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	until, untilOK := rawUntil.(time.Time)
+	if !active || !untilOK || until.IsZero() || !time.Now().Before(until) {
+		mu.Unlock()
+		return
+	}
+	if accountPersistedSchedulingCooldownActive(account) {
+		mu.Unlock()
+		return
+	}
+
+	if rawInstalled, ok := s.openaiAccountRuntimeBlockInstalledAt.Load(account.ID); ok {
+		if installedAt, ok := rawInstalled.(time.Time); ok && !installedAt.IsZero() && installedAt.After(observedAt) {
+			// A request installed a newer local generation while the outbox
+			// worker was reading the row.  Do not let the older event erase it.
+			mu.Unlock()
+			return
+		}
+	}
+	rawObserved, hasObserved := s.openaiAccountRuntimeBlockObservedUpdatedAt.Load(account.ID)
+	observedVersion, observedOK := rawObserved.(time.Time)
+	if !hasObserved || !observedOK || observedVersion.IsZero() || !account.UpdatedAt.After(observedVersion) {
+		// A zero/missing row version cannot prove that a durable writer observed
+		// the transition.  Keep the local block fail-closed in that case.
+		mu.Unlock()
+		return
+	}
+
+	var generation uint64
+	if rawGeneration, ok := s.openaiAccountRuntimeBlockGeneration.Load(account.ID); ok {
+		generation, _ = rawGeneration.(uint64)
+	}
+	currentReason := ""
+	if rawReason, ok := s.openaiAccountRuntimeBlockReason.Load(account.ID); ok {
+		currentReason = strings.TrimSpace(fmt.Sprint(rawReason))
+	}
+	// Re-check the same state under the lock immediately before deletion.  The
+	// lock makes this a generation/deadline CAS against a concurrent transport
+	// failure or a fresh 429 transition.
+	currentRaw, currentOK := s.openaiAccountRuntimeBlockUntil.Load(account.ID)
+	currentUntil, currentTimeOK := currentRaw.(time.Time)
+	if !currentOK || !currentTimeOK || !currentUntil.Equal(until) {
+		mu.Unlock()
+		return
+	}
+	var guardConns []*openAIWSConn
+	if currentReason == "429" {
+		// A durable recovery makes the account eligible for ordinary requests
+		// again.  Permanent guard pins are continuation-only reservations; leave
+		// one behind and hasOpenAI429GuardReservation would keep every ordinary
+		// scheduler candidate filtered even after this CAS succeeds.  Detach
+		// under the runtime transition, then close after releasing the lock.
+		if pool := s.existingOpenAIWSConnPool(); pool != nil {
+			guardConns = pool.detachGuardConns(account.ID)
+		}
+	}
+	s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
+	s.openaiAccountRuntimeBlockReason.Delete(account.ID)
+	s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+	s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
+	s.openaiOAuth429RetryStartedAt.Delete(account.ID)
+	nextGeneration := s.openaiAccountRuntimeBlockSequence.Add(1)
+	if generation >= nextGeneration {
+		// The sequence is process-local and normally strictly increasing.  Keep
+		// the stored value monotonic even for a wrapped/custom test sequence.
+		nextGeneration = generation + 1
+	}
+	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, nextGeneration)
+	mu.Unlock()
+	// Do not clear the two-strike confirmation here.  A new 429 can arrive
+	// immediately after this observer releases the runtime lock; clearing the
+	// distributed streak after that point would erase the newer confirmation.
+	// Explicit administrator recovery still clears the streak through the
+	// existing ClearAccountSchedulingBlock path.
+	closeOpenAIWSConns(guardConns)
+}
+
+// ReconcileOpenAIAccountRuntimeBlockEvent is the scheduler-facing, payload-aware
+// entrypoint.  Only an explicit durable-clear marker may retire a local block;
+// ordinary account updates (quota snapshots, proxy/name edits, etc.) are not
+// sufficient evidence because they can advance UpdatedAt after a failed block
+// write.  The legacy method above remains available for direct/admin recovery
+// and focused integrations that already know a clear occurred.
+func (s *OpenAIGatewayService) ReconcileOpenAIAccountRuntimeBlockEvent(account *Account, observedAt time.Time, payload map[string]any) {
+	if !SchedulerRuntimeBlockClearRequested(payload) {
+		return
+	}
+	s.ReconcileOpenAIAccountRuntimeBlock(account, observedAt)
+}
+
 func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	if s == nil || accountID <= 0 {
 		return
@@ -677,6 +826,7 @@ func (s *OpenAIGatewayService) ClearAccountSchedulingBlock(accountID int64) {
 	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
 	s.openaiAccountRuntimeBlockReason.Delete(accountID)
 	s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(accountID)
+	s.openaiAccountRuntimeBlockInstalledAt.Delete(accountID)
 	s.openaiOAuth429RetryStartedAt.Delete(accountID)
 	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
 	mu.Unlock()
@@ -699,6 +849,7 @@ func (s *OpenAIGatewayService) clearAllOpenAIRuntimeBlockState() {
 	clear(&s.openaiAccountRuntimeBlockUntil)
 	clear(&s.openaiAccountRuntimeBlockReason)
 	clear(&s.openaiAccountRuntimeBlockObservedUpdatedAt)
+	clear(&s.openaiAccountRuntimeBlockInstalledAt)
 	clear(&s.openaiAccountRuntimeBlockLocks)
 	clear(&s.openaiAccountRuntimeBlockGeneration)
 	clear(&s.openaiOAuth429RetryStartedAt)
@@ -716,6 +867,7 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 			s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 			s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 			s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+			s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
 			s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 			return s.hasOpenAI429GuardReservation(account)
 		}
@@ -729,6 +881,7 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 		s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+		s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 		return s.hasOpenAI429GuardReservation(account)
 	}
@@ -738,6 +891,7 @@ func (s *OpenAIGatewayService) isOpenAIAccountRuntimeBlocked(account *Account) b
 	s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 	s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 	s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+	s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
 	s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 	return s.hasOpenAI429GuardReservation(account)
 }
@@ -781,6 +935,7 @@ func (s *OpenAIGatewayService) openAI429GuardRuntimeBlockUntil(account *Account)
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 		s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+		s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, s.openaiAccountRuntimeBlockSequence.Add(1))
 		return time.Time{}, false
 	}
@@ -905,6 +1060,7 @@ func (s *OpenAIGatewayService) peekOpenAIAccountRuntimeBlock(account *Account) o
 		s.openaiAccountRuntimeBlockUntil.Delete(account.ID)
 		s.openaiAccountRuntimeBlockReason.Delete(account.ID)
 		s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(account.ID)
+		s.openaiAccountRuntimeBlockInstalledAt.Delete(account.ID)
 		s.openaiOAuth429RetryStartedAt.Delete(account.ID)
 		generation := s.openaiAccountRuntimeBlockSequence.Add(1)
 		s.openaiAccountRuntimeBlockGeneration.Store(account.ID, generation)
@@ -942,6 +1098,7 @@ func (s *OpenAIGatewayService) clearOpenAIAccountRuntimeBlockIfUnchanged(account
 	s.openaiAccountRuntimeBlockUntil.Delete(accountID)
 	s.openaiAccountRuntimeBlockReason.Delete(accountID)
 	s.openaiAccountRuntimeBlockObservedUpdatedAt.Delete(accountID)
+	s.openaiAccountRuntimeBlockInstalledAt.Delete(accountID)
 	s.openaiOAuth429RetryStartedAt.Delete(accountID)
 	s.openaiAccountRuntimeBlockGeneration.Store(accountID, s.openaiAccountRuntimeBlockSequence.Add(1))
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
@@ -19,8 +21,15 @@ import (
 
 type openAIWSRateLimitSignalRepo struct {
 	stubOpenAIAccountRepo
-	rateLimitCalls []time.Time
-	updateExtra    []map[string]any
+	rateLimitCalls      []time.Time
+	modelRateLimitCalls []openAIWSModelRateLimitCall
+	updateExtra         []map[string]any
+}
+
+type openAIWSModelRateLimitCall struct {
+	model   string
+	resetAt time.Time
+	reason  string
 }
 
 type openAICodexSnapshotAsyncRepo struct {
@@ -37,6 +46,28 @@ type openAICodexExtraListRepo struct {
 func (r *openAIWSRateLimitSignalRepo) SetRateLimited(_ context.Context, _ int64, resetAt time.Time) error {
 	r.rateLimitCalls = append(r.rateLimitCalls, resetAt)
 	return nil
+}
+
+func (r *openAIWSRateLimitSignalRepo) SetModelRateLimit(_ context.Context, _ int64, model string, resetAt time.Time, reason ...string) error {
+	call := openAIWSModelRateLimitCall{model: model, resetAt: resetAt}
+	if len(reason) > 0 {
+		call.reason = reason[0]
+	}
+	r.modelRateLimitCalls = append(r.modelRateLimitCalls, call)
+	return nil
+}
+
+// openAIWSSparkHandshake429Dialer models the real WS dialer contract: a
+// handshake can return a status and quota headers while carrying no JSON body.
+// This is the exact shape that previously lost the Spark model name.
+type openAIWSSparkHandshake429Dialer struct {
+	headers http.Header
+}
+
+func (d *openAIWSSparkHandshake429Dialer) Dial(context.Context, string, http.Header, string) (openAIWSClientConn, int, http.Header, error) {
+	return nil, http.StatusTooManyRequests, cloneHeader(d.headers), &openAIWSHandshakeError{
+		Err: errors.New("upstream websocket handshake returned 429"),
+	}
 }
 
 func (r *openAIWSRateLimitSignalRepo) UpdateExtra(_ context.Context, _ int64, updates map[string]any) error {
@@ -460,6 +491,113 @@ func TestOpenAIGatewayService_Forward_WSv2Handshake429PersistsRateLimit(t *testi
 	require.Len(t, repo.rateLimitCalls, 1)
 	require.NotEmpty(t, repo.updateExtra, "握手 429 的 x-codex 头应立即落库")
 	require.Contains(t, repo.updateExtra[0], "codex_usage_updated_at")
+}
+
+func TestOpenAIGatewayService_Forward_WSv2SparkHandshake429KeepsModelScope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	quotaHeaders := http.Header{}
+	quotaHeaders.Set("x-codex-primary-used-percent", "100")
+	quotaHeaders.Set("x-codex-primary-reset-after-seconds", "604800")
+	quotaHeaders.Set("x-codex-primary-window-minutes", "10080")
+	quotaHeaders.Set("x-codex-secondary-used-percent", "20")
+	quotaHeaders.Set("x-codex-secondary-reset-after-seconds", "1800")
+	quotaHeaders.Set("x-codex-secondary-window-minutes", "300")
+
+	account := Account{
+		ID:          6501,
+		Name:        "openai-spark-handshake-429",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token":       "access-token",
+			"chatgpt_account_id": "chatgpt-account",
+		},
+		Extra: map[string]any{
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	openAITestAccountWithProxy(&account)
+	repo := &openAIWSRateLimitSignalRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
+	rateSvc := NewRateLimitService(repo, nil, cfg, nil, nil)
+
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(&openAIWSSparkHandshake429Dialer{headers: quotaHeaders})
+	defer pool.Close()
+
+	svc := &OpenAIGatewayService{
+		accountRepo:      repo,
+		rateLimitService: rateSvc,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		cfg:              cfg,
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+	recoveryTried := false
+	result, err := svc.forwardOpenAIWSV2(
+		context.Background(), c, &account,
+		map[string]any{
+			"model":  "gpt-5.3-codex-spark",
+			"stream": false,
+			"input":  []any{map[string]any{"type": "input_text", "text": "hello"}},
+		},
+		"", "access-token",
+		OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+		true, false,
+		"gpt-5.3-codex-spark", "gpt-5.3-codex-spark",
+		time.Now(), 1, "", &recoveryTried,
+	)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Empty(t, repo.rateLimitCalls, "Spark handshake 429 must not persist an account-level cooldown")
+	require.Len(t, repo.modelRateLimitCalls, 1)
+	require.Equal(t, "gpt-5.3-codex-spark", repo.modelRateLimitCalls[0].model)
+	require.Equal(t, openAICodexSparkRateLimitReason, repo.modelRateLimitCalls[0].reason)
+	require.Greater(t, time.Until(repo.modelRateLimitCalls[0].resetAt), 6*24*time.Hour)
+}
+
+func TestPersistOpenAIWSRateLimitSignalForModel_SparkHandshakeWithoutBody(t *testing.T) {
+	// This helper is shared by ingress, pooled v2 Forward, and the v2
+	// passthrough adapter. Keep the no-body handshake shape here so a future
+	// call-site refactor cannot silently fall back to body-only model discovery.
+	account := &Account{ID: 6502, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	repo := &openAIWSRateLimitSignalRepo{}
+	rateSvc := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	svc := &OpenAIGatewayService{rateLimitService: rateSvc}
+
+	headers := http.Header{}
+	headers.Set("x-codex-primary-used-percent", "100")
+	headers.Set("x-codex-primary-reset-after-seconds", "604800")
+	headers.Set("x-codex-primary-window-minutes", "10080")
+
+	svc.persistOpenAIWSRateLimitSignalForModel(
+		context.Background(), account, headers, nil,
+		"rate_limit_exceeded", "rate_limit_error", "handshake returned 429",
+		"gpt-5.3-codex-spark", http.StatusTooManyRequests,
+	)
+
+	require.Empty(t, repo.rateLimitCalls)
+	require.Len(t, repo.modelRateLimitCalls, 1)
+	require.Equal(t, "gpt-5.3-codex-spark", repo.modelRateLimitCalls[0].model)
+	require.Equal(t, openAICodexSparkRateLimitReason, repo.modelRateLimitCalls[0].reason)
 }
 
 func TestOpenAIGatewayService_Forward_WSv2Handshake502RecordsModelTransient(t *testing.T) {

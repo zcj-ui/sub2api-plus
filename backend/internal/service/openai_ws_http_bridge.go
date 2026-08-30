@@ -115,6 +115,173 @@ func (s *OpenAIGatewayService) shouldBridgeOpenAIWSHTTP(account *Account, payloa
 	return threshold > 0 && int64(payloadBytes) >= threshold
 }
 
+// shouldBridgeOpenAIWSPassthroughFirstMessage decides whether the first frame
+// of a WS-v2 passthrough session can safely be converted to the HTTP bridge.
+//
+// Passthrough normally forwards frames byte-for-byte.  A frame larger than the
+// websocket relay's practical limit can instead use the HTTP bridge, but only
+// for an initial response.create request.  In particular, a continuation must
+// remain on the websocket because the HTTP bridge cannot preserve its
+// previous_response_id affinity.  Do not use a permissive gjson lookup here:
+// duplicate or malformed critical fields must not accidentally turn a
+// continuation into a new request.
+func (s *OpenAIGatewayService) shouldBridgeOpenAIWSPassthroughFirstMessage(account *Account, payload []byte) bool {
+	if account != nil && account.Platform == PlatformGrok {
+		return true
+	}
+	if !s.openAIWSHTTPBridgeEnabled() || int64(len(payload)) < s.openAIWSHTTPBridgeThresholdBytes() {
+		return false
+	}
+	if !json.Valid(payload) {
+		return false
+	}
+
+	i := skipOpenAIWSJSONSpace(payload, 0)
+	if i >= len(payload) || payload[i] != '{' {
+		return false
+	}
+	i++
+	eventType := "response.create"
+	previousResponseID := ""
+	typeSeen, previousResponseIDSeen := false, false
+	for {
+		i = skipOpenAIWSJSONSpace(payload, i)
+		if i >= len(payload) {
+			return false
+		}
+		if payload[i] == '}' {
+			break
+		}
+		keyStart := i
+		if payload[i] != '"' {
+			return false
+		}
+		keyEnd := scanOpenAIWSJSONString(payload, keyStart)
+		if keyEnd <= keyStart || keyEnd > len(payload) {
+			return false
+		}
+		i = skipOpenAIWSJSONSpace(payload, keyEnd)
+		if i >= len(payload) || payload[i] != ':' {
+			return false
+		}
+		i++
+		i = skipOpenAIWSJSONSpace(payload, i)
+		if i >= len(payload) {
+			return false
+		}
+		valueStart := i
+		i = skipOpenAIWSJSONValue(payload, i)
+		if i <= valueStart || i > len(payload) {
+			return false
+		}
+
+		key := ""
+		// Critical keys are short.  Bound the encoded spelling before decoding
+		// escaped keys so an attacker cannot force an unbounded allocation.
+		if keyEnd-keyStart <= 128 {
+			_ = json.Unmarshal(payload[keyStart:keyEnd], &key)
+		}
+		switch key {
+		case "type":
+			if typeSeen {
+				return false
+			}
+			typeSeen = true
+			var value *string
+			if err := json.Unmarshal(payload[valueStart:i], &value); err != nil {
+				return false
+			}
+			if value == nil || strings.TrimSpace(*value) == "" {
+				eventType = "response.create"
+			} else {
+				eventType = strings.TrimSpace(*value)
+			}
+		case "previous_response_id":
+			if previousResponseIDSeen {
+				return false
+			}
+			previousResponseIDSeen = true
+			var value *string
+			if err := json.Unmarshal(payload[valueStart:i], &value); err != nil {
+				return false
+			}
+			if value != nil {
+				previousResponseID = strings.TrimSpace(*value)
+			}
+		}
+		i = skipOpenAIWSJSONSpace(payload, i)
+		if i >= len(payload) {
+			return false
+		}
+		if payload[i] == ',' {
+			i++
+			continue
+		}
+		if payload[i] != '}' {
+			return false
+		}
+		break
+	}
+	return eventType == "response.create" && previousResponseID == ""
+}
+
+func skipOpenAIWSJSONSpace(payload []byte, i int) int {
+	for i < len(payload) {
+		switch payload[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+func scanOpenAIWSJSONString(payload []byte, i int) int {
+	if i >= len(payload) || payload[i] != '"' {
+		return i
+	}
+	for i++; i < len(payload); i++ {
+		switch payload[i] {
+		case '\\':
+			i++
+		case '"':
+			return i + 1
+		}
+	}
+	return len(payload)
+}
+
+func skipOpenAIWSJSONValue(payload []byte, i int) int {
+	if i >= len(payload) {
+		return i
+	}
+	if payload[i] == '"' {
+		return scanOpenAIWSJSONString(payload, i)
+	}
+	if payload[i] != '{' && payload[i] != '[' {
+		for i < len(payload) && payload[i] != ',' && payload[i] != '}' {
+			i++
+		}
+		return i
+	}
+	depth := 0
+	for ; i < len(payload); i++ {
+		switch payload[i] {
+		case '"':
+			i = scanOpenAIWSJSONString(payload, i) - 1
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(payload)
+}
+
 func prepareOpenAIWSHTTPBridgeBody(account *Account, payload []byte) ([]byte, error) {
 	var body map[string]any
 	if err := decodeOpenAIJSONUseNumber(payload, &body); err != nil {
@@ -438,7 +605,16 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, openAIWSHTTPBridgeErrorBodyLimitBytes))
 		_ = resp.Body.Close()
-		retryBody, retryReason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody)
+		var retryBody []byte
+		var retryReason string
+		var changed bool
+		var retryErr error
+		if account.IsOpenAIOAuth() && isChatGPTInternalCodexEndpointForAccount(account, upstreamReq.URL.String()) {
+			retryBody, retryReason, changed, retryErr = normalizeOpenAIChatGPTOptionalRejectedFieldRetryBody(resp.StatusCode, body, respBody)
+		}
+		if !changed && retryErr == nil {
+			retryBody, retryReason, changed, retryErr = normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody)
+		}
 		if retryErr != nil {
 			return nil, fmt.Errorf("normalize websocket http bridge rejected field retry: %w", retryErr)
 		}
@@ -502,7 +678,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	pendingClientMessageBytes := int64(0)
 	capacityFailoverSuppressedLogged := false
 	clientDisconnected := false
-	rateLimitSignalHandled := false
+	rateLimitSignalTracker := &openAIWSRateLimitSignalTracker{}
 	officialOpenAIResponses := account != nil && account.Platform == PlatformOpenAI
 	bareErrorPending := false
 	var bareErrorPayload []byte
@@ -519,15 +695,19 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 	}
 	recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
-		if !isRateLimit || rateLimitSignalHandled {
-			return isRateLimit
+		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
+		isRateLimit, applySideEffect := rateLimitSignalTracker.observe(isRateLimit, explicit429)
+		if !isRateLimit {
+			return false
+		}
+		if !applySideEffect {
+			return true
 		}
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
 			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, resp.Header, responseBody, canonicalOpenAIAccountSchedulingModel(account, originalModel))
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, resp.Header, responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
+			s.persistOpenAIWSRateLimitSignalForModel(ctx, account, resp.Header, responseBody, codeRaw, errTypeRaw, errMsgRaw, canonicalOpenAIAccountSchedulingModel(account, originalModel), upstreamStatus)
 		}
-		rateLimitSignalHandled = true
 		return true
 	}
 
@@ -535,6 +715,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 		imageCount := imageCounter.Count()
 		result := &OpenAIForwardResult{
 			RequestID:                     responseID,
+			ResponseID:                    responseID,
 			Usage:                         usage,
 			Model:                         originalModel,
 			UpstreamModel:                 mappedModel,
@@ -758,7 +939,7 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 					// count the same request twice and freeze the account.
 					return nil, s.newOpenAIWSRateLimitFailoverError(account, resp.Header, upstreamMessage, errMessage)
 				}
-				return nil, s.newOpenAIStreamFailoverError(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, resp.Header)
+				return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, true, resp.Header.Get("x-request-id"), upstreamMessage, errMessage, mappedModel, resp.Header)
 			}
 			if account.Platform != PlatformGrok && !failureAccountSideEffectsApplied {
 				if !isRateLimit && (eventType == "response.failed" || (!officialOpenAIResponses && shouldFailover && !requestScopedCapacity)) {
@@ -801,13 +982,14 @@ func (s *OpenAIGatewayService) proxyOpenAIWSHTTPBridgeTurn(
 				isOpenAIWSTerminalEvent(eventType)
 			if stageBeforeSemanticOutput && !commitStagedMessages {
 				if pendingClientMessageBytes+int64(len(clientMessage)) > openAIFirstOutputStageMaxBytes {
-					return nil, s.newOpenAIStreamFailoverError(
+					return nil, s.newOpenAIStreamFailoverErrorWithModel(
 						c,
 						account,
 						true,
 						resp.Header.Get("x-request-id"),
 						nil,
 						"OpenAI WS HTTP bridge first-output staging limit exceeded",
+						mappedModel,
 						resp.Header,
 					)
 				}

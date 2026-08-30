@@ -24,6 +24,14 @@ type FrameConn interface {
 	Close() error
 }
 
+// PingableFrameConn is implemented by WebSocket adapters that can send a
+// control-frame Ping and wait for its Pong.  Keeping it optional preserves the
+// relay's support for lightweight frame fakes and transports without control
+// frame APIs.
+type PingableFrameConn interface {
+	Ping(ctx context.Context) error
+}
+
 type Usage struct {
 	InputTokens              int
 	OutputTokens             int
@@ -77,16 +85,23 @@ type RelayOptions struct {
 	TakeNextTurnStartedAt           func() time.Time
 	FirstMessageType                coderws.MessageType
 	FirstMessageSent                bool
+	FailOnInitialUpstreamDisconnect bool
 	StartClientAfterFirstDownstream bool
 	OnUsageParseFailure             func(eventType string, usageRaw string)
 	OnTurnComplete                  func(turn RelayTurnResult)
 	BeforeWriteClient               func(msgType coderws.MessageType, payload []byte, wroteDownstream bool) error
 	BeforeClientWrite               func(msgType coderws.MessageType, payload []byte)
 	AfterClientWrite                func(msgType coderws.MessageType, payload []byte, writeErr error)
-	BeforeRelayCancel               func(exit RelayExit)
-	ReadClientFrame                 func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
-	OnTrace                         func(event RelayTraceEvent)
-	Now                             func() time.Time
+	// DownstreamPing is an optional control-frame keepalive for the client
+	// WebSocket. It is armed only after the first successful downstream data
+	// write and runs while that connection remains active.
+	DownstreamPing         func(context.Context) error
+	DownstreamPingInterval time.Duration
+	DownstreamPingTimeout  time.Duration
+	BeforeRelayCancel      func(exit RelayExit)
+	ReadClientFrame        func(ctx context.Context, clientConn FrameConn) (coderws.MessageType, []byte, error)
+	OnTrace                func(event RelayTraceEvent)
+	Now                    func() time.Time
 }
 
 type RelayTraceEvent struct {
@@ -270,6 +285,31 @@ func Relay(
 	exitCh := make(chan relayExitSignal, 3)
 	dropDownstreamWrites := atomic.Bool{}
 	clientReaderStarted := atomic.Bool{}
+	downstreamKeepaliveStarted := atomic.Bool{}
+	lastDownstreamWrite := atomic.Int64{}
+	downstreamPing := options.DownstreamPing
+	if downstreamPing == nil {
+		if pingable, ok := clientConn.(PingableFrameConn); ok {
+			downstreamPing = pingable.Ping
+		}
+	}
+	startDownstreamKeepalive := func() {
+		if downstreamPing == nil || options.DownstreamPingInterval <= 0 ||
+			!downstreamKeepaliveStarted.CompareAndSwap(false, true) {
+			return
+		}
+		lastDownstreamWrite.Store(nowFn().UnixNano())
+		go runDownstreamKeepalive(
+			relayCtx,
+			nowFn,
+			downstreamPing,
+			options.DownstreamPingInterval,
+			options.DownstreamPingTimeout,
+			&lastDownstreamWrite,
+			onTrace,
+			exitCh,
+		)
+	}
 	startClientReader := func() {
 		if !clientReaderStarted.CompareAndSwap(false, true) {
 			return
@@ -293,7 +333,15 @@ func Relay(
 			options.OnTurnComplete,
 			options.BeforeWriteClient,
 			options.BeforeClientWrite,
-			options.AfterClientWrite,
+			func(msgType coderws.MessageType, payload []byte, writeErr error) {
+				if options.AfterClientWrite != nil {
+					options.AfterClientWrite(msgType, payload, writeErr)
+				}
+				if writeErr == nil {
+					lastDownstreamWrite.Store(nowFn().UnixNano())
+					startDownstreamKeepalive()
+				}
+			},
 			func(msgType coderws.MessageType, payload []byte) {
 				if options.StartClientAfterFirstDownstream {
 					startClientReader()
@@ -356,6 +404,19 @@ func Relay(
 			WroteDownstream: secondExit.wroteDownstream,
 			Error:           relayErrorString(secondExit.err),
 		})
+	}
+	if options.FailOnInitialUpstreamDisconnect &&
+		firstExit.stage == "read_upstream" && !combinedWroteDownstream {
+		exitErr := firstExit.err
+		if exitErr == nil {
+			exitErr = io.EOF
+		}
+		// The adapter may immediately redial and reuse the client connection.
+		// Do not let the old upstream relay goroutine (or its late terminal
+		// callback) overlap that retry; the normal cleanup below is skipped by
+		// this early-return branch.
+		<-upstreamDone
+		return result, &RelayExit{Stage: "read_upstream", Err: exitErr}
 	}
 
 	relayCancel()
@@ -632,6 +693,67 @@ func runUpstreamToClient(
 			forwardedFrames.Add(1)
 		}
 		markActivity()
+	}
+}
+
+func runDownstreamKeepalive(
+	ctx context.Context,
+	nowFn func() time.Time,
+	ping func(context.Context) error,
+	interval time.Duration,
+	timeout time.Duration,
+	lastWrite *atomic.Int64,
+	onTrace func(event RelayTraceEvent),
+	exitCh chan<- relayExitSignal,
+) {
+	if ctx == nil || ping == nil || interval <= 0 || exitCh == nil {
+		return
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if lastWrite != nil {
+				last := time.Unix(0, lastWrite.Load())
+				if !last.IsZero() && nowFn().Sub(last) < interval {
+					continue
+				}
+			}
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
+			err := ping(pingCtx)
+			cancel()
+			if err != nil {
+				emitRelayTrace(onTrace, RelayTraceEvent{
+					Stage:           "downstream_ping_failed",
+					Direction:       "downstream_keepalive",
+					Graceful:        true,
+					WroteDownstream: true,
+					Error:           err.Error(),
+				})
+				// Reuse the normal graceful client-disconnect drain path so usage
+				// events already in flight are still consumed from upstream.
+				select {
+				case exitCh <- relayExitSignal{stage: "read_client", err: err, graceful: true, wroteDownstream: true}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			emitRelayTrace(onTrace, RelayTraceEvent{
+				Stage:           "downstream_ping_ok",
+				Direction:       "downstream_keepalive",
+				Graceful:        true,
+				WroteDownstream: true,
+			})
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func newResponsesProbeAccount(id int64) Account {
@@ -142,6 +143,116 @@ func TestProbeOpenAIAPIKeyResponsesSupport_ConclusiveResponsesStillPersist(t *te
 			updates := runResponsesProbe(t, tc.status, tc.body)
 			require.NotNil(t, updates, "能下结论的响应必须落标")
 			require.Equal(t, tc.want, updates[openai_compat.ExtraKeyResponsesSupported])
+		})
+	}
+}
+
+func TestProbeOpenAIAPIKeyResponsesSupport_ModelSpecific404DoesNotVetoOtherMappedModel(t *testing.T) {
+	account := newResponsesProbeAccount(4300)
+	account.Credentials["model_mapping"] = map[string]any{
+		"client-a": "model-a",
+		"client-b": "model-b",
+	}
+	updatesCh := make(chan map[string]any, 1)
+	repo := &snapshotUpdateAccountRepo{
+		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
+		updateExtraCalls:      updatesCh,
+	}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusNotFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"model_not_found","param":"model","message":"The model does not exist"}}`)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":"completed","output":[{"type":"function_call","name":"probe_ping"}]}`)),
+		},
+	}}
+	svc := &AccountTestService{
+		accountRepo:  repo,
+		httpUpstream: upstream,
+		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+	}
+
+	svc.ProbeOpenAIAPIKeyResponsesSupport(context.Background(), account.ID)
+
+	updates := <-updatesCh
+	require.Equal(t, true, updates[openai_compat.ExtraKeyResponsesSupported])
+	require.Len(t, upstream.bodies, 2)
+	require.Equal(t, "model-a", gjson.GetBytes(upstream.bodies[0], "model").String())
+	require.Equal(t, "model-b", gjson.GetBytes(upstream.bodies[1], "model").String())
+}
+
+func TestProbeOpenAIAPIKeyResponsesSupport_AllModelSpecificFailuresKeepUnknown(t *testing.T) {
+	account := newResponsesProbeAccount(4301)
+	account.Credentials["model_mapping"] = map[string]any{
+		"client-a": "model-a",
+		"client-b": "model-b",
+	}
+	updatesCh := make(chan map[string]any, 1)
+	repo := &snapshotUpdateAccountRepo{
+		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
+		updateExtraCalls:      updatesCh,
+	}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusBadRequest,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"model_not_supported","param":"model"}}`)),
+		},
+		{
+			StatusCode: http.StatusNotFound,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"detail":"unknown model"}`)),
+		},
+	}}
+	svc := &AccountTestService{
+		accountRepo:  repo,
+		httpUpstream: upstream,
+		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+	}
+
+	svc.ProbeOpenAIAPIKeyResponsesSupport(context.Background(), account.ID)
+
+	select {
+	case updates := <-updatesCh:
+		t.Fatalf("model-scoped failures must keep account capability unknown, got update %#v", updates)
+	default:
+	}
+	require.Len(t, upstream.bodies, 2)
+}
+
+func TestClearStaleResponsesProbeVerdictIfAutoPreservesExplicitModes(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mode       any
+		wantUpdate bool
+	}{
+		{name: "missing mode clears stale false", mode: nil, wantUpdate: true},
+		{name: "auto clears stale false", mode: string(openai_compat.ResponsesSupportModeAuto), wantUpdate: true},
+		{name: "invalid mode follows auto", mode: "unexpected", wantUpdate: true},
+		{name: "force responses is preserved", mode: string(openai_compat.ResponsesSupportModeForceResponses), wantUpdate: false},
+		{name: "force chat is preserved", mode: string(openai_compat.ResponsesSupportModeForceChatCompletions), wantUpdate: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			updates := make(chan map[string]any, 1)
+			extra := map[string]any{openai_compat.ExtraKeyResponsesSupported: false}
+			if tc.mode != nil {
+				extra[openai_compat.ExtraKeyResponsesMode] = tc.mode
+			}
+			repo := &snapshotUpdateAccountRepo{updateExtraCalls: updates}
+			account := &Account{ID: 99, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Extra: extra}
+			clearStaleResponsesProbeVerdictIfAuto(context.Background(), repo, account)
+			select {
+			case got := <-updates:
+				require.True(t, tc.wantUpdate)
+				require.Contains(t, got, openai_compat.ExtraKeyResponsesSupported)
+				require.Nil(t, got[openai_compat.ExtraKeyResponsesSupported])
+			default:
+				require.False(t, tc.wantUpdate)
+			}
 		})
 	}
 }

@@ -17,7 +17,16 @@ type TestSMTPRequest struct {
 	SMTPPort     int    `json:"smtp_port"`
 	SMTPUsername string `json:"smtp_username"`
 	SMTPPassword string `json:"smtp_password"`
-	SMTPUseTLS   bool   `json:"smtp_use_tls"`
+	// Pointer distinguishes an omitted field (inherit saved settings) from an
+	// explicit false (force plaintext/STARTTLS for this one-off test).
+	SMTPUseTLS *bool `json:"smtp_use_tls"`
+}
+
+func resolveTestSMTPUseTLS(requestValue *bool, savedConfig *service.SMTPConfig) bool {
+	if requestValue != nil {
+		return *requestValue
+	}
+	return savedConfig != nil && savedConfig.UseTLS
 }
 
 // TestSMTPConnection 测试SMTP连接
@@ -64,7 +73,7 @@ func (h *SettingHandler) TestSMTPConnection(c *gin.Context) {
 		Port:     req.SMTPPort,
 		Username: req.SMTPUsername,
 		Password: password,
-		UseTLS:   req.SMTPUseTLS,
+		UseTLS:   resolveTestSMTPUseTLS(req.SMTPUseTLS, savedConfig),
 	}
 
 	err := h.emailService.TestSMTPConnectionWithConfig(config)

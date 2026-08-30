@@ -29,7 +29,7 @@ func TestChannelMonitorV2MatrixHandlerRejectsInvalidGroupBy(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodGet, "/channel-monitor-v2/matrix?group_by=invalid", nil)
-	h := NewChannelMonitorV2Handler(service.NewChannelMonitorV2Service(nil))
+	h := NewChannelMonitorV2Handler(service.NewChannelMonitorV2Service(nil), nil)
 	h.Matrix(c)
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }

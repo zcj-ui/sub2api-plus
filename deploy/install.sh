@@ -636,22 +636,39 @@ download_and_extract() {
         exit 1
     fi
 
-    # Download and verify checksum
+    # Download and verify checksum.  Replacing the running service without a
+    # checksum would turn a release/transport compromise into code execution,
+    # so a missing or malformed checksums.txt is a hard failure.
     print_info "$(msg 'verifying_checksum')"
-    if curl -sL "$checksum_url" -o "$TEMP_DIR/checksums.txt" 2>/dev/null; then
-        local expected_checksum=$(grep "$archive_name" "$TEMP_DIR/checksums.txt" | awk '{print $1}')
-        local actual_checksum=$(sha256sum "$TEMP_DIR/$archive_name" | awk '{print $1}')
-
-        if [ "$expected_checksum" != "$actual_checksum" ]; then
-            print_error "$(msg 'checksum_failed')"
-            print_error "Expected: $expected_checksum"
-            print_error "Actual: $actual_checksum"
-            exit 1
-        fi
-        print_success "$(msg 'checksum_verified')"
-    else
-        print_warning "$(msg 'checksum_not_found')"
+    if ! curl -sL "$checksum_url" --fail -o "$TEMP_DIR/checksums.txt" 2>/dev/null; then
+        print_error "$(msg 'checksum_not_found')"
+        exit 1
     fi
+
+    local expected_checksum
+    expected_checksum=$(awk -v target="$archive_name" '$2 == target {print $1; exit}' "$TEMP_DIR/checksums.txt")
+    if ! [[ "$expected_checksum" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+        print_error "$(msg 'checksum_not_found')"
+        exit 1
+    fi
+
+    local actual_checksum
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_checksum=$(sha256sum "$TEMP_DIR/$archive_name" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_checksum=$(shasum -a 256 "$TEMP_DIR/$archive_name" | awk '{print $1}')
+    else
+        print_error "$(msg 'missing_deps'): sha256sum or shasum"
+        exit 1
+    fi
+
+    if [ "${expected_checksum,,}" != "${actual_checksum,,}" ]; then
+        print_error "$(msg 'checksum_failed')"
+        print_error "Expected: $expected_checksum"
+        print_error "Actual: $actual_checksum"
+        exit 1
+    fi
+    print_success "$(msg 'checksum_verified')"
 
     # Extract
     print_info "$(msg 'extracting')"

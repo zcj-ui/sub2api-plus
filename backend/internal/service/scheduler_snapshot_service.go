@@ -124,6 +124,8 @@ type SchedulerSnapshotService struct {
 	accountRepo                  AccountRepository
 	groupRepo                    GroupRepository
 	cfg                          *config.Config
+	runtimeBlockObserverMu       sync.RWMutex
+	runtimeBlockObserver         SchedulerAccountRuntimeBlockObserver
 	stopCh                       chan struct{}
 	stopOnce                     sync.Once
 	wg                           sync.WaitGroup
@@ -143,6 +145,36 @@ type SchedulerSnapshotService struct {
 	fullRebuildRequested uint64
 	fullRebuildCompleted uint64
 	fullRebuildLastErr   error
+}
+
+// SetAccountRuntimeBlockObserver registers the optional gateway callback used
+// to reconcile process-local OpenAI/Grok runtime blocks.  The scheduler starts
+// before the gateway is constructed in the generated dependency graph, so the
+// callback is installed after construction and guarded for concurrent outbox
+// delivery during startup.
+func (s *SchedulerSnapshotService) SetAccountRuntimeBlockObserver(observer SchedulerAccountRuntimeBlockObserver) {
+	if s == nil {
+		return
+	}
+	s.runtimeBlockObserverMu.Lock()
+	s.runtimeBlockObserver = observer
+	s.runtimeBlockObserverMu.Unlock()
+}
+
+func (s *SchedulerSnapshotService) notifyAccountRuntimeBlockObserver(account *Account, observedAt time.Time, payload map[string]any) {
+	if s == nil || account == nil {
+		return
+	}
+	s.runtimeBlockObserverMu.RLock()
+	observer := s.runtimeBlockObserver
+	s.runtimeBlockObserverMu.RUnlock()
+	if observer != nil {
+		if eventObserver, ok := observer.(SchedulerAccountRuntimeBlockEventObserver); ok {
+			eventObserver.ReconcileOpenAIAccountRuntimeBlockEvent(account, observedAt, payload)
+			return
+		}
+		observer.ReconcileOpenAIAccountRuntimeBlock(account, observedAt)
+	}
 }
 
 func NewSchedulerSnapshotService(
@@ -465,15 +497,19 @@ func (s *SchedulerSnapshotService) cleanupConsumedOutbox(watermark int64) {
 }
 
 func (s *SchedulerSnapshotService) handleOutboxEvent(ctx context.Context, event SchedulerOutboxEvent, seen map[batchSeenKey]struct{}) error {
+	observedAt := event.CreatedAt.UTC()
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 	switch event.EventType {
 	case SchedulerOutboxEventAccountLastUsed:
 		return s.handleLastUsedEvent(ctx, event.Payload)
 	case SchedulerOutboxEventAccountBulkChanged:
-		return s.handleBulkAccountEvent(ctx, event.Payload, seen)
+		return s.handleBulkAccountEventAt(ctx, event.Payload, seen, observedAt)
 	case SchedulerOutboxEventAccountGroupsChanged:
-		return s.handleAccountEvent(ctx, event.AccountID, event.Payload, seen)
+		return s.handleAccountEventAt(ctx, event.AccountID, event.Payload, seen, observedAt)
 	case SchedulerOutboxEventAccountChanged:
-		return s.handleAccountEvent(ctx, event.AccountID, event.Payload, seen)
+		return s.handleAccountEventAt(ctx, event.AccountID, event.Payload, seen, observedAt)
 	case SchedulerOutboxEventGroupChanged:
 		return s.handleGroupEvent(ctx, event.GroupID, seen)
 	case SchedulerOutboxEventFullRebuild:
@@ -510,6 +546,10 @@ func (s *SchedulerSnapshotService) handleLastUsedEvent(ctx context.Context, payl
 }
 
 func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, payload map[string]any, seen map[batchSeenKey]struct{}) error {
+	return s.handleBulkAccountEventAt(ctx, payload, seen, time.Now().UTC())
+}
+
+func (s *SchedulerSnapshotService) handleBulkAccountEventAt(ctx context.Context, payload map[string]any, seen map[batchSeenKey]struct{}, observedAt time.Time) error {
 	if payload == nil {
 		return nil
 	}
@@ -539,6 +579,12 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 	}
 
 	preloadGroupIDs := parseInt64Slice(payload["group_ids"])
+	// The outbox event creation time is the lower bound for this authoritative
+	// read. A runtime block installed after it belongs to a newer request
+	// generation and must not be retired by this older bulk event.
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 	accounts, err := s.accountRepo.GetByIDs(ctx, ids)
 	if err != nil {
 		return err
@@ -557,6 +603,11 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 			continue
 		}
 		found[account.ID] = struct{}{}
+		// Bulk account updates (quota clears, proxy edits, status changes) are
+		// delivered as one event and otherwise bypass handleAccountEvent. Notify
+		// the optional gateway observer for every fresh row so a peer's durable
+		// recovery also retires this process's fast-path block/guard reservation.
+		s.notifyAccountRuntimeBlockObserver(account, observedAt, payload)
 		if s.cache != nil {
 			if err := s.cache.SetAccount(ctx, account); err != nil {
 				return err
@@ -650,6 +701,10 @@ func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, p
 }
 
 func (s *SchedulerSnapshotService) handleAccountEvent(ctx context.Context, accountID *int64, payload map[string]any, seen map[batchSeenKey]struct{}) error {
+	return s.handleAccountEventAt(ctx, accountID, payload, seen, time.Now().UTC())
+}
+
+func (s *SchedulerSnapshotService) handleAccountEventAt(ctx context.Context, accountID *int64, payload map[string]any, seen map[batchSeenKey]struct{}, observedAt time.Time) error {
 	if accountID == nil || *accountID <= 0 {
 		return nil
 	}
@@ -662,6 +717,12 @@ func (s *SchedulerSnapshotService) handleAccountEvent(ctx context.Context, accou
 		groupIDs = parseInt64Slice(payload["group_ids"])
 	}
 
+	// The event creation time is the lower bound before the authoritative DB
+	// read. Any local block installed after it belongs to a newer runtime
+	// generation and the observer must leave it untouched.
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
 	account, err := s.accountRepo.GetByID(ctx, *accountID)
 	if err != nil {
 		if errors.Is(err, ErrAccountNotFound) {
@@ -674,6 +735,11 @@ func (s *SchedulerSnapshotService) handleAccountEvent(ctx context.Context, accou
 		}
 		return err
 	}
+	// accountRepo.GetByID above is the fresh, authoritative row read that
+	// follows the outbox event.  Notify the gateway before rebuilding buckets so
+	// every instance can retire a stale process-local runtime block as soon as
+	// the durable cooldown has been cleared.
+	s.notifyAccountRuntimeBlockObserver(account, observedAt, payload)
 	if s.cache != nil {
 		if err := s.cache.SetAccount(ctx, account); err != nil {
 			return err

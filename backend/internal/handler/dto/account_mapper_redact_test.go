@@ -93,6 +93,27 @@ func TestAccountFromServiceShallow_RedactsOllamaCloudManagedExtra(t *testing.T) 
 	require.Contains(t, src.Extra, service.OllamaCloudUsageSessionExtraKey)
 }
 
+func TestAccountFromServiceShallow_RedactsCodexIdentityAndSchedulerMarkers(t *testing.T) {
+	src := &service.Account{
+		ID:       10,
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Extra: map[string]any{
+			"codex_fingerprint_seed":                       "seed-secret",
+			service.AccountErrorRestoreSchedulableExtraKey: true,
+			"codex_spend_control_snapshot":                 map[string]any{"reached": false},
+		},
+	}
+
+	got := AccountFromServiceShallow(src)
+	require.NotContains(t, got.Extra, "codex_fingerprint_seed")
+	require.NotContains(t, got.Extra, service.AccountErrorRestoreSchedulableExtraKey)
+	require.Contains(t, got.Extra, "codex_spend_control_snapshot")
+	raw, err := json.Marshal(got)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "seed-secret")
+}
+
 func TestAccountFromServiceShallow_NilCredentialsOmitsStatus(t *testing.T) {
 	src := &service.Account{ID: 1, Name: "n", Platform: "anthropic", Type: "oauth"}
 	got := AccountFromServiceShallow(src)

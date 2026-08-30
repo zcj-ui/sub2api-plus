@@ -71,6 +71,38 @@ func (r schedulerTestOpenAIAccountRepo) ListSchedulableUngroupedByPlatform(ctx c
 	return r.ListSchedulableByPlatform(ctx, platform)
 }
 
+func (r schedulerTestOpenAIAccountRepo) ListModelAvailabilityCandidates(_ context.Context, groupID *int64, platforms []string, includeGrouped bool) ([]Account, error) {
+	platformSet := make(map[string]struct{}, len(platforms))
+	for _, platform := range platforms {
+		platformSet[platform] = struct{}{}
+	}
+	result := make([]Account, 0, len(r.accounts))
+	for _, account := range r.accounts {
+		if account.Status != StatusActive || !account.Schedulable {
+			continue
+		}
+		if len(platformSet) > 0 {
+			if _, ok := platformSet[account.Platform]; !ok {
+				continue
+			}
+		}
+		if groupID != nil {
+			// Most scheduler fixtures predate the model-availability repository
+			// method and intentionally omit group metadata. Keep those fixtures
+			// eligible for a synthetic group, while still exercising real group
+			// filtering whenever metadata is present.
+			hasGroupMetadata := len(account.GroupIDs) > 0 || len(account.AccountGroups) > 0
+			if hasGroupMetadata && !openAIStickyAccountMatchesGroup(&account, groupID) {
+				continue
+			}
+		} else if !includeGrouped && (len(account.GroupIDs) > 0 || len(account.AccountGroups) > 0) {
+			continue
+		}
+		result = append(result, account)
+	}
+	return result, nil
+}
+
 type schedulerGroupAwareOpenAIAccountRepo struct {
 	schedulerTestOpenAIAccountRepo
 }

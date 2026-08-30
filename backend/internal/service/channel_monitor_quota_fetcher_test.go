@@ -531,6 +531,94 @@ func TestQuotaFetcher_CachesFailureSnapshotWithShortTTL(t *testing.T) {
 	require.Equal(t, 2, usage.getCalls(), "expired negative cache should refetch")
 }
 
+func TestQuotaFetcher_CacheExpiryDeletesEntryAtBoundary(t *testing.T) {
+	fetcher, _, _, _, _ := newQuotaFetcherTestSetup(t)
+	snapshot := &domain.MonitorQuotaSnapshot{Success: true}
+	expiresAt := time.Unix(1_700_000_000, 0)
+	fetcher.cache[99] = monitorQuotaCacheEntry{snapshot: snapshot, expiry: expiresAt}
+
+	got, ok := fetcher.cachedSnapshot(99, expiresAt)
+	require.False(t, ok)
+	require.Nil(t, got)
+	_, stillPresent := fetcher.cache[99]
+	require.False(t, stillPresent, "expired entries should be removed while checking")
+}
+
+func TestQuotaFetcher_NilContextInvalidIDAndNilCacheAreSafe(t *testing.T) {
+	fetcher, usage, _, _, accounts := newQuotaFetcherTestSetup(t)
+	accounts.accounts[31] = &Account{ID: 31, Platform: domain.PlatformOpenAI}
+	usage.usage = &UsageInfo{}
+	fetcher.cache = nil
+
+	snapshot := fetcher.Fetch(nil, 31)
+	require.True(t, snapshot.Success)
+	require.Equal(t, 1, usage.getCalls())
+	require.NotNil(t, fetcher.cache)
+
+	invalid := fetcher.Fetch(nil, 0)
+	require.False(t, invalid.Success)
+	require.Equal(t, "invalid account id", invalid.Error)
+	require.Equal(t, 1, accounts.calls, "invalid IDs must not query the repository")
+}
+
+func TestQuotaFetcher_NilCNSourceResultYieldsErrorSnapshot(t *testing.T) {
+	t.Run("quota", func(t *testing.T) {
+		fetcher, _, cnQuota, _, accounts := newQuotaFetcherTestSetup(t)
+		accounts.accounts[32] = &Account{ID: 32, Platform: domain.PlatformKimi, Credentials: map[string]any{"account_mode": AccountModeCoding}}
+		cnQuota.result = nil
+		snapshot := fetcher.Fetch(context.Background(), 32)
+		require.False(t, snapshot.Success)
+		require.Equal(t, "cn quota service returned no data", snapshot.Error)
+	})
+	t.Run("balance", func(t *testing.T) {
+		fetcher, _, _, cnBalance, accounts := newQuotaFetcherTestSetup(t)
+		accounts.accounts[33] = &Account{ID: 33, Platform: domain.PlatformKimi, Credentials: map[string]any{"account_mode": AccountModePayG}}
+		cnBalance.result = nil
+		snapshot := fetcher.Fetch(context.Background(), 33)
+		require.False(t, snapshot.Success)
+		require.Equal(t, "cn balance service returned no data", snapshot.Error)
+	})
+}
+
+func TestQuotaFetcher_CacheIsBounded(t *testing.T) {
+	fetcher, _, _, _, _ := newQuotaFetcherTestSetup(t)
+	now := time.Now()
+	for i := 1; i <= monitorQuotaCacheMaxEntries+1; i++ {
+		fetcher.storeSnapshot(int64(i), &domain.MonitorQuotaSnapshot{Success: true}, now.Add(time.Hour))
+	}
+	require.LessOrEqual(t, len(fetcher.cache), monitorQuotaCacheMaxEntries)
+}
+
+func TestQuotaFetcher_InvalidateDropsSnapshotAndForcesRefetch(t *testing.T) {
+	fetcher, usage, _, _, accounts := newQuotaFetcherTestSetup(t)
+	accounts.accounts[34] = &Account{ID: 34, Platform: domain.PlatformOpenAI}
+	usage.usage = &UsageInfo{}
+
+	require.True(t, fetcher.Fetch(context.Background(), 34).Success)
+	require.Equal(t, 1, usage.getCalls())
+	fetcher.Invalidate(34)
+	require.True(t, fetcher.Fetch(context.Background(), 34).Success)
+	require.Equal(t, 2, usage.getCalls(), "invalidated account must query the source again")
+}
+
+func TestQuotaFetcher_InvalidatePreventsInFlightWriteback(t *testing.T) {
+	fetcher, usage, _, _, accounts := newQuotaFetcherTestSetup(t)
+	accounts.accounts[35] = &Account{ID: 35, Platform: domain.PlatformOpenAI}
+	usage.usage = &UsageInfo{}
+	usage.block = make(chan struct{})
+
+	done := make(chan *domain.MonitorQuotaSnapshot, 1)
+	go func() { done <- fetcher.Fetch(context.Background(), 35) }()
+	require.Eventually(t, func() bool { return usage.getCalls() == 1 }, time.Second, 5*time.Millisecond)
+	fetcher.Invalidate(35)
+	close(usage.block)
+	require.True(t, (<-done).Success)
+	fetcher.mu.Lock()
+	_, cached := fetcher.cache[35]
+	fetcher.mu.Unlock()
+	require.False(t, cached, "a fetch started before invalidation must not repopulate stale cache")
+}
+
 func TestQuotaFetcher_ConcurrentFetchesShareSingleFlight(t *testing.T) {
 	fetcher, usage, _, _, accounts := newQuotaFetcherTestSetup(t)
 	accounts.accounts[12] = &Account{ID: 12, Platform: domain.PlatformOpenAI}

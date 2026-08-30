@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -73,6 +74,15 @@ const geminiPrecheckCacheTTL = time.Minute
 const (
 	defaultRateLimit429CooldownSeconds = 5
 	maxRateLimit429CooldownSeconds     = 7200
+	// OpenAI's JSON 429 payload is not a trusted clock.  In particular,
+	// transient `rate_limit_exceeded` responses have occasionally carried the
+	// account's long 5h/7d reset (or an accidentally distant timestamp).  Keep
+	// that path bounded so one malformed response cannot quarantine an account
+	// for months or overflow time.Duration calculations.  A real
+	// `usage_limit_reached` can legitimately point at the weekly window, hence
+	// the wider eight-day allowance (one day of clock/relay skew).
+	maxOpenAIResponseRateLimitResetAfter = 2 * time.Hour
+	maxOpenAIResponseUsageResetAfter     = 8 * 24 * time.Hour
 )
 
 const (
@@ -92,6 +102,9 @@ const (
 	openAI403CooldownMinutesDefault = 10
 	openAI403DisableThreshold       = 3
 	openAI403CounterWindowMinutes   = 180
+	maxOpenAI403CooldownMinutes     = 1440
+	maxOpenAI403DisableThreshold    = 100
+	maxOpenAI403WindowMinutes       = 1440
 )
 
 // NewRateLimitService 创建RateLimitService实例
@@ -1094,6 +1107,23 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		return false
 	}
 
+	// This helper is shared by the custom CN-provider 403 policy. Keep the
+	// configurable switch strictly scoped to OpenAI/Codex; CN providers retain
+	// their existing hard-coded policy and are not affected by this setting.
+	cooldownMinutes := openAI403CooldownMinutesDefault
+	disableThreshold := openAI403DisableThreshold
+	counterWindowMinutes := openAI403CounterWindowMinutes
+	if account != nil && account.Platform == PlatformOpenAI {
+		settings := s.getOpenAI403CooldownSettings(ctx, account)
+		if !settings.Enabled {
+			slog.Info("openai_403_cooldown_disabled_skip_account_penalty", "account_id", account.ID)
+			return false
+		}
+		cooldownMinutes = settings.CooldownMinutes
+		disableThreshold = settings.DisableThreshold
+		counterWindowMinutes = settings.WindowMinutes
+	}
+
 	msg := buildForbiddenErrorMessage(
 		"Access forbidden (403):",
 		upstreamMsg,
@@ -1106,21 +1136,21 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		return true
 	}
 
-	count, err := s.openAI403CounterCache.IncrementOpenAI403Count(ctx, account.ID, openAI403CounterWindowMinutes)
+	count, err := s.openAI403CounterCache.IncrementOpenAI403Count(ctx, account.ID, counterWindowMinutes)
 	if err != nil {
 		slog.Warn("openai_403_increment_failed", "account_id", account.ID, "error", err)
 		s.handleAuthError(ctx, account, msg)
 		return true
 	}
 
-	if count >= openAI403DisableThreshold {
-		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, openAI403DisableThreshold)
+	if count >= int64(disableThreshold) {
+		msg = fmt.Sprintf("%s | consecutive_403=%d/%d", msg, count, disableThreshold)
 		s.handleAuthError(ctx, account, msg)
 		return true
 	}
 
-	until := time.Now().Add(time.Duration(openAI403CooldownMinutesDefault) * time.Minute)
-	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, openAI403DisableThreshold, msg)
+	until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
+	reason := fmt.Sprintf("OpenAI 403 temporary cooldown (%d/%d): %s", count, disableThreshold, msg)
 	s.notifyAccountSchedulingBlocked(account, until, "openai_403_temp")
 	if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, reason); err != nil {
 		slog.Warn("openai_403_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
@@ -1133,9 +1163,26 @@ func (s *RateLimitService) handleOpenAI403(ctx context.Context, account *Account
 		"account_id", account.ID,
 		"until", until,
 		"count", count,
-		"threshold", openAI403DisableThreshold,
+		"threshold", disableThreshold,
+		"cooldown_minutes", cooldownMinutes,
+		"window_minutes", counterWindowMinutes,
 	)
 	return true
+}
+
+func (s *RateLimitService) getOpenAI403CooldownSettings(ctx context.Context, account *Account) *OpenAI403CooldownSettings {
+	if s != nil && s.settingService != nil {
+		settings, err := s.settingService.GetOpenAI403CooldownSettings(ctx)
+		if err == nil && settings != nil {
+			return settings
+		}
+		accountID := int64(0)
+		if account != nil {
+			accountID = account.ID
+		}
+		slog.Warn("openai_403_cooldown_settings_read_failed", "account_id", accountID, "error", err)
+	}
+	return DefaultOpenAI403CooldownSettings()
 }
 
 // handleAntigravity403 处理 Antigravity 平台的 403 错误
@@ -1423,20 +1470,11 @@ func calculateOpenAI429ResetTime(headers http.Header) *time.Time {
 		return &resetAt
 	}
 
-	// 都未达到100%但收到429，使用较长的重置时间
-	var maxResetSecs int
-	if normalized.Reset7dSeconds != nil && *normalized.Reset7dSeconds > maxResetSecs {
-		maxResetSecs = *normalized.Reset7dSeconds
-	}
-	if normalized.Reset5hSeconds != nil && *normalized.Reset5hSeconds > maxResetSecs {
-		maxResetSecs = *normalized.Reset5hSeconds
-	}
-	if maxResetSecs > 0 {
-		resetAt := now.Add(time.Duration(maxResetSecs) * time.Second)
-		slog.Info("openai_429_using_max_reset", "max_reset_seconds", maxResetSecs, "reset_at", resetAt)
-		return &resetAt
-	}
-
+	// Neither window is exhausted.  A 429 with partially-used windows is
+	// commonly a transient RPM/TPM burst limit; the advertised window reset
+	// values describe quota windows, not this short-lived transport throttle.
+	// Returning nil lets handle429 use the bounded fallback cooldown instead of
+	// excluding the account for hours or days.
 	return nil
 }
 
@@ -1778,56 +1816,133 @@ func persistOpenAICodexSnapshotWithRepo(ctx context.Context, repo AccountReposit
 //	  }
 //	}
 func parseOpenAIRateLimitResetTime(body []byte) *int64 {
-	var parsed map[string]any
-	if err := json.Unmarshal(body, &parsed); err != nil {
+	// Decode with UseNumber. The previous float64-based decoder silently
+	// rounded large Unix values and converted NaN/overflowing values to an
+	// implementation-dependent int64, which could create an effectively
+	// permanent account cooldown.
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var parsed map[string]json.RawMessage
+	if err := decoder.Decode(&parsed); err != nil {
 		return nil
 	}
-
-	errObj, ok := parsed["error"].(map[string]any)
-	if !ok {
+	// Reject concatenated JSON documents.  Accepting a valid first object and
+	// silently ignoring an attacker-controlled trailing object makes the reset
+	// decision dependent on transport framing rather than one authoritative body.
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil
 	}
-
-	// 检查是否为已知的账号用量限制类型。
-	errType, _ := errObj["type"].(string)
-	if errType != "usage_limit_reached" && errType != "rate_limit_exceeded" && errType != "GoUsageLimitError" {
+	var errObj map[string]json.RawMessage
+	if raw := parsed["error"]; len(raw) == 0 || json.Unmarshal(raw, &errObj) != nil {
 		return nil
 	}
-
-	// 优先使用 resets_at（Unix 时间戳）
-	if resetsAt, ok := errObj["resets_at"].(float64); ok {
-		ts := int64(resetsAt)
-		return &ts
+	var errType string
+	if raw := errObj["type"]; len(raw) > 0 {
+		_ = json.Unmarshal(raw, &errType)
 	}
-	if resetsAt, ok := errObj["resets_at"].(string); ok {
-		if ts, err := strconv.ParseInt(resetsAt, 10, 64); err == nil {
+	errType = strings.TrimSpace(errType)
+	switch strings.ToLower(errType) {
+	case "usage_limit_reached", "rate_limit_exceeded", "gousagelimiterror":
+	default:
+		return nil
+	}
+	now := time.Now()
+	maxAfter := maxOpenAIResponseUsageResetAfter
+	if strings.EqualFold(errType, "rate_limit_exceeded") {
+		maxAfter = maxOpenAIResponseRateLimitResetAfter
+	}
+
+	// Prefer resets_at (Unix seconds; accept millisecond timestamps emitted by
+	// a few compatibility relays). A timestamp outside the bounded future
+	// window is ignored so the caller falls back to its short 429 cooldown.
+	if raw := errObj["resets_at"]; len(raw) > 0 {
+		if ts, ok := parseBoundedOpenAIResetTimestamp(raw, now, maxAfter); ok {
 			return &ts
 		}
 	}
 
-	// 如果没有 resets_at，尝试使用 resets_in_seconds
-	if resetsInSeconds, ok := errObj["resets_in_seconds"].(float64); ok {
-		ts := time.Now().Unix() + int64(resetsInSeconds)
-		return &ts
-	}
-	if resetsInSeconds, ok := errObj["resets_in_seconds"].(string); ok {
-		if sec, err := strconv.ParseInt(resetsInSeconds, 10, 64); err == nil {
-			ts := time.Now().Unix() + sec
+	// If resets_at is absent/invalid, try resets_in_seconds. Negative values
+	// are rejected; excessively large values are deliberately not clamped to a
+	// fake long cooldown, but treated as an untrusted signal and sent to the
+	// normal bounded fallback path.
+	if raw := errObj["resets_in_seconds"]; len(raw) > 0 {
+		if seconds, ok := parseOpenAIResetSeconds(raw); ok && seconds >= 0 && seconds <= int64(maxAfter/time.Second) {
+			ts := now.Add(time.Duration(seconds) * time.Second).Unix()
 			return &ts
 		}
 	}
 
-	// OpenCode Go subscriptions expose the reset only in a human-readable message,
-	// for example: "Weekly usage limit reached. Resets in 2 days."
-	if errType == "GoUsageLimitError" {
-		message, _ := errObj["message"].(string)
-		if resetAfter := parseOpenCodeGoUsageLimitResetDuration(message); resetAfter > 0 {
-			ts := time.Now().Add(resetAfter).Unix()
+	// OpenCode Go subscriptions expose the reset only in a human-readable
+	// message, for example: "Weekly usage limit reached. Resets in 2 days."
+	if strings.EqualFold(errType, "GoUsageLimitError") {
+		var message string
+		if raw := errObj["message"]; len(raw) > 0 {
+			_ = json.Unmarshal(raw, &message)
+		}
+		if resetAfter := parseOpenCodeGoUsageLimitResetDuration(message); resetAfter > 0 && resetAfter <= maxAfter {
+			ts := now.Add(resetAfter).Unix()
 			return &ts
 		}
 	}
 
 	return nil
+}
+
+// parseBoundedOpenAIResetTimestamp parses a JSON integer/string Unix timestamp
+// and validates its distance from now. Past timestamps remain representable so
+// existing callers can clear an already-expired rate-limit state immediately;
+// only non-positive, malformed, or implausibly distant values are discarded.
+func parseBoundedOpenAIResetTimestamp(raw json.RawMessage, now time.Time, maxAfter time.Duration) (int64, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return 0, false
+	}
+	if len(text) > 0 && text[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return 0, false
+		}
+		text = strings.TrimSpace(value)
+	}
+	// Unix timestamps are integral by contract. Reject decimal/exponent forms
+	// instead of truncating them and accidentally accepting a malformed value.
+	ts, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || ts <= 0 {
+		return 0, false
+	}
+	// Compatibility relays occasionally send milliseconds. Guard the conversion
+	// before dividing so an int64 edge value cannot wrap.
+	if ts > 100_000_000_000 {
+		ts /= 1000
+	}
+	if ts <= 0 {
+		return 0, false
+	}
+	resetAt := time.Unix(ts, 0)
+	if maxAfter > 0 && resetAt.After(now.Add(maxAfter)) {
+		return 0, false
+	}
+	return ts, true
+}
+
+func parseOpenAIResetSeconds(raw json.RawMessage) (int64, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return 0, false
+	}
+	if text[0] == '"' {
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return 0, false
+		}
+		text = strings.TrimSpace(value)
+	}
+	seconds, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
 }
 
 func parseOpenCodeGoUsageLimitResetDuration(message string) time.Duration {
@@ -2313,6 +2428,45 @@ func (s *RateLimitService) HandleOpenAIImageRateLimit(ctx context.Context, accou
 		return true
 	}
 	slog.Info("openai_image_rate_limited", "account_id", account.ID, "scope", openAIImageGenerationRateLimitKey, "reset_at", resetAt, "reset_in", time.Until(resetAt).Truncate(time.Second))
+	return true
+}
+
+// HandleOpenAICodexSparkRateLimit records a Spark-only 429 as a model-scoped
+// cooldown.  The x-codex rate-limit headers describe the Spark meter, not the
+// whole OAuth account; writing them to Account.RateLimitResetAt would wrongly
+// remove the same credential from ordinary Codex models.
+func (s *RateLimitService) HandleOpenAICodexSparkRateLimit(ctx context.Context, account *Account, requestedModel string, statusCode int, headers http.Header, responseBody []byte) bool {
+	if s == nil || account == nil || s.accountRepo == nil || statusCode != http.StatusTooManyRequests || !isOpenAIOAuthAccount(account) {
+		return false
+	}
+	if !isCodexSparkModel(requestedModel) || !account.ShouldHandleErrorCode(statusCode) {
+		return false
+	}
+
+	modelKey := normalizeCodexModel(modelRateLimitKeyForUpstreamModelNotFound(ctx, account, requestedModel))
+	if modelKey == "" {
+		return false
+	}
+	now := time.Now()
+	disposition, resetAt := classifyOpenAIOAuth429(headers, responseBody)
+	// A long reset is trustworthy for Spark only when the corresponding 5h/7d
+	// window is explicitly exhausted.  A transient 429 carrying a generic reset
+	// header receives the short configured cooldown instead.
+	if disposition != openAIOAuth429Quota5h && disposition != openAIOAuth429Quota7d {
+		resetAt = nil
+	}
+	if resetAt == nil || !resetAt.After(now) {
+		cooldown, ok := s.get429FallbackCooldown(ctx, account)
+		if !ok || cooldown <= 0 {
+			cooldown = time.Duration(defaultRateLimit429CooldownSeconds) * time.Second
+		}
+		reset := now.Add(cooldown)
+		resetAt = &reset
+	}
+	if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, modelKey, *resetAt, openAICodexSparkRateLimitReason); err != nil {
+		slog.Warn("openai_codex_spark_model_rate_limit_set_failed", "account_id", account.ID, "model", modelKey, "error", err)
+	}
+	slog.Info("openai_codex_spark_model_rate_limited", "account_id", account.ID, "model", modelKey, "reset_at", *resetAt)
 	return true
 }
 

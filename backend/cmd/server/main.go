@@ -122,8 +122,11 @@ func runSetupServer() {
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           r,
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 * 1024,
 		Protocols:         protocols,
 	}
 

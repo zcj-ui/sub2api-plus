@@ -18,6 +18,45 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestShouldRotateOpenAIWSLeaseBeforeTurn(t *testing.T) {
+	newAgedLease := func() *openAIWSConnLease {
+		conn := newOpenAIWSConn("aged_turn", 901, &openAIWSFakeConn{}, nil)
+		conn.createdAtNano.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+		return &openAIWSConnLease{conn: conn}
+	}
+
+	rotate, err := shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), false, false, false, false)
+	require.True(t, rotate)
+	require.NoError(t, err)
+
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), false, true, false, false)
+	require.False(t, rotate)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "store=false")
+
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), false, false, true, false)
+	require.False(t, rotate)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "previous_response_id")
+
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), false, false, true, true)
+	require.True(t, rotate)
+	require.NoError(t, err)
+
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), false, true, false, true)
+	require.True(t, rotate, "store=false can rotate only with verified replay history")
+	require.NoError(t, err)
+
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(newAgedLease(), true, true, true, false)
+	require.False(t, rotate)
+	require.NoError(t, err)
+
+	fresh := openAIWSConnLease{conn: newOpenAIWSConn("fresh_turn", 901, &openAIWSFakeConn{}, nil)}
+	rotate, err = shouldRotateOpenAIWSLeaseBeforeTurn(&fresh, false, false, false, false)
+	require.False(t, rotate)
+	require.NoError(t, err)
+}
+
 type openAIWSLeaseLossAfterReadConn struct {
 	*openAIWSCaptureConn
 	cancel context.CancelCauseFunc
@@ -334,6 +373,104 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_KeepLeaseAcrossT
 	require.Equal(t, int64(1), metrics.AcquireTotal, "同一 ingress 会话多 turn 应只获取一次上游 lease")
 	require.Equal(t, 1, captureDialer.DialCount(), "同一 ingress 会话应保持同一上游连接")
 	require.Len(t, captureConn.writes, 2, "应向同一上游连接发送两轮 response.create")
+}
+
+func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_CapacityShedFailsOverBeforeClientOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = true
+	cfg.Gateway.OpenAIWS.APIKeyEnabled = true
+	cfg.Gateway.OpenAIWS.ResponsesWebsocketsV2 = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 8
+	cfg.Gateway.OpenAIWS.DialTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.ReadTimeoutSeconds = 3
+	cfg.Gateway.OpenAIWS.WriteTimeoutSeconds = 3
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     &httpUpstreamRecorder{},
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	account := &Account{
+		ID:          115,
+		Name:        "openai-capacity-shed-ingress",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Extra:       map[string]any{"responses_websockets_v2_enabled": true},
+	}
+
+	serverErrCh := make(chan error, 1)
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := coderws.Accept(w, r, &coderws.AcceptOptions{CompressionMode: coderws.CompressionContextTakeover})
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		req := r.Clone(r.Context())
+		req.Header = req.Header.Clone()
+		ginCtx.Request = req
+		msgType, firstMessage, readErr := conn.Read(r.Context())
+		if readErr != nil {
+			serverErrCh <- readErr
+			return
+		}
+		if msgType != coderws.MessageText {
+			serverErrCh <- errors.New("unexpected client message type")
+			return
+		}
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+	}))
+	defer wsServer.Close()
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 3*time.Second)
+	clientConn, _, err := coderws.Dial(dialCtx, "ws"+strings.TrimPrefix(wsServer.URL, "http"), nil)
+	cancelDial()
+	require.NoError(t, err)
+	defer func() { _ = clientConn.CloseNow() }()
+
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), 3*time.Second)
+	require.NoError(t, clientConn.Write(writeCtx, coderws.MessageText, []byte(`{"type":"response.create","model":"gpt-5.5","stream":false,"input":[{"type":"input_text","text":"hello"}]}`)))
+	cancelWrite()
+
+	select {
+	case relayErr := <-serverErrCh:
+		var failoverErr *UpstreamFailoverError
+		require.ErrorAs(t, relayErr, &failoverErr)
+		require.Equal(t, http.StatusServiceUnavailable, failoverErr.StatusCode)
+		require.True(t, failoverErr.RequestScopedTransient)
+		require.True(t, failoverErr.RetryableOnSameAccount)
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待容量降载 failover 超时")
+	}
+	require.Len(t, captureConn.writes, 1, "请求仍应发送到上游一次")
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	_, _, readErr := clientConn.Read(readCtx)
+	cancelRead()
+	require.Error(t, readErr, "failover 返回前不应把上游容量错误事件写给客户端")
 }
 
 func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_RepairsConcatenatedJSONMessage(t *testing.T) {

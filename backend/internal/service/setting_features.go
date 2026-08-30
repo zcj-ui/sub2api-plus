@@ -764,6 +764,98 @@ func (s *SettingService) SetRateLimit429CooldownSettings(ctx context.Context, se
 	return s.settingRepo.Set(ctx, SettingKeyRateLimit429CooldownSettings, string(data))
 }
 
+// GetOpenAI403CooldownSettings returns the account-level OpenAI 403 policy.
+// Missing, empty, malformed, or out-of-range values are normalized so a bad
+// setting never turns a transient upstream response into an unexpected
+// process-wide failure.  Repository errors are returned to the caller, which
+// can then fall back to the historical defaults on the request path.
+func (s *SettingService) GetOpenAI403CooldownSettings(ctx context.Context) (*OpenAI403CooldownSettings, error) {
+	defaults := DefaultOpenAI403CooldownSettings()
+	if s == nil || s.settingRepo == nil {
+		return defaults, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	value, err := s.settingRepo.GetValue(ctx, SettingKeyOpenAI403CooldownSettings)
+	if err != nil {
+		if errors.Is(err, ErrSettingNotFound) {
+			return defaults, nil
+		}
+		return nil, fmt.Errorf("get OpenAI 403 cooldown settings: %w", err)
+	}
+	if strings.TrimSpace(value) == "" {
+		return defaults, nil
+	}
+
+	var settings OpenAI403CooldownSettings
+	if err := json.Unmarshal([]byte(value), &settings); err != nil {
+		return defaults, nil
+	}
+	if settings.CooldownMinutes < 1 {
+		settings.CooldownMinutes = 1
+	}
+	if settings.CooldownMinutes > maxOpenAI403CooldownMinutes {
+		settings.CooldownMinutes = maxOpenAI403CooldownMinutes
+	}
+	if settings.DisableThreshold < 1 {
+		settings.DisableThreshold = 1
+	}
+	if settings.DisableThreshold > maxOpenAI403DisableThreshold {
+		settings.DisableThreshold = maxOpenAI403DisableThreshold
+	}
+	if settings.WindowMinutes < 1 {
+		settings.WindowMinutes = 1
+	}
+	if settings.WindowMinutes > maxOpenAI403WindowMinutes {
+		settings.WindowMinutes = maxOpenAI403WindowMinutes
+	}
+
+	return &settings, nil
+}
+
+// SetOpenAI403CooldownSettings persists the OpenAI 403 policy.  Enabled
+// settings reject invalid values so an accidental typo is visible to the
+// administrator; when disabled, invalid numeric fields are normalized to the
+// historical defaults because they are not active until the switch is enabled.
+func (s *SettingService) SetOpenAI403CooldownSettings(ctx context.Context, settings *OpenAI403CooldownSettings) error {
+	if s == nil || s.settingRepo == nil {
+		return fmt.Errorf("setting repository is unavailable")
+	}
+	if settings == nil {
+		return fmt.Errorf("settings cannot be nil")
+	}
+	defaults := DefaultOpenAI403CooldownSettings()
+	if settings.CooldownMinutes < 1 || settings.CooldownMinutes > maxOpenAI403CooldownMinutes {
+		if settings.Enabled {
+			return fmt.Errorf("cooldown_minutes must be between 1-1440")
+		}
+		settings.CooldownMinutes = defaults.CooldownMinutes
+	}
+	if settings.DisableThreshold < 1 || settings.DisableThreshold > maxOpenAI403DisableThreshold {
+		if settings.Enabled {
+			return fmt.Errorf("disable_threshold must be between 1-100")
+		}
+		settings.DisableThreshold = defaults.DisableThreshold
+	}
+	if settings.WindowMinutes < 1 || settings.WindowMinutes > maxOpenAI403WindowMinutes {
+		if settings.Enabled {
+			return fmt.Errorf("window_minutes must be between 1-1440")
+		}
+		settings.WindowMinutes = defaults.WindowMinutes
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	data, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("marshal OpenAI 403 cooldown settings: %w", err)
+	}
+	return s.settingRepo.Set(ctx, SettingKeyOpenAI403CooldownSettings, string(data))
+}
+
 // GetOpenAIImagesOAuthUnavailableCooldownSettings returns the configured
 // OpenAI OAuth image-tool cooldown.  Missing, empty, malformed, or out-of-range
 // values deliberately fall back to the historical 30-minute default.  A real
@@ -1040,7 +1132,7 @@ func (s *SettingService) SetOpenAIFastPolicySettings(ctx context.Context, settin
 		BetaPolicyScopeAll: true, BetaPolicyScopeOAuth: true, BetaPolicyScopeAPIKey: true, BetaPolicyScopeBedrock: true,
 	}
 	validTiers := map[string]bool{
-		OpenAIFastTierAny: true, OpenAIFastTierPriority: true, OpenAIFastTierFlex: true,
+		OpenAIFastTierAny: true, OpenAIFastTierMissing: true, OpenAIFastTierPriority: true, OpenAIFastTierFlex: true,
 	}
 
 	for i, rule := range settings.Rules {

@@ -312,6 +312,20 @@ func AnalyzeToolCallOutputContextCoverageBytes(body []byte) ToolCallOutputContex
 	return coverage
 }
 
+// CanRebuildOpenAIHTTPContinuationFromInput reports whether an HTTP
+// Responses request can safely drop previous_response_id and still preserve
+// tool-call context from its input. OAuth/SetupToken ChatGPT upstreams do not
+// accept previous_response_id on HTTP, so callers may only route such a
+// continuation to them when every function_call_output has a matching
+// function_call (or item_reference) in the same input payload.
+//
+// A request without tool outputs is deliberately rejected here: a lone
+// follow-up input cannot reconstruct the prior server-side response chain.
+func CanRebuildOpenAIHTTPContinuationFromInput(body []byte) bool {
+	coverage := AnalyzeToolCallOutputContextCoverageBytes(body)
+	return coverage.HasFunctionCallOutput && coverage.ContextCoversAllCallIDs
+}
+
 // ValidateFunctionCallOutputContext 为 handler 提供低开销校验结果：
 // 1) 无工具输出直接返回
 // 2) 若已存在工具调用上下文则提前返回

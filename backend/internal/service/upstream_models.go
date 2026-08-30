@@ -16,6 +16,8 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
+	reqv3 "github.com/imroc/req/v3"
 )
 
 const (
@@ -24,6 +26,8 @@ const (
 	modelsDevRegistryTTL                      = 6 * time.Hour
 	UpstreamModelMetadataExtraKey             = "upstream_model_metadata"
 	UpstreamModelMetadataIncompleteCode       = "upstream_model_metadata_incomplete"
+	openAIModelSyncChromeMaxAttempts          = 2
+	openAIModelSyncChromeRetryDelay           = 300 * time.Millisecond
 )
 
 type UpstreamModelMetadata struct {
@@ -1068,10 +1072,83 @@ func (s *AccountTestService) fetchAntigravityOAuthUpstreamModels(ctx context.Con
 }
 
 func (s *AccountTestService) doUpstreamModelsRequest(req *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+	var (
+		resp *http.Response
+		err  error
+	)
 	if s.tlsFPProfileService == nil {
-		return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, nil)
+		resp, err = s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, nil)
+	} else {
+		resp, err = s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 	}
-	return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+	if err == nil || !shouldRetryOpenAIModelSyncWithChrome(account, err) {
+		return resp, err
+	}
+
+	retry := s.openAIModelSyncChromeRequester
+	if retry == nil {
+		retry = doOpenAIModelSyncChromeRequest
+	}
+	return retryOpenAIModelSyncChromeRequest(req, proxyURL, retry)
+}
+
+func shouldRetryOpenAIModelSyncWithChrome(account *Account, err error) bool {
+	return account != nil && account.IsOpenAIApiKey() && isOpenAIModelSyncRetryableTransportError(err)
+}
+
+func isOpenAIModelSyncRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return (strings.Contains(message, "tls") && strings.Contains(message, "eof")) ||
+		strings.Contains(message, "connection reset by peer")
+}
+
+func retryOpenAIModelSyncChromeRequest(
+	req *http.Request,
+	proxyURL string,
+	retry func(*http.Request, string) (*http.Response, error),
+) (*http.Response, error) {
+	if req == nil || retry == nil {
+		return nil, errors.New("OpenAI model sync Chrome retry is unavailable")
+	}
+	var lastErr error
+	for attempt := 1; attempt <= openAIModelSyncChromeMaxAttempts; attempt++ {
+		resp, err := retry(req.Clone(req.Context()), proxyURL)
+		if err == nil || attempt == openAIModelSyncChromeMaxAttempts || !isOpenAIModelSyncRetryableTransportError(err) {
+			return resp, err
+		}
+		lastErr = err
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		timer := time.NewTimer(openAIModelSyncChromeRetryDelay)
+		select {
+		case <-req.Context().Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, req.Context().Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func doOpenAIModelSyncChromeRequest(req *http.Request, proxyURL string) (*http.Response, error) {
+	client := reqv3.C().SetTimeout(30 * time.Second).ImpersonateChrome()
+	trimmedProxyURL, _, err := proxyurl.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if trimmedProxyURL != "" {
+		client.SetProxyURL(trimmedProxyURL)
+	}
+	return client.Do(req)
 }
 
 func upstreamModelsProxyURL(account *Account) (string, error) {

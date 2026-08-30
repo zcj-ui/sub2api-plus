@@ -18,6 +18,31 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// shouldRotateOpenAIWSLeaseBeforeTurn applies the narrow safety policy used
+// when an ingress session's pooled socket crosses the local retirement line.
+// store=false depends on history held by the old upstream socket, so it must
+// fail closed rather than silently continuing on a fresh connection. For
+// store=true, a previous_response_id requires verified local replay history;
+// otherwise replacing the socket would lose the conversation chain.
+func shouldRotateOpenAIWSLeaseBeforeTurn(
+	lease *openAIWSConnLease,
+	guardContinuation bool,
+	storeDisabled bool,
+	hasPreviousResponseID bool,
+	hasVerifiedReplayHistory bool,
+) (bool, error) {
+	if lease == nil || guardContinuation || !lease.ShouldRetire() {
+		return false, nil
+	}
+	if storeDisabled && !hasVerifiedReplayHistory {
+		return false, errors.New("retired websocket cannot safely continue a store=false session")
+	}
+	if hasPreviousResponseID && !hasVerifiedReplayHistory {
+		return false, errors.New("retired websocket previous_response_id cannot be safely replayed")
+	}
+	return true, nil
+}
+
 type openAIWSRejectedFieldRetryError struct {
 	body   []byte
 	reason string
@@ -142,11 +167,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			// passthrough timing callback together on this fast path.
 			// Keep passthrough as the fast path for ordinary frames, but do not
 			// let its early return bypass the oversized-frame HTTP bridge.
-			if s.shouldBridgeOpenAIWSHTTP(
-				account,
-				len(firstClientMessage),
-				gjson.GetBytes(firstClientMessage, "previous_response_id").String(),
-			) {
+			if s.shouldBridgeOpenAIWSPassthroughFirstMessage(account, firstClientMessage) {
 				forceHTTPBridge = true
 				break
 			}
@@ -428,6 +449,13 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			normalized = next
 		}
 		SetOpsUpstreamModel(c, upstreamModel)
+		if openAIPromptCacheFieldsPresent(normalized) {
+			if sanitized, changed, sanitizeErr := normalizeOpenAIPromptCacheFieldsForEgressWithModel(normalized, account, wsURL, upstreamModel, ""); sanitizeErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", sanitizeErr)
+			} else if changed {
+				normalized = sanitized
+			}
+		}
 		if isCodexCLI && codexImageGenerationExplicitToolPolicy == codexImageGenerationExplicitToolPolicyStrip {
 			if stripped, changed, stripErr := stripOpenAIImageGenerationToolsFromRawPayload(normalized); stripErr != nil {
 				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", stripErr)
@@ -933,7 +961,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			dedicatedMode,
 		)
 		req.ForcePreferredConn = identityForcePreferred
-		req.ForceNewConn = identityForceNew
+		// A new ctx_pool ingress without continuation state must not inherit an
+		// idle pooled coder/websocket socket: that implementation has no reader
+		// while idle, so an upstream 1011 keepalive close can remain unseen until
+		// the first write. Force a fresh socket for the initial turn (and its
+		// single retry) unless a guard/continuation explicitly pins one.
+		firstTurnFresh := turn == 1 && strings.TrimSpace(preferred) == "" &&
+			!forcePreferredConn && firstPayload.previousResponseID == "" &&
+			!continuationLeaseRequested
+		req.ForceNewConn = identityForceNew || firstTurnFresh
 		// dedicated 模式下每次获取均新建连接，避免跨会话复用残留上下文。
 		acquireCtx, acquireCancel := context.WithTimeout(ctx, acquireTimeout)
 		lease, acquireErr := pool.Acquire(acquireCtx, req)
@@ -976,7 +1012,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			var dialErr *openAIWSDialError
 			if errors.As(acquireErr, &dialErr) && dialErr != nil {
 				if dialStatus, rateLimited := openAIWSDialRateLimitStatus(acquireErr); rateLimited {
-					s.persistOpenAIWSRateLimitSignal(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()), dialStatus)
+					// A failed handshake normally has no response body, so the model
+					// cannot be recovered from the error payload.  Preserve the
+					// already-resolved model explicitly; Spark 429s must stay scoped
+					// to that model instead of entering the account-level 2-strike path.
+					s.persistOpenAIWSRateLimitSignalForModel(ctx, account, dialErr.ResponseHeaders, dialErr.ResponseBody, "rate_limit_exceeded", "rate_limit_error", strings.TrimSpace(acquireErr.Error()), canonicalModel, dialStatus)
 					return nil, s.newOpenAIWSRateLimitFailoverError(account, dialErr.ResponseHeaders, dialErr.ResponseBody, acquireErr.Error())
 				}
 			}
@@ -1056,6 +1096,30 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			)
 		}
 		payload = normalizedPayload
+		// Resolve prompt-cache optional fields after all per-turn model mapping
+		// and protocol normalization. The helper is limited to OpenAI API-key
+		// accounts; OAuth/Codex remains governed by the ChatGPT internal egress
+		// guard, and other providers are left untouched.
+		// A later response.create may omit `model`; the ingress normalizer has
+		// already resolved that turn's mapped model into mappedModel.  Reuse it
+		// here so GPT-5.6 prompt-cache options are not stripped merely because the
+		// client relied on the session-level model.
+		sanitizerModel := strings.TrimSpace(openAIWSPayloadStringFromRaw(payload, "model"))
+		if sanitizerModel == "" {
+			sanitizerModel = normalizeOpenAIModelForUpstream(account, account.GetMappedModel(originalModel))
+		}
+		if sanitized, changed, sanitizeErr := normalizeOpenAIPromptCacheFieldsForEgressWithModel(
+			payload, account, wsURL, sanitizerModel, sanitizerModel,
+		); sanitizeErr != nil {
+			return nil, wrapOpenAIWSIngressTurnError(
+				"write_upstream",
+				fmt.Errorf("normalize prompt-cache fields: %w", sanitizeErr),
+				false,
+			)
+		} else if changed {
+			payload = sanitized
+			payloadBytes = len(payload)
+		}
 		// The payload can be normalized immediately before the write (for example
 		// when the protocol options repair a client frame). Keep the accounting
 		// size aligned with the bytes that are actually sent upstream.
@@ -1097,7 +1161,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		clientDisconnected := false
 		guardConnectionBroken := false
 		retained429ErrorTerminal := false
-		rateLimitSignalHandled := false
+		rateLimitSignalTracker := &openAIWSRateLimitSignalTracker{}
+		rateLimitSignalObserved := false
 		guardLeaseMayRetain := func() bool {
 			if !lease.openAI429GuardActiveAtAcquire {
 				return true
@@ -1122,15 +1187,26 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		recordRateLimitSignal := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 			isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
 			explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
-			if !isRateLimit || rateLimitSignalHandled {
-				return isRateLimit
+			isRateLimit, applySideEffect := rateLimitSignalTracker.observe(isRateLimit, explicit429)
+			if !isRateLimit {
+				return false
+			}
+			// The terminal helper needs to know that an OpenAI response's 429
+			// classification has already been (or deliberately not been) handled.
+			// Keep this marker scoped to the OpenAI path; the same relay machinery can
+			// carry Grok-compatible accounts whose legacy side effects must still run
+			// at terminal handling time.
+			if account != nil && account.Platform == PlatformOpenAI {
+				rateLimitSignalObserved = true
+			}
+			if !applySideEffect {
+				return true
 			}
 			if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
-				s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
+				s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody, mappedModel)
 			} else {
-				s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
+				s.persistOpenAIWSRateLimitSignalForModel(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, mappedModel, upstreamStatus)
 			}
-			rateLimitSignalHandled = true
 			if explicit429 && guardLeaseMayRetain() {
 				s.markOpenAI429GuardConnectionProof(account, lease)
 				// A confirmed Codex 429 is a scheduling state, not a transport
@@ -1141,6 +1217,36 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 			return true
+		}
+		// Capacity-shed frames are request/model-scoped (not account health).
+		// Before semantic output is committed, surface them as a typed failover
+		// so ctx_pool can retry or select another account.  Leaving the original
+		// server_is_overloaded/slow_down code on the wire makes Codex treat the
+		// session as a fatal capacity error and stops its own retry loop (official
+		// issue #5840).  Once semantic output exists, the write path below only
+		// rewrites the client-facing code and preserves the partial turn.
+		capacityShedFailover := func(upstreamMessage []byte, upstreamStatus int, errMsg string) error {
+			if clientDisconnected || wroteSemanticDownstream {
+				return nil
+			}
+			transientStatus := openAIWSPayloadTransientStatus(upstreamMessage)
+			if upstreamStatus >= http.StatusInternalServerError {
+				transientStatus = upstreamStatus
+			}
+			if transientStatus < http.StatusBadRequest || transientStatus == http.StatusTooManyRequests ||
+				!isOpenAIRequestScopedCapacityShed(errMsg, upstreamMessage) {
+				return nil
+			}
+			lease.MarkBroken()
+			return s.newOpenAIAccountFailoverError(
+				account,
+				transientStatus,
+				lease.HandshakeHeaders(),
+				upstreamMessage,
+				strings.TrimSpace(errMsg),
+				false,
+				true,
+			)
 		}
 		var pendingJSONDocuments [][]byte
 		for {
@@ -1241,6 +1347,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
+				if !isRateLimit {
+					if capacityErr := capacityShedFailover(upstreamMessage, upstreamStatus, errMsgRaw); capacityErr != nil {
+						return nil, capacityErr
+					}
+				}
 				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				if guardAccountActiveAtEvent && !guardConnectionAtEvent && !isRateLimit {
 					failedStatus, _ := openAIWS429GuardErrorEventFailureStatus(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw)
@@ -1381,6 +1492,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
+				if !isRateLimit {
+					if capacityErr := capacityShedFailover(upstreamMessage, upstreamStatus, errMsgRaw); capacityErr != nil {
+						return nil, capacityErr
+					}
+				}
 				// Re-evaluate after recording: this event may be the confirming
 				// 429 that proves and pins this exact lease.
 				guardConnectionAtEvent := guardRateLimitedConnectionActive()
@@ -1442,6 +1558,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 			if !clientDisconnected {
+				if eventType == "error" || eventType == "response.failed" {
+					// If the turn has already produced semantic output, failover is
+					// unsafe; still normalize capacity codes so Codex can retry the
+					// request instead of terminating the whole session.
+					if rewritten, changed := sanitizeOpenAICapacityShedErrorCodeForClient(upstreamMessage); changed {
+						upstreamMessage = rewritten
+					}
+				}
 				if eventType == "error" {
 					if updated, changed := ensureOpenAIWSErrorEventClientDetail(upstreamMessage); changed {
 						upstreamMessage = updated
@@ -1542,7 +1666,14 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 					guardConnectionBroken = true
 				}
 				canonicalModel := canonicalOpenAIAccountSchedulingModel(account, originalModel)
-				terminalEvent := s.handleOpenAIWSTerminalTransientFailure(ctx, account, canonicalModel, lease.HandshakeHeaders(), upstreamMessage)
+				terminalEvent := s.handleOpenAIWSTerminalTransientFailureAfterRateLimitSignal(
+					ctx,
+					account,
+					canonicalModel,
+					lease.HandshakeHeaders(),
+					upstreamMessage,
+					rateLimitSignalObserved,
+				)
 				// 客户端已断连时，上游连接的 session 状态不可信，标记 broken 避免回池复用。
 				if clientDisconnected {
 					lease.MarkBroken()
@@ -1571,6 +1702,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				imageCount := imageCounter.Count()
 				result := &OpenAIForwardResult{
 					RequestID:                     responseID,
+					ResponseID:                    responseID,
 					Usage:                         usage,
 					Model:                         originalModel,
 					UpstreamModel:                 mappedModel,
@@ -2420,6 +2552,65 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
 		if parseErr != nil {
 			return parseErr
+		}
+		// Do not carry a pooled socket across the upstream's hard lifetime. A
+		// permanent 429 guard is intentionally exempt because its continuation
+		// identity is the feature being retained. Ordinary store=false sessions
+		// cannot be moved safely: their history exists only on this socket.
+		nextStoreDisabled := s.isOpenAIWSStoreDisabledInRequestRaw(nextPayload.payloadRaw, account)
+		shouldRotateLease, rotateErr := shouldRotateOpenAIWSLeaseBeforeTurn(
+			sessionLease,
+			sessionLeaseRetainedBy429Guard(),
+			nextStoreDisabled,
+			strings.TrimSpace(nextPayload.previousResponseID) != "",
+			hasVerifiedReplayHistory(),
+		)
+		if rotateErr != nil {
+			resetSessionLease(false)
+			return NewOpenAIWSClientCloseError(
+				coderws.StatusGoingAway,
+				rotateErr.Error(),
+				rotateErr,
+			)
+		}
+		if shouldRotateLease {
+			if nextStoreDisabled {
+				// The old socket carried store=false history implicitly. When
+				// verified replay exists, materialize the complete sequence before
+				// rotating so the replacement socket receives equivalent context.
+				replayInput, replayExists, replayErr := buildOpenAIWSReplayInputSequence(
+					lastTurnReplayInput,
+					lastTurnReplayInputExists,
+					nextPayload.payloadRaw,
+					true,
+				)
+				if replayErr != nil || !replayExists {
+					if replayErr == nil {
+						replayErr = errors.New("store=false replay history is empty")
+					}
+					resetSessionLease(false)
+					return NewOpenAIWSClientCloseError(coderws.StatusGoingAway, replayErr.Error(), replayErr)
+				}
+				updatedPayload, setInputErr := setOpenAIWSPayloadInputSequence(nextPayload.payloadRaw, replayInput, true)
+				if setInputErr != nil {
+					resetSessionLease(false)
+					return NewOpenAIWSClientCloseError(coderws.StatusGoingAway, "retired websocket replay input could not be rebuilt", setInputErr)
+				}
+				hadPreviousResponseID := strings.TrimSpace(nextPayload.previousResponseID) != ""
+				updatedPayload, removed, dropErr := dropPreviousResponseIDFromRawPayload(updatedPayload)
+				if dropErr != nil || (hadPreviousResponseID && !removed) {
+					if dropErr == nil {
+						dropErr = errors.New("previous_response_id was not removed from replay payload")
+					}
+					resetSessionLease(false)
+					return NewOpenAIWSClientCloseError(coderws.StatusGoingAway, "retired websocket replay payload is unsafe", dropErr)
+				}
+				nextPayload.payloadRaw = updatedPayload
+				nextPayload.payloadBytes = len(updatedPayload)
+				nextPayload.previousResponseID = ""
+			}
+			resetSessionLease(false)
+			preferredConnID = ""
 		}
 		nextRoutingFields := gjson.GetManyBytes(nextPayload.payloadRaw, "model", "service_tier")
 		if nextPayload.promptCacheKey != "" {

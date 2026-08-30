@@ -118,6 +118,21 @@ func TestProbeOpenAIAccountHealthOAuthSecondAttemptRecovers(t *testing.T) {
 	require.Equal(t, AccountHealthProbeStatusHealthy, result.Snapshot.Status)
 }
 
+func TestProbeOpenAIAccountHealthOAuthSuccessClearsPending429Streak(t *testing.T) {
+	account := &Account{ID: 22, Name: "oauth", Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	repo := &healthProbeRepo{mockAccountRepoForGemini: mockAccountRepoForGemini{accountsByID: map[int64]*Account{22: account}}}
+	quota := &healthQuotaStub{usage: &OpenAIQuotaUsage{RateLimitResetCredits: &OpenAIRateLimitResetCredits{}}}
+	rateLimits := NewRateLimitService(nil, nil, nil, nil, nil)
+	// Seed exactly one explicit 429. A successful authoritative health probe
+	// must reset it before a later transient 429 can be considered a second hit.
+	require.False(t, rateLimits.confirmOpenAIOAuth429Context(context.Background(), account.ID, time.Now()))
+	svc := &AccountTestService{accountRepo: repo, openAIQuotaService: quota, rateLimitService: rateLimits}
+
+	result := svc.ProbeOpenAIAccountHealth(context.Background(), account.ID)
+	require.True(t, result.Healthy)
+	require.False(t, rateLimits.confirmOpenAIOAuth429Context(context.Background(), account.ID, time.Now()))
+}
+
 func TestInventoryOpenAIAccountReturnsAndCachesOAuthQuota(t *testing.T) {
 	account := &Account{ID: 8, Name: "oauth inventory", Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	repo := &healthProbeRepo{mockAccountRepoForGemini: mockAccountRepoForGemini{accountsByID: map[int64]*Account{8: account}}}
@@ -156,6 +171,28 @@ func TestInventoryOpenAIAccountReportsQuotaPersistenceFailure(t *testing.T) {
 	require.True(t, result.Healthy)
 	require.False(t, result.QuotaPersisted)
 	require.Contains(t, result.Reason, "could not be persisted")
+}
+
+func TestInventoryOpenAIAccountTreatsMissingResetCreditEnvelopeAsPersisted(t *testing.T) {
+	account := &Account{ID: 19, Name: "oauth inventory without reset cards", Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	repo := &healthProbeRepo{mockAccountRepoForGemini: mockAccountRepoForGemini{accountsByID: map[int64]*Account{19: account}}}
+	usage := &OpenAIQuotaUsage{
+		RateLimit: &OpenAIRateLimit{PrimaryWindow: &OpenAIRateLimitWindow{LimitWindowSeconds: 18000}},
+		// The upstream may omit rate_limit_reset_credits entirely.  This is a
+		// successful quota snapshot and should not make inventory persistence
+		// appear failed merely because there is no reset-card row to cache.
+		RateLimitResetCredits: nil,
+	}
+	quota := &inventoryQuotaStub{healthQuotaStub: &healthQuotaStub{usage: usage}}
+	svc := &AccountTestService{accountRepo: repo, openAIQuotaService: quota}
+
+	result := svc.InventoryOpenAIAccount(context.Background(), 19)
+
+	require.True(t, result.Healthy)
+	require.True(t, result.QuotaPersisted)
+	require.Equal(t, []int64{19}, quota.usageCacheIDs)
+	require.Empty(t, quota.resetCacheIDs, "nil reset-credit envelope should not invoke a cache write")
+	require.Empty(t, result.Reason)
 }
 
 func TestInventoryOpenAIAccountHidesParentCreditsForSparkShadow(t *testing.T) {

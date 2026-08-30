@@ -21,6 +21,64 @@ func collectStreamEvents(t *testing.T, chunks []string) []ResponsesStreamEvent {
 	return events
 }
 
+func TestStream_ResponseIDIsFrozenAfterCreated(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-pro")
+	first := &ChatCompletionsChunk{
+		ID: "chatcmpl-first",
+		Choices: []ChatChunkChoice{{
+			Index: 0,
+			Delta: ChatDelta{Content: strPtr("hello")},
+		}},
+	}
+	createdEvents := ChatCompletionsChunkToResponsesEvents(first, state)
+	created := findEvent(createdEvents, "response.created")
+	require.NotNil(t, created)
+	require.NotNil(t, created.Response)
+	require.Equal(t, "chatcmpl-first", created.Response.ID)
+
+	// Some Chat-compatible upstreams change the id on later chunks.  The
+	// Responses facade must keep the id announced in response.created so the
+	// completed event and continuation affinity point at the same response.
+	later := &ChatCompletionsChunk{
+		ID: "chatcmpl-later",
+		Choices: []ChatChunkChoice{{
+			Index: 0,
+			Delta: ChatDelta{Content: strPtr(" world")},
+		}},
+	}
+	ChatCompletionsChunkToResponsesEvents(later, state)
+	completed := findEvent(FinalizeChatCompletionsResponsesStream(state), "response.completed")
+	require.NotNil(t, completed)
+	require.NotNil(t, completed.Response)
+	require.Equal(t, "chatcmpl-first", completed.Response.ID)
+	require.Equal(t, "chatcmpl-first", state.ResponseID)
+}
+
+func TestStream_ResponseIDFallsBackToGeneratedIDWhenFirstChunkHasNone(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-pro")
+	generatedID := state.ResponseID
+	require.NotEmpty(t, generatedID)
+
+	createdEvents := ChatCompletionsChunkToResponsesEvents(&ChatCompletionsChunk{
+		Choices: []ChatChunkChoice{{
+			Index: 0,
+			Delta: ChatDelta{Content: strPtr("hello")},
+		}},
+	}, state)
+	created := findEvent(createdEvents, "response.created")
+	require.NotNil(t, created)
+	require.NotNil(t, created.Response)
+	require.Equal(t, generatedID, created.Response.ID)
+
+	// A late id must not replace the generated id after response.created.
+	ChatCompletionsChunkToResponsesEvents(&ChatCompletionsChunk{ID: "chatcmpl-late"}, state)
+	completed := findEvent(FinalizeChatCompletionsResponsesStream(state), "response.completed")
+	require.NotNil(t, completed)
+	require.NotNil(t, completed.Response)
+	require.Equal(t, generatedID, completed.Response.ID)
+	require.Equal(t, generatedID, state.ResponseID)
+}
+
 // TestStream_ReasoningOpensItemBeforeDelta guards the bug where a strict client
 // (Codex) drops reasoning deltas that reference an item not yet opened.
 func TestStream_ReasoningOpensItemBeforeDelta(t *testing.T) {

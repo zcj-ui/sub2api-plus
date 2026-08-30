@@ -1433,6 +1433,40 @@ func (s *AccountRepoSuite) TestClearError_SyncSchedulerSnapshotOnRecovery() {
 	s.Require().Equal(service.StatusActive, cacheRecorder.setAccounts[0].Status)
 }
 
+func (s *AccountRepoSuite) TestErrorRecoveryRestoresOnlySystemOwnedSchedulability() {
+	// An account enabled before SetError is automatically returned to the
+	// scheduler pool. An account explicitly paused by an administrator remains
+	// paused, including when that pause is applied while the account is errored.
+	for _, tc := range []struct {
+		name               string
+		initialSchedulable bool
+		pauseDuringError   bool
+		wantSchedulable    bool
+	}{
+		{name: "system quarantine restores enabled account", initialSchedulable: true, wantSchedulable: true},
+		{name: "manual pause is preserved", initialSchedulable: false, wantSchedulable: false},
+		{name: "pause during error wins", initialSchedulable: true, pauseDuringError: true, wantSchedulable: false},
+	} {
+		s.Run(tc.name, func() {
+			account := mustCreateAccount(s.T(), s.client, &service.Account{
+				Name:        "error-recovery-" + strings.ReplaceAll(tc.name, " ", "-"),
+				Status:      service.StatusActive,
+				Schedulable: tc.initialSchedulable,
+			})
+			s.Require().NoError(s.repo.SetError(s.ctx, account.ID, "temporary error"))
+			if tc.pauseDuringError {
+				s.Require().NoError(s.repo.SetSchedulable(s.ctx, account.ID, false))
+			}
+			s.Require().NoError(s.repo.ClearError(s.ctx, account.ID))
+			got, err := s.repo.GetByID(s.ctx, account.ID)
+			s.Require().NoError(err)
+			s.Require().Equal(service.StatusActive, got.Status)
+			s.Require().Equal(tc.wantSchedulable, got.Schedulable)
+			s.Require().NotContains(got.Extra, service.AccountErrorRestoreSchedulableExtraKey)
+		})
+	}
+}
+
 // --- UpdateSessionWindow ---
 
 func (s *AccountRepoSuite) TestUpdateSessionWindow() {
@@ -1476,6 +1510,42 @@ func (s *AccountRepoSuite) TestUpdateExtra_NilExtra() {
 	got, err := s.repo.GetByID(s.ctx, account.ID)
 	s.Require().NoError(err)
 	s.Require().Equal("val", got.Extra["key"])
+}
+
+func (s *AccountRepoSuite) TestUpdateExtra_OlderCodexSnapshotCannotOverwriteNewerObservation() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{
+		Name:     "acc-extra-codex-monotonic",
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Extra:    map[string]any{},
+	})
+	const newer = int64(1771236000200000000)
+	const older = int64(1771236000100000000)
+
+	s.Require().NoError(s.repo.UpdateExtra(s.ctx, account.ID, map[string]any{
+		service.OpenAIQuotaUsed5hPercentExtraKey:           95.0,
+		service.OpenAICodexUsageObservedAtUnixNanoExtraKey: newer,
+	}))
+	s.Require().NoError(s.repo.UpdateExtra(s.ctx, account.ID, map[string]any{
+		service.OpenAIQuotaUsed5hPercentExtraKey:           94.0,
+		service.OpenAICodexUsageObservedAtUnixNanoExtraKey: older,
+		"unrelated_runtime_marker":                         "preserved",
+	}))
+
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(95.0, got.Extra[service.OpenAIQuotaUsed5hPercentExtraKey])
+	s.Require().Equal("preserved", got.Extra["unrelated_runtime_marker"])
+
+	var storedObservedAt string
+	s.Require().NoError(scanSingleRow(
+		s.ctx,
+		s.repo.sql,
+		"SELECT extra ->> $1 FROM accounts WHERE id = $2",
+		[]any{service.OpenAICodexUsageObservedAtUnixNanoExtraKey, account.ID},
+		&storedObservedAt,
+	))
+	s.Require().Equal("1771236000200000000", storedObservedAt)
 }
 
 func (s *AccountRepoSuite) TestUpdateExtra_SchedulerNeutralSkipsOutboxAndSyncsFreshSnapshot() {

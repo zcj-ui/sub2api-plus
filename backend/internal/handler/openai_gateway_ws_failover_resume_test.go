@@ -54,6 +54,8 @@ func TestOpenAIWSCurrentTurnRetryPayloadStateRejectsUnsafePayload(t *testing.T) 
 		[]byte(`{"type":"response.create","model":123}`),
 		[]byte(`{"type":"response.cancel","model":"gpt-second"}`),
 		[]byte(`{"type":"response.create","model":"gpt-second","input":[{"type":"function_call_output","call_id":"missing","output":"done"}]}`),
+		[]byte(`{"type":"response.create","model":"gpt-second","previous_response_id":123}`),
+		[]byte(`{"type":"response.create","model":"gpt-second","previous_response_id":"resp_a","previous_response_id":"resp_b"}`),
 		[]byte(`{`),
 	}
 

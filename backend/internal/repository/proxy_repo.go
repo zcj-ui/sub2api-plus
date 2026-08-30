@@ -124,23 +124,57 @@ func (r *proxyRepository) Update(ctx context.Context, proxyIn *service.Proxy) er
 }
 
 type proxyProbeIdentity struct {
-	protocol string
-	host     string
-	port     int
-	username string
-	password string
-	status   string
+	protocol          string
+	host              string
+	port              int
+	username          string
+	password          string
+	status            string
+	fallbackMode      string
+	expiresAtUnixNano int64
+	hasExpiresAt      bool
+	backupProxyID     int64
+	hasBackupProxyID  bool
+	expiryWarnDays    int
 }
 
 func proxyProbeIdentityFromService(proxyIn *service.Proxy) proxyProbeIdentity {
-	return proxyProbeIdentity{
-		protocol: proxyIn.Protocol,
-		host:     proxyIn.Host,
-		port:     proxyIn.Port,
-		username: proxyIn.Username,
-		password: proxyIn.Password,
-		status:   proxyIn.Status,
+	identity := proxyProbeIdentity{}
+	if proxyIn == nil {
+		return identity
 	}
+	identity.protocol = proxyIn.Protocol
+	identity.host = proxyIn.Host
+	identity.port = proxyIn.Port
+	identity.username = proxyIn.Username
+	identity.password = proxyIn.Password
+	identity.status = proxyIn.Status
+	identity.fallbackMode = proxyIn.FallbackMode
+	if strings.TrimSpace(identity.fallbackMode) == "" {
+		identity.fallbackMode = service.FallbackModeNone
+	}
+	identity.expiryWarnDays = proxyIn.ExpiryWarnDays
+	if proxyIn.ExpiresAt != nil {
+		identity.expiresAtUnixNano = proxyIn.ExpiresAt.UnixNano()
+		identity.hasExpiresAt = true
+	}
+	if proxyIn.BackupProxyID != nil {
+		identity.backupProxyID = *proxyIn.BackupProxyID
+		identity.hasBackupProxyID = true
+	}
+	return identity
+}
+
+// proxyProbeIdentityTransportEqual is the legacy probe CAS identity check.
+// Probe writes only need the network transport tuple; scheduler invalidation
+// additionally tracks expiry/fallback metadata in proxyProbeIdentity itself.
+func proxyProbeIdentityTransportEqual(left, right proxyProbeIdentity) bool {
+	return left.protocol == right.protocol &&
+		left.host == right.host &&
+		left.port == right.port &&
+		left.username == right.username &&
+		left.password == right.password &&
+		left.status == right.status
 }
 
 func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.Client, proxyIn *service.Proxy) (*dbent.Proxy, error) {
@@ -199,7 +233,8 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 
 func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID int64) (proxyProbeIdentity, error) {
 	rows, err := client.QueryContext(ctx, `
-		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
+		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status,
+		       COALESCE(fallback_mode, ''), expires_at, backup_proxy_id, expiry_warn_days
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
@@ -215,28 +250,51 @@ func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID i
 		return proxyProbeIdentity{}, service.ErrProxyNotFound
 	}
 	var identity proxyProbeIdentity
-	if err := rows.Scan(&identity.protocol, &identity.host, &identity.port, &identity.username, &identity.password, &identity.status); err != nil {
+	var expiresAt sql.NullTime
+	var backupProxyID sql.NullInt64
+	var fallbackMode sql.NullString
+	var expiryWarnDays sql.NullInt64
+	if err := rows.Scan(
+		&identity.protocol,
+		&identity.host,
+		&identity.port,
+		&identity.username,
+		&identity.password,
+		&identity.status,
+		&fallbackMode,
+		&expiresAt,
+		&backupProxyID,
+		&expiryWarnDays,
+	); err != nil {
 		return proxyProbeIdentity{}, err
 	}
+	identity.fallbackMode = fallbackMode.String
+	if strings.TrimSpace(identity.fallbackMode) == "" {
+		identity.fallbackMode = service.FallbackModeNone
+	}
+	if expiresAt.Valid {
+		identity.expiresAtUnixNano = expiresAt.Time.UnixNano()
+		identity.hasExpiresAt = true
+	}
+	if backupProxyID.Valid {
+		identity.backupProxyID = backupProxyID.Int64
+		identity.hasBackupProxyID = true
+	}
+	identity.expiryWarnDays = int(expiryWarnDays.Int64)
 	return identity, rows.Err()
 }
 
 func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyID int64) ([]int64, error) {
 	rows, err := exec.QueryContext(ctx, `
 		UPDATE accounts
-		SET extra = COALESCE(extra, '{}'::jsonb)
-				- 'upstream_billing_probe'
-				- 'ollama_cloud_usage_snapshot',
+		SET extra = CASE
+				WHEN extra IS NULL THEN NULL
+				ELSE extra
+					- 'upstream_billing_probe'
+					- 'ollama_cloud_usage_snapshot'
+			END,
 			updated_at = NOW()
 		WHERE proxy_id = $1
-			AND type = 'apikey'
-			AND (
-				(extra ? 'upstream_billing_probe'
-					AND extra -> 'upstream_billing_probe' <> 'null'::jsonb)
-				OR (platform IN ('openai', 'anthropic')
-					AND extra ? 'ollama_cloud_usage_snapshot'
-					AND extra -> 'ollama_cloud_usage_snapshot' <> 'null'::jsonb)
-			)
 			AND deleted_at IS NULL
 		RETURNING id
 	`, proxyID)

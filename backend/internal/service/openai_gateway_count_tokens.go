@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -94,9 +94,11 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
 	if err != nil {
-		writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
+		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
+			writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
+		}
 		return fmt.Errorf("responses input_tokens: read upstream response: %w", err)
 	}
 
@@ -125,6 +127,13 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
 	if contentType == "" {
 		contentType = "application/json"
+	}
+	// A successful authoritative OpenAI token-count response is a healthy
+	// signal. Do not let an earlier single 429 combine with a later transient
+	// one after this success and incorrectly satisfy the two-strike quarantine
+	// threshold.
+	if account.IsOpenAIOAuth() {
+		s.clearOpenAIOAuth429Streak(account.ID)
 	}
 	c.Data(http.StatusOK, contentType, respBody)
 	return nil
@@ -335,9 +344,11 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, anthropicTooLargeError)
 	if err != nil {
-		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
+		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
+			writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to read response")
+		}
 		return fmt.Errorf("read input_tokens response: %w", err)
 	}
 

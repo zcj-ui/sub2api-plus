@@ -20,6 +20,28 @@ var clientSessionIDHeaders = append(
 	claudeCodeSessionHeader,
 )
 
+// ClaudeCodeSessionIDFromHeader returns the stable Claude Code conversation
+// identifier carried by X-Claude-Code-Session-Id. It is intentionally
+// separate from ExtractClientSessionID so callers must opt in explicitly when
+// using this signal for OpenAI account affinity.
+func ClaudeCodeSessionIDFromHeader(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	return sanitizeSessionID(c.GetHeader(claudeCodeSessionHeader))
+}
+
+// OpenAIExplicitSessionIDFromHeader returns only the session headers owned by
+// the OpenAI-compatible protocol family. It intentionally excludes the
+// Claude-Code header so callers can preserve the protocol's precedence when
+// both clients send identifiers.
+func OpenAIExplicitSessionIDFromHeader(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	return sanitizeSessionID(explicitOpenAIHeaderSessionID(c))
+}
+
 // ExtractClientSessionID resolves the explicit client-provided session identifier from
 // request headers for usage-log correlation and returns it sanitized. It is
 // protocol-agnostic and shared by every gateway handler so all supported protocols

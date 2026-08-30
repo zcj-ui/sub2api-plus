@@ -52,6 +52,17 @@ type accountRepository struct {
 	schedulerCache service.SchedulerCache
 }
 
+// accountSQLExecutor resolves the SQL executor from the request transaction
+// when one is present. Error-state transitions are used from both standalone
+// service calls and Ent transaction callbacks; executing through r.sql
+// unconditionally would silently escape the caller's transaction.
+func (r *accountRepository) accountSQLExecutor(ctx context.Context) sqlQueryExecutor {
+	if r == nil {
+		return nil
+	}
+	return txAwareSQLExecutor(ctx, r.sql, r.client)
+}
+
 var schedulerNeutralExtraKeyPrefixes = []string{
 	"codex_primary_",
 	"codex_secondary_",
@@ -65,14 +76,60 @@ var schedulerNeutralExtraKeyPrefixes = []string{
 }
 
 var schedulerNeutralExtraKeys = map[string]struct{}{
-	"codex_usage_updated_at":     {},
-	"grok_billing_snapshot":      {},
-	"session_window_utilization": {},
+	"codex_usage_updated_at":                           {},
+	service.OpenAIQuotaPlanTypeExtraKey:                {},
+	service.OpenAICodexUsageObservedAtUnixNanoExtraKey: {},
+	"grok_billing_snapshot":                            {},
+	"session_window_utilization":                       {},
 }
 
 type compactProbeExtraUpdateGroup struct {
 	observedAt int64
 	updates    map[string]any
+}
+
+// codexUsageExtraUpdateGroup keeps the quota window fields together while
+// allowing unrelated extra fields to be written regardless of observation
+// order.  The observed timestamp is compared in PostgreSQL, so this remains
+// correct across processes and gateway instances.
+type codexUsageExtraUpdateGroup struct {
+	observedAt int64
+	updates    map[string]any
+}
+
+func codexUsageSnapshotExtraKey(key string) bool {
+	if key == service.OpenAICodexUsageObservedAtUnixNanoExtraKey {
+		return true
+	}
+	return strings.HasPrefix(key, "codex_primary_") ||
+		strings.HasPrefix(key, "codex_secondary_") ||
+		strings.HasPrefix(key, "codex_5h_") ||
+		strings.HasPrefix(key, "codex_7d_") ||
+		key == service.OpenAIQuotaUsageUpdatedAtExtraKey ||
+		key == service.OpenAIQuotaCreditBalanceExtraKey ||
+		key == service.OpenAIQuotaPlanTypeExtraKey ||
+		key == service.OpenAIQuotaSpendControlExtraKey ||
+		key == service.OpenAIQuotaResetCreditsExtraKey
+}
+
+func partitionCodexUsageExtraUpdates(updates map[string]any) (map[string]any, *codexUsageExtraUpdateGroup) {
+	common := make(map[string]any, len(updates))
+	observedAt, ok := compactProbeObservedAt(updates[service.OpenAICodexUsageObservedAtUnixNanoExtraKey])
+	if !ok {
+		for key, value := range updates {
+			common[key] = value
+		}
+		return common, nil
+	}
+	group := &codexUsageExtraUpdateGroup{observedAt: observedAt, updates: make(map[string]any)}
+	for key, value := range updates {
+		if codexUsageSnapshotExtraKey(key) {
+			group.updates[key] = value
+		} else {
+			common[key] = value
+		}
+	}
+	return common, group
 }
 
 func compactProbeSnapshotExtraKey(key string) bool {
@@ -710,6 +767,8 @@ func lockAndMergeAccountProbeExtra(
 				extra -> 'ollama_cloud_usage_snapshot',
 				extra -> 'account_health_probe',
 				extra -> 'codex_credit_snapshot',
+				extra -> 'codex_plan_type',
+				extra -> 'codex_spend_control_snapshot',
 				extra -> 'codex_reset_credit_snapshot',
 				extra -> 'codex_usage_updated_at',
 				extra -> 'codex_5h_used_percent',
@@ -747,6 +806,8 @@ func lockAndMergeAccountProbeExtra(
 		currentOllamaSnapshot        []byte
 		currentHealthProbe           []byte
 		currentCreditSnapshot        []byte
+		currentPlanType              []byte
+		currentSpendControlSnapshot  []byte
 		currentResetCreditSnapshot   []byte
 		currentUsageUpdatedAt        []byte
 		currentUsed5hPercent         []byte
@@ -770,6 +831,8 @@ func lockAndMergeAccountProbeExtra(
 		&currentOllamaSnapshot,
 		&currentHealthProbe,
 		&currentCreditSnapshot,
+		&currentPlanType,
+		&currentSpendControlSnapshot,
 		&currentResetCreditSnapshot,
 		&currentUsageUpdatedAt,
 		&currentUsed5hPercent,
@@ -876,6 +939,8 @@ func lockAndMergeAccountProbeExtra(
 		for key, raw := range map[string][]byte{
 			service.AccountHealthProbeExtraKey:         currentHealthProbe,
 			service.OpenAIQuotaCreditBalanceExtraKey:   currentCreditSnapshot,
+			service.OpenAIQuotaPlanTypeExtraKey:        currentPlanType,
+			service.OpenAIQuotaSpendControlExtraKey:    currentSpendControlSnapshot,
 			service.OpenAIQuotaResetCreditsExtraKey:    currentResetCreditSnapshot,
 			service.OpenAIQuotaUsageUpdatedAtExtraKey:  currentUsageUpdatedAt,
 			service.OpenAIQuotaUsed5hPercentExtraKey:   currentUsed5hPercent,
@@ -1481,16 +1546,43 @@ func (r *accountRepository) BatchUpdateLastUsed(ctx context.Context, updates map
 }
 
 func (r *accountRepository) SetError(ctx context.Context, id int64, errorMsg string) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetStatus(service.StatusError).
-		SetErrorMessage(errorMsg).
-		SetSchedulable(false).
-		Save(ctx)
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
+	// Keep the administrator's explicit scheduling switch separate from the
+	// system-owned error quarantine.  The CASE expression observes the old
+	// schedulable value atomically: only an account that was enabled before the
+	// error gets a restore marker.  A manually paused account therefore remains
+	// paused after ClearError/auto-recovery.
+	result, err := exec.ExecContext(ctx, `
+		UPDATE accounts AS a
+		SET status = $1,
+			error_message = $2,
+			schedulable = FALSE,
+			extra = CASE
+				WHEN a.schedulable IS TRUE THEN jsonb_set(
+					COALESCE(a.extra, '{}'::jsonb),
+					'{_sub2api_error_restore_schedulable}',
+					'true'::jsonb,
+					true
+				)
+				ELSE COALESCE(a.extra, '{}'::jsonb)
+			END,
+			updated_at = NOW()
+		WHERE a.id = $3 AND a.deleted_at IS NULL
+	`, service.StatusError, errorMsg, id)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	if err := enqueueSchedulerOutbox(ctx, exec, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue set error failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
@@ -1503,12 +1595,25 @@ func (r *accountRepository) SetGrokCredentialErrorIfMatch(
 	snapshot service.GrokCredentialMutationSnapshot,
 	errorMsg string,
 ) (bool, error) {
-	result, err := r.sql.ExecContext(ctx, `
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	result, err := exec.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET status = $1,
 			error_message = $2,
 			schedulable = false,
+			extra = CASE
+				WHEN a.schedulable IS TRUE THEN jsonb_set(
+					COALESCE(a.extra, '{}'::jsonb),
+					'{_sub2api_error_restore_schedulable}',
+					'true'::jsonb,
+					true
+				)
+				ELSE COALESCE(a.extra, '{}'::jsonb)
+			END,
 			updated_at = NOW()
 		WHERE a.id = $3
 			AND a.deleted_at IS NULL
@@ -1556,19 +1661,29 @@ func (r *accountRepository) SetGrokOAuthErrorIfCredentialsUnchanged(
 	expectedCredentials map[string]any,
 	errorMsg string,
 ) (bool, error) {
-	if r == nil || r.sql == nil {
-		return false, errors.New("account repository SQL executor is not configured")
-	}
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
 	}
-	result, err := r.sql.ExecContext(ctx, `
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	result, err := exec.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET status = $1,
 			error_message = $2,
 			schedulable = FALSE,
+			extra = CASE
+				WHEN a.schedulable IS TRUE THEN jsonb_set(
+					COALESCE(a.extra, '{}'::jsonb),
+					'{_sub2api_error_restore_schedulable}',
+					'true'::jsonb,
+					true
+				)
+				ELSE COALESCE(a.extra, '{}'::jsonb)
+			END,
 			updated_at = NOW()
 		WHERE a.id = $3
 			AND a.deleted_at IS NULL
@@ -1617,9 +1732,6 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	expectedProxyID *int64,
 	credentials map[string]any,
 ) (bool, error) {
-	if r == nil || r.sql == nil {
-		return false, errors.New("account repository SQL executor is not configured")
-	}
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
@@ -1628,7 +1740,11 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	if err != nil {
 		return false, err
 	}
-	result, err := r.sql.ExecContext(ctx, `
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return false, errors.New("account repository SQL executor is not configured")
+	}
+	result, err := exec.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET credentials = $1::jsonb,
@@ -1677,19 +1793,29 @@ func (r *accountRepository) SetGrokOAuthRefreshErrorIfCredentialsUnchanged(
 	expectedProxyID *int64,
 	errorMsg string,
 ) (bool, error) {
-	if r == nil || r.sql == nil {
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
 		return false, errors.New("account repository SQL executor is not configured")
 	}
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
 	}
-	result, err := r.sql.ExecContext(ctx, `
+	result, err := exec.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
 		SET status = $1,
 			error_message = $2,
 			schedulable = FALSE,
+			extra = CASE
+				WHEN a.schedulable IS TRUE THEN jsonb_set(
+					COALESCE(a.extra, '{}'::jsonb),
+					'{_sub2api_error_restore_schedulable}',
+					'true'::jsonb,
+					true
+				)
+				ELSE COALESCE(a.extra, '{}'::jsonb)
+			END,
 			updated_at = NOW()
 		WHERE a.id = $3
 			AND a.deleted_at IS NULL
@@ -1738,9 +1864,6 @@ func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnc
 	until time.Time,
 	reason string,
 ) (bool, error) {
-	if r == nil || r.sql == nil {
-		return false, errors.New("account repository SQL executor is not configured")
-	}
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
@@ -1798,6 +1921,14 @@ func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnc
 // logic can promptly detect the latest account state and avoid using unavailable accounts.
 func (r *accountRepository) syncSchedulerAccountSnapshot(ctx context.Context, accountID int64) {
 	if r == nil || r.schedulerCache == nil || accountID <= 0 {
+		return
+	}
+	// A transaction-bound context may still expose the pre-commit row through
+	// r.client.Account.Query(). Publishing that snapshot would overwrite a
+	// newer cache value with stale state. The transaction's outbox event is the
+	// authoritative post-commit refresh path; standalone mutations continue to
+	// use the eager sync below.
+	if dbent.TxFromContext(ctx) != nil {
 		return
 	}
 	account, err := r.GetByID(ctx, accountID)
@@ -1867,15 +1998,40 @@ func (r *accountRepository) syncSchedulerAccountSnapshots(ctx context.Context, a
 }
 
 func (r *accountRepository) ClearError(ctx context.Context, id int64) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetStatus(service.StatusActive).
-		SetErrorMessage("").
-		Save(ctx)
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
+	// Restore only the state captured by SetError.  If an administrator paused
+	// the account while it was errored, SetSchedulable removes this marker and
+	// the explicit false value is retained.  Legacy rows without a marker are
+	// deliberately left untouched so a manual recovery cannot silently enable a
+	// deliberately paused account.
+	result, err := exec.ExecContext(ctx, `
+		UPDATE accounts AS a
+		SET status = $1,
+			error_message = '',
+			schedulable = CASE
+				WHEN COALESCE(a.extra, '{}'::jsonb)->>'_sub2api_error_restore_schedulable' = 'true' THEN TRUE
+				ELSE a.schedulable
+			END,
+			extra = COALESCE(a.extra, '{}'::jsonb) - '_sub2api_error_restore_schedulable',
+			updated_at = NOW()
+		WHERE a.id = $2 AND a.deleted_at IS NULL
+	`, service.StatusActive, id)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	if err := enqueueSchedulerOutbox(ctx, exec, service.SchedulerOutboxEventAccountChanged, &id, nil, map[string]any{
+		service.SchedulerRuntimeBlockClearPayloadKey: true,
+	}); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue clear error failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
@@ -2349,7 +2505,9 @@ func (r *accountRepository) ClearRateLimitIfObserved(ctx context.Context, id int
 		r.syncSchedulerAccountSnapshot(ctx, id)
 		return false, nil
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, map[string]any{
+		service.SchedulerRuntimeBlockClearPayloadKey: true,
+	}); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue observed rate-limit clear failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
@@ -2508,7 +2666,9 @@ func (r *accountRepository) ClearTempUnschedulable(ctx context.Context, id int64
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, map[string]any{
+		service.SchedulerRuntimeBlockClearPayloadKey: true,
+	}); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue clear temp unschedulable failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
@@ -2525,7 +2685,9 @@ func (r *accountRepository) ClearRateLimit(ctx context.Context, id int64) error 
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, map[string]any{
+		service.SchedulerRuntimeBlockClearPayloadKey: true,
+	}); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue clear rate limit failed: account=%d err=%v", id, err)
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
@@ -2619,14 +2781,31 @@ func (r *accountRepository) UpdateSessionWindowEnd(ctx context.Context, id int64
 }
 
 func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedulable bool) error {
-	_, err := r.client.Account.Update().
-		Where(dbaccount.IDEQ(id)).
-		SetSchedulable(schedulable).
-		Save(ctx)
+	exec := r.accountSQLExecutor(ctx)
+	if exec == nil {
+		return errors.New("account repository SQL executor is not configured")
+	}
+	// Any explicit scheduling change supersedes a pending automatic restore.
+	// Remove the marker in the same UPDATE so a manual disable racing with
+	// recovery cannot be undone by a later ClearError.
+	result, err := exec.ExecContext(ctx, `
+		UPDATE accounts AS a
+		SET schedulable = $1,
+			extra = COALESCE(a.extra, '{}'::jsonb) - '_sub2api_error_restore_schedulable',
+			updated_at = NOW()
+		WHERE a.id = $2 AND a.deleted_at IS NULL
+	`, schedulable, id)
 	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	if err := enqueueSchedulerOutbox(ctx, exec, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
 		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue schedulable change failed: account=%d err=%v", id, err)
 	}
 	if !schedulable {
@@ -2701,7 +2880,8 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	// Compact capability observations may complete out of order. Keep the
 	// snapshot fields together and apply them only when their observation time
 	// is newer than the stored snapshot. Unrelated fields remain independent.
-	commonUpdates, compactProbeGroup := partitionCompactProbeExtraUpdates(updates)
+	commonUpdates, codexUsageGroup := partitionCodexUsageExtraUpdates(updates)
+	commonUpdates, compactProbeGroup := partitionCompactProbeExtraUpdates(commonUpdates)
 	payload, err := json.Marshal(commonUpdates)
 	if err != nil {
 		return err
@@ -2735,8 +2915,23 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	}
 	args := []any{string(payload), id}
 	if deleteKeys := compactProbeExtraDeleteKeys(commonUpdates); len(deleteKeys) > 0 {
-		extraExpression = "(" + extraExpression + ") - $3::text[]"
+		deleteParam := "$" + strconv.Itoa(len(args)+1)
+		extraExpression = "(" + extraExpression + ") - " + deleteParam + "::text[]"
 		args = append(args, pq.Array(deleteKeys))
+	}
+	if codexUsageGroup != nil {
+		previousExpression := extraExpression
+		observedAtParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, codexUsageGroup.observedAt)
+		groupPayload, marshalErr := json.Marshal(codexUsageGroup.updates)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		payloadParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, string(groupPayload))
+		candidateExpression := "(" + previousExpression + " || " + payloadParam + "::jsonb)"
+		storedObservedAt := "COALESCE(CASE WHEN jsonb_typeof(COALESCE(extra, '{}'::jsonb)->'" + service.OpenAICodexUsageObservedAtUnixNanoExtraKey + "') = 'number' THEN (extra->>'" + service.OpenAICodexUsageObservedAtUnixNanoExtraKey + "')::numeric END, 0)"
+		extraExpression = "CASE WHEN " + storedObservedAt + " <= " + observedAtParam + "::numeric THEN " + candidateExpression + " ELSE " + previousExpression + " END"
 	}
 	if compactProbeGroup != nil {
 		previousExpression := extraExpression
@@ -2994,7 +3189,7 @@ func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, a
 	if err := rows.Scan(&current.protocol, &current.host, &current.port, &current.username, &current.password, &current.status); err != nil {
 		return false, err
 	}
-	return current == proxyProbeIdentityFromService(account.Proxy), rows.Err()
+	return proxyProbeIdentityTransportEqual(current, proxyProbeIdentityFromService(account.Proxy)), rows.Err()
 }
 
 func shouldEnqueueSchedulerOutboxForExtraUpdates(updates map[string]any) bool {
@@ -3129,7 +3324,15 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 			return 0, err
 		}
 		credentialPlaceholder = "$" + itoa(idx)
-		setClauses = append(setClauses, "credentials = COALESCE(credentials, '{}'::jsonb) || "+credentialPlaceholder+"::jsonb")
+		credentialExpression := "COALESCE(credentials, '{}'::jsonb) || " + credentialPlaceholder + "::jsonb"
+		// JSONB merge retains keys omitted from the patch.  A bulk edit that
+		// explicitly sends user_agent:null means "clear this OpenAI OAuth
+		// override", so remove the key after merging instead of persisting a
+		// JSON null sentinel.
+		if value, exists := updates.Credentials["user_agent"]; exists && value == nil {
+			credentialExpression = "(" + credentialExpression + ") - 'user_agent'"
+		}
+		setClauses = append(setClauses, "credentials = "+credentialExpression)
 		args = append(args, payload)
 		idx++
 	}

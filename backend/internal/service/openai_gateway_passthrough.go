@@ -540,7 +540,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 	if !account.IsShadow() {
 		if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
-			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
+			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot, account)
 		}
 	} else if account.ParentAccountID != nil {
 		notifyOpenAIAutoReset(*account.ParentAccountID)
@@ -639,6 +639,8 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	if scrubbed, changed := s.scrubForeignOpenAICodexTurnStateFromBody(c, account, body); changed {
 		body = scrubbed
 	}
+	body = applyOpenAIPromptCacheFieldsForEgress(account, targetURL, body)
+	body = applyChatGPTInternalEgressStripForURL(ctx, account, targetURL, body, openAIEgressPassthrough)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -834,6 +836,9 @@ func shouldFailoverOpenAIPassthroughResponse(account *Account, statusCode int, r
 	}
 	if isOpenAIContextWindowError("", responseBody) {
 		return false
+	}
+	if isOpenAIShortInputPolicyError(statusCode, responseBody) {
+		return true
 	}
 	if isOpenAIHTTPUpstreamAccessStateError(statusCode, "", responseBody) {
 		return true
@@ -1592,6 +1597,9 @@ func openAIStreamFailedEventShouldFailover(payload []byte, message string) bool 
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
+	if isOpenAIShortInputPolicyError(http.StatusBadRequest, payload) {
+		return true
+	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1644,6 +1652,9 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	if isOpenAIContextWindowError(message, payload) {
 		return false
 	}
+	if isOpenAIShortInputPolicyError(http.StatusBadRequest, payload) {
+		return true
+	}
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
@@ -1670,6 +1681,7 @@ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
 	payload []byte,
 	message string,
 	headers http.Header,
+	canonicalModel ...string,
 ) (int, bool) {
 	statusCode := openAIStreamFailureStatus(payload, message)
 	switch statusCode {
@@ -1683,14 +1695,19 @@ func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
 		if c != nil && c.Request != nil {
 			ctx = c.Request.Context()
 		}
+		model := firstNonEmpty(canonicalModel...)
+		if model == "" {
+			model = firstNonEmpty(gjson.GetBytes(payload, "model").String(), gjson.GetBytes(payload, "response.model").String())
+		}
 		accountHeaders := headers
 		if statusCode == http.StatusTooManyRequests {
 			// The enclosing HTTP response succeeded. Its quota snapshot describes
-			// normal account state and must not become the reset for a semantic 429
-			// carried by a stream terminal event.
-			accountHeaders = nil
+			// normal account state and must not become the reset for an ordinary
+			// semantic 429. Spark OAuth requests are the exception: their 5h/7d
+			// headers are the model-specific quota evidence we need to persist.
+			accountHeaders = openAIWSSemantic429Headers(account, model, headers)
 		}
-		return statusCode, s.handleOpenAIAccountUpstreamError(ctx, account, statusCode, accountHeaders, payload)
+		return statusCode, s.handleOpenAIAccountUpstreamError(ctx, account, statusCode, accountHeaders, payload, model)
 	default:
 		return statusCode, false
 	}
@@ -1769,6 +1786,19 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverError(
 	message string,
 	responseHeaders ...http.Header,
 ) *UpstreamFailoverError {
+	return s.newOpenAIStreamFailoverErrorWithModel(c, account, passthrough, upstreamRequestID, payload, message, "", responseHeaders...)
+}
+
+func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
+	c *gin.Context,
+	account *Account,
+	passthrough bool,
+	upstreamRequestID string,
+	payload []byte,
+	message string,
+	canonicalModel string,
+	responseHeaders ...http.Header,
+) *UpstreamFailoverError {
 	message = sanitizeUpstreamErrorMessage(strings.TrimSpace(message))
 	if message == "" {
 		message = "OpenAI stream disconnected before completion"
@@ -1777,7 +1807,7 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverError(
 	if len(responseHeaders) > 0 && responseHeaders[0] != nil {
 		headers = responseHeaders[0].Clone()
 	}
-	statusCode, shouldDisable := s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, headers)
+	statusCode, shouldDisable := s.handleOpenAIStreamTerminalAccountSideEffects(c, account, payload, message, headers, canonicalModel)
 	// 流内 failed 事件承载于 HTTP 200；使用事件的语义状态更新账号健康，
 	// 再由 failover 引擎按 StatusCode/RetryableOnSameAccount 决定恢复策略。
 	message = s.recordOpenAIStreamUpstreamError(c, account, passthrough, upstreamRequestID, "failover", payload, message)
@@ -1841,6 +1871,7 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
 	terminalType string,
 	payload []byte,
 	message string,
+	canonicalModel ...string,
 ) *UpstreamFailoverError {
 	// A non-streaming terminal event can be surfaced from tests and internal
 	// adapters without a response/context. Keep this helper side-effect free in
@@ -1861,7 +1892,7 @@ func (s *OpenAIGatewayService) nonStreamingTerminalFailureFailover(
 		headers = resp.Header
 		upstreamRequestID = strings.TrimSpace(resp.Header.Get("x-request-id"))
 	}
-	return s.newOpenAIStreamFailoverError(c, account, passthrough, upstreamRequestID, payload, message, headers)
+	return s.newOpenAIStreamFailoverErrorWithModel(c, account, passthrough, upstreamRequestID, payload, message, firstNonEmpty(canonicalModel...), headers)
 }
 
 func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
@@ -1917,7 +1948,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	bareErrorAccountSideEffectsPending := false
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
 	// pendingLines 在首个可见输出前保留前导事件，确保无输出失败仍可安全 failover。
+	// 这是一个故意短暂的缓冲，不允许异常上游在迟迟不产生可见输出时无限
+	// append；与 Forward 的首输出 stage 共用 8 MiB 上限。
 	pendingLines := make([]string, 0, 8)
+	var pendingLinesBytes int64
+	pendingLineLimit := int64(openAIFirstOutputStageMaxBytes)
 
 	// ── 首个可见输出之前的下游 keepalive ──────────────────────────────────
 	//
@@ -1975,7 +2010,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				return false
 			}
 		}
-		pendingLines = pendingLines[:0]
+		clearOpenAIPendingSSELines(&pendingLines, &pendingLinesBytes)
 		return true
 	}
 	ensureResponseFailedTerminal := func() {
@@ -1983,7 +2018,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			return
 		}
 		if bareErrorAccountSideEffectsPending {
-			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header)
+			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
 			bareErrorAccountSideEffectsPending = false
 		}
 		if clientDisconnected || !writePendingLines() {
@@ -2115,7 +2150,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 						// account health; EOF synthesis applies the pending effect.
 						bareErrorAccountSideEffectsPending = true
 					} else {
-						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header)
+						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header, mappedModel)
 						bareErrorAccountSideEffectsPending = false
 					}
 				}
@@ -2130,7 +2165,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 					}
 					if shouldFailover {
 						return resultWithUsage(),
-							s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, dataBytes, failedMessage, resp.Header)
+							s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 					}
 					if !cyberHit && !sawBareError {
 						if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
@@ -2215,7 +2250,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 
 		if !clientDisconnected && !failureDelivered && !suppressCurrentEvent {
 			if !clientOutputStarted && !lineStartsClientOutput {
-				pendingLines = append(pendingLines, line)
+				if err := appendOpenAIPendingSSELine(&pendingLines, &pendingLinesBytes, line, pendingLineLimit); err != nil {
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] pre-output pending SSE limit exceeded: account=%d max_bytes=%d", account.ID, pendingLineLimit)
+					return resultWithUsage(), newOpenAIPreOutputBufferFailoverError(
+						c, account, true, upstreamRequestID, resp.Header,
+					)
+				}
 				continue
 			}
 			// 真实输出开始，心跳的使命结束。停拍是幂等的，且会与心跳 goroutine
@@ -2266,7 +2306,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				msg += ": " + errText
 			}
 			return resultWithUsage(),
-				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, msg)
+				s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, nil, msg, mappedModel)
 		}
 		if clientDisconnected {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", err)
@@ -2291,7 +2331,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		).Info("OpenAI passthrough 上游流在未收到 [DONE] 时结束，疑似断流")
 		if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
 			return resultWithUsage(),
-				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event")
+				s.newOpenAIStreamFailoverErrorWithModel(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event", mappedModel)
 		}
 		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")

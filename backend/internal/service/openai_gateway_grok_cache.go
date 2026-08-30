@@ -109,11 +109,15 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 	if seed == "" {
 		seed = explicitOpenAIHeaderSessionID(c)
 	}
+	if seed == "" && len(body) > 0 {
+		// grok-build side-calls keep the parent prompt-cache prefix in the body
+		// while using a fresh X-Grok-Conv-Id label for each recap/title request.
+		// Prefer the client-declared cache key so those calls share the main
+		// turn's upstream cache identity; the per-call header remains a fallback.
+		seed = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
+	}
 	if seed == "" && c != nil {
 		seed = strings.TrimSpace(c.GetHeader(grokConversationIDHeader))
-	}
-	if seed == "" && len(body) > 0 {
-		seed = strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String())
 	}
 	if seed == "" {
 		seed = strings.TrimSpace(explicitKey)

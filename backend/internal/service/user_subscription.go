@@ -91,7 +91,8 @@ func (s *UserSubscription) NeedsWeeklyResetAt(now time.Time) bool {
 	if s.WeeklyWindowStart == nil {
 		return false
 	}
-	return !now.Before(s.WeeklyWindowStart.Add(7 * 24 * time.Hour))
+	resetAt := s.windowResetAnchor(*s.WeeklyWindowStart).Add(7 * 24 * time.Hour)
+	return !now.Before(resetAt)
 }
 
 func (s *UserSubscription) NeedsMonthlyReset() bool {
@@ -102,7 +103,8 @@ func (s *UserSubscription) NeedsMonthlyResetAt(now time.Time) bool {
 	if s.MonthlyWindowStart == nil {
 		return false
 	}
-	return !now.Before(s.MonthlyWindowStart.Add(30 * 24 * time.Hour))
+	resetAt := s.windowResetAnchor(*s.MonthlyWindowStart).Add(30 * 24 * time.Hour)
+	return !now.Before(resetAt)
 }
 
 func (s *UserSubscription) canAutomaticallyResetDailyAt(now time.Time) bool {
@@ -138,6 +140,20 @@ func (s *UserSubscription) canAutomaticallyResetMonthlyAt(now time.Time) bool {
 	return ok
 }
 
+// windowResetAnchor returns the effective anchor used by the rolling weekly
+// and monthly windows. Older subscriptions were initialized at midnight on
+// the start date; only that unambiguous first anchor is corrected to StartsAt.
+// Later midnight values may be deliberate manual resets and remain authoritative.
+// Daily windows use calendar-midnight semantics and intentionally do not call
+// this helper.
+func (s *UserSubscription) windowResetAnchor(previous time.Time) time.Time {
+	legacyAnchor := startOfDay(s.StartsAt)
+	if legacyAnchor.Before(s.StartsAt) && previous.Equal(legacyAnchor) {
+		return s.StartsAt
+	}
+	return previous
+}
+
 // automaticWindowStartAt 计算周/月窗口（期限对齐滚动窗口）的当前窗口起点。
 // 窗口从锚点按整数个 period 步进，且不越过订阅到期时间，避免最后一个不完整
 // 周期重复发放额度（issue #5051）。日窗口不走此函数，见 automaticDailyWindowStartAt。
@@ -146,14 +162,7 @@ func (s *UserSubscription) automaticWindowStartAt(previous *time.Time, period ti
 		return time.Time{}, false
 	}
 
-	anchor := *previous
-	// Older subscriptions initialized their first windows at midnight on their
-	// start date. Only that initial value is unambiguous; later midnight anchors
-	// may be manual resets and must remain authoritative.
-	legacyAnchor := startOfDay(s.StartsAt)
-	if legacyAnchor.Before(s.StartsAt) && anchor.Equal(legacyAnchor) {
-		anchor = s.StartsAt
-	}
+	anchor := s.windowResetAnchor(*previous)
 	next := anchor.Add(period)
 	if now.Before(next) || !next.Before(s.ExpiresAt) {
 		return time.Time{}, false
@@ -184,7 +193,7 @@ func (s *UserSubscription) WeeklyResetTime() *time.Time {
 	if s.WeeklyWindowStart == nil {
 		return nil
 	}
-	t := s.WeeklyWindowStart.Add(7 * 24 * time.Hour)
+	t := s.windowResetAnchor(*s.WeeklyWindowStart).Add(7 * 24 * time.Hour)
 	return &t
 }
 
@@ -192,7 +201,7 @@ func (s *UserSubscription) MonthlyResetTime() *time.Time {
 	if s.MonthlyWindowStart == nil {
 		return nil
 	}
-	t := s.MonthlyWindowStart.Add(30 * 24 * time.Hour)
+	t := s.windowResetAnchor(*s.MonthlyWindowStart).Add(30 * 24 * time.Hour)
 	return &t
 }
 

@@ -270,6 +270,9 @@ import {
   selectCodexConfigReasoningEffort
 } from '@/utils/codexCatalogConfig'
 
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol'
+const DEFAULT_CODEX_REASONING_EFFORT = 'medium'
+
 interface Props {
   show: boolean
   apiKey: string
@@ -659,9 +662,15 @@ function selectCodexCatalogModel(preferredModel: string): string {
   return codexCatalogModelSlugs.value[0] || preferredModel
 }
 
-function codexReasoningEffortTomlLine(modelSlug: string): string {
+function codexReasoningEffortTomlLine(modelSlug: string, preferredEffort?: string): string {
+  const catalogModel = findCodexCatalogModel(codexModelManifestContent.value, modelSlug)
+  const catalogEffort = selectCodexConfigReasoningEffort(catalogModel)
+  const preferredEffortIsSupported = !catalogModel ||
+    (catalogModel.supported_reasoning_levels ?? []).some((level) =>
+      typeof level?.effort === 'string' && level.effort.trim() === preferredEffort
+    )
   return formatCodexReasoningEffortTomlLine(
-    selectCodexConfigReasoningEffort(findCodexCatalogModel(codexModelManifestContent.value, modelSlug))
+    preferredEffort && preferredEffortIsSupported ? preferredEffort : catalogEffort
   )
 }
 
@@ -777,22 +786,22 @@ function generateAnthropicFiles(baseUrl: string, apiKey: string): FileConfig[] {
   switch (activeTab.value) {
     case 'unix':
       path = 'Terminal'
-      content = `export ANTHROPIC_BASE_URL="${baseUrl}"
-export ANTHROPIC_AUTH_TOKEN="${apiKey}"
+      content = `export ANTHROPIC_BASE_URL=${quoteUnixShellValue(baseUrl)}
+export ANTHROPIC_AUTH_TOKEN=${quoteUnixShellValue(apiKey)}
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0`
       break
     case 'cmd':
       path = 'Command Prompt'
-      content = `set ANTHROPIC_BASE_URL=${baseUrl}
-set ANTHROPIC_AUTH_TOKEN=${apiKey}
+      content = `${formatCmdEnvironmentAssignment('ANTHROPIC_BASE_URL', baseUrl)}
+${formatCmdEnvironmentAssignment('ANTHROPIC_AUTH_TOKEN', apiKey)}
 set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 set CLAUDE_CODE_ATTRIBUTION_HEADER=0`
       break
     case 'powershell':
       path = 'PowerShell'
-      content = `$env:ANTHROPIC_BASE_URL="${baseUrl}"
-$env:ANTHROPIC_AUTH_TOKEN="${apiKey}"
+      content = `$env:ANTHROPIC_BASE_URL=${quotePowerShellValue(baseUrl)}
+$env:ANTHROPIC_AUTH_TOKEN=${quotePowerShellValue(apiKey)}
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 $env:CLAUDE_CODE_ATTRIBUTION_HEADER=0`
       break
@@ -805,15 +814,15 @@ $env:CLAUDE_CODE_ATTRIBUTION_HEADER=0`
     ? '~/.claude/settings.json'
     : '%USERPROFILE%\\.claude\\settings.json'
 
-  const vscodeContent = `{
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "ANTHROPIC_BASE_URL": "${baseUrl}",
-    "ANTHROPIC_AUTH_TOKEN": "${apiKey}",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
-  }
-}`
+  const vscodeContent = JSON.stringify({
+    $schema: 'https://json.schemastore.org/claude-code-settings.json',
+    env: {
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      CLAUDE_CODE_ATTRIBUTION_HEADER: '0'
+    }
+  }, null, 2)
 
   return [
     { path, content },
@@ -845,19 +854,19 @@ function generateGrokClaudeFiles(baseUrl: string, apiKey: string): FileConfig[] 
     case 'unix':
       path = 'Terminal'
       content = Object.entries(environment)
-        .map(([name, value]) => `export ${name}="${value}"`)
+        .map(([name, value]) => `export ${name}=${quoteUnixShellValue(value)}`)
         .join('\n')
       break
     case 'cmd':
       path = 'Command Prompt'
       content = Object.entries(environment)
-        .map(([name, value]) => `set ${name}=${value}`)
+        .map(([name, value]) => formatCmdEnvironmentAssignment(name, value))
         .join('\n')
       break
     case 'powershell':
       path = 'PowerShell'
       content = Object.entries(environment)
-        .map(([name, value]) => `$env:${name}="${value}"`)
+        .map(([name, value]) => `$env:${name}=${quotePowerShellValue(value)}`)
         .join('\n')
       break
     default:
@@ -892,18 +901,18 @@ function generateGeminiCliContent(baseUrl: string, apiKey: string): FileConfig {
   switch (activeTab.value) {
     case 'unix':
       path = 'Terminal'
-      content = `export GOOGLE_GEMINI_BASE_URL="${baseUrl}"
-export GEMINI_API_KEY="${apiKey}"
-export GEMINI_MODEL="${model}"  # ${modelComment}`
-      highlighted = `${keyword('export')} ${variable('GOOGLE_GEMINI_BASE_URL')}${operator('=')}${string(`"${baseUrl}"`)}
-${keyword('export')} ${variable('GEMINI_API_KEY')}${operator('=')}${string(`"${apiKey}"`)}
+      content = `export GOOGLE_GEMINI_BASE_URL=${quoteUnixShellValue(baseUrl)}
+export GEMINI_API_KEY=${quoteUnixShellValue(apiKey)}
+export GEMINI_MODEL=${quoteUnixShellValue(model)}  # ${modelComment}`
+      highlighted = `${keyword('export')} ${variable('GOOGLE_GEMINI_BASE_URL')}${operator('=')}${string(quoteUnixShellValue(baseUrl))}
+${keyword('export')} ${variable('GEMINI_API_KEY')}${operator('=')}${string(quoteUnixShellValue(apiKey))}
 ${keyword('export')} ${variable('GEMINI_MODEL')}${operator('=')}${string(`"${model}"`)}  ${comment(`# ${modelComment}`)}`
       break
     case 'cmd':
       path = 'Command Prompt'
-      content = `set GOOGLE_GEMINI_BASE_URL=${baseUrl}
-set GEMINI_API_KEY=${apiKey}
-set GEMINI_MODEL=${model}`
+      content = `${formatCmdEnvironmentAssignment('GOOGLE_GEMINI_BASE_URL', baseUrl)}
+${formatCmdEnvironmentAssignment('GEMINI_API_KEY', apiKey)}
+${formatCmdEnvironmentAssignment('GEMINI_MODEL', model)}`
       highlighted = `${keyword('set')} ${variable('GOOGLE_GEMINI_BASE_URL')}${operator('=')}${string(baseUrl)}
 ${keyword('set')} ${variable('GEMINI_API_KEY')}${operator('=')}${string(apiKey)}
 ${keyword('set')} ${variable('GEMINI_MODEL')}${operator('=')}${string(model)}
@@ -911,11 +920,11 @@ ${comment(`REM ${modelComment}`)}`
       break
     case 'powershell':
       path = 'PowerShell'
-      content = `$env:GOOGLE_GEMINI_BASE_URL="${baseUrl}"
-$env:GEMINI_API_KEY="${apiKey}"
-$env:GEMINI_MODEL="${model}"  # ${modelComment}`
-      highlighted = `${keyword('$env:')}${variable('GOOGLE_GEMINI_BASE_URL')}${operator('=')}${string(`"${baseUrl}"`)}
-${keyword('$env:')}${variable('GEMINI_API_KEY')}${operator('=')}${string(`"${apiKey}"`)}
+      content = `$env:GOOGLE_GEMINI_BASE_URL=${quotePowerShellValue(baseUrl)}
+$env:GEMINI_API_KEY=${quotePowerShellValue(apiKey)}
+$env:GEMINI_MODEL=${quotePowerShellValue(model)}  # ${modelComment}`
+      highlighted = `${keyword('$env:')}${variable('GOOGLE_GEMINI_BASE_URL')}${operator('=')}${string(quotePowerShellValue(baseUrl))}
+${keyword('$env:')}${variable('GEMINI_API_KEY')}${operator('=')}${string(quotePowerShellValue(apiKey))}
 ${keyword('$env:')}${variable('GEMINI_MODEL')}${operator('=')}${string(`"${model}"`)}  ${comment(`# ${modelComment}`)}`
       break
     default:
@@ -931,8 +940,11 @@ function generateOpenAIFiles(baseUrl: string, apiKey: string): FileConfig[] {
   const isWindows = activeTab.value === 'windows'
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
 
-  const model = selectCodexCatalogModel('gpt-5.5')
-  const reasoningEffortLine = codexReasoningEffortTomlLine(model)
+  const model = selectCodexCatalogModel(DEFAULT_CODEX_MODEL)
+  const reasoningEffortLine = codexReasoningEffortTomlLine(
+    model,
+    model === DEFAULT_CODEX_MODEL ? DEFAULT_CODEX_REASONING_EFFORT : undefined
+  )
 
   // config.toml content
   const configContent = `model_provider = "OpenAI"
@@ -945,38 +957,50 @@ windows_wsl_setup_acknowledged = true
 
 [model_providers.OpenAI]
 name = "OpenAI"
-base_url = "${baseUrl}"
+base_url = "${escapeTomlBasicString(baseUrl)}"
 wire_api = "responses"
-${generateCodexProviderAuthConfig()}
+${generateCodexProviderAuthConfig(apiKey)}
 
 [features]
 goals = true`
 
-  // auth.json content
-  const authContent = `{
-  "OPENAI_API_KEY": "${apiKey}"
-}`
-
-  return [
-    {
-      path: `${configDir}/config.toml`,
-      content: configContent,
-      hint: t('keys.useKeyModal.openai.configTomlHint')
-    },
-    {
-      path: `${configDir}/auth.json`,
-      content: authContent
-    }
-  ]
+  return buildOpenAICodexFileConfigs(configDir, configContent, apiKey)
 }
 
-function generateCodexProviderAuthConfig(): string {
+function generateCodexProviderAuthConfig(apiKey: string): string {
   if (codexAuthMode.value === 'api-key') {
     return `requires_openai_auth = false
+experimental_bearer_token = "${escapeTomlBasicString(apiKey)}"
 http_headers = { "x-openai-actor-authorization" = "local-image-extension" }`
   }
 
   return 'requires_openai_auth = true'
+}
+
+function buildOpenAICodexFileConfigs(
+  configDir: string,
+  configContent: string,
+  apiKey: string
+): FileConfig[] {
+  const files: FileConfig[] = [
+    {
+      path: `${configDir}/config.toml`,
+      content: configContent,
+      hint: t('keys.useKeyModal.openai.configTomlHint')
+    }
+  ]
+
+  // Preserve the legacy auth.json flow for users who explicitly choose it.
+  // API-key mode is self-contained in config.toml so Codex sends the bearer
+  // header even when it does not enter the OpenAI OAuth auth path.
+  if (codexAuthMode.value === 'legacy') {
+    files.push({
+      path: `${configDir}/auth.json`,
+      content: JSON.stringify({ OPENAI_API_KEY: apiKey }, null, 2)
+    })
+  }
+
+  return files
 }
 
 function joinConfigPath(dir: string, file: string, windows: boolean): string {
@@ -985,7 +1009,51 @@ function joinConfigPath(dir: string, file: string, windows: boolean): string {
 }
 
 function escapeTomlBasicString(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  return Array.from(value, (char) => {
+    switch (char) {
+      case '\\': return '\\\\'
+      case '"': return '\\"'
+      case '\b': return '\\b'
+      case '\t': return '\\t'
+      case '\n': return '\\n'
+      case '\f': return '\\f'
+      case '\r': return '\\r'
+    }
+    const code = char.charCodeAt(0)
+    return code <= 0x1f || code === 0x7f
+      ? `\\u${code.toString(16).padStart(4, '0')}`
+      : char
+  }).join('')
+}
+
+// Keep the legacy output for ordinary URLs/tokens while quoting values that
+// could otherwise be interpreted by the target shell.
+const shellSafeValuePattern = /^[A-Za-z0-9_./:@?=+,%-]*$/
+const cmdSafeValuePattern = /^[A-Za-z0-9_./:@?=+,-]*$/
+
+function quoteUnixShellValue(value: string): string {
+  if (shellSafeValuePattern.test(value)) return `"${value}"`
+  return `'${value.replace(/'/g, `'"'"'`)}'`
+}
+
+function quotePowerShellValue(value: string): string {
+  if (shellSafeValuePattern.test(value)) return `"${value}"`
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+function escapeCmdEnvironmentValue(value: string): string {
+  // A literal newline would terminate a CMD command, so flatten it while
+  // retaining all other characters in the assigned value.
+  return value
+    .replace(/[\r\n]/g, ' ')
+    .replace(/%/g, '%%')
+    .replace(/([&|<>^()!])/g, '^$1')
+    .replace(/"/g, '^"')
+}
+
+function formatCmdEnvironmentAssignment(name: string, value: string): string {
+  if (cmdSafeValuePattern.test(value)) return `set ${name}=${value}`
+  return `set "${name}=${escapeCmdEnvironmentValue(value)}"`
 }
 
 function generateGrokFiles(baseUrl: string, apiKey: string): FileConfig[] {
@@ -999,19 +1067,19 @@ function generateGrokFiles(baseUrl: string, apiKey: string): FileConfig[] {
   switch (shell) {
     case 'cmd':
       envPath = 'Command Prompt'
-      envContent = `set GROK_MODELS_BASE_URL=${baseUrl}
-set XAI_API_KEY=${apiKey}`
+      envContent = `${formatCmdEnvironmentAssignment('GROK_MODELS_BASE_URL', baseUrl)}
+${formatCmdEnvironmentAssignment('XAI_API_KEY', apiKey)}`
       break
     case 'powershell':
     case 'windows':
       envPath = 'PowerShell'
-      envContent = `$env:GROK_MODELS_BASE_URL="${baseUrl}"
-$env:XAI_API_KEY="${apiKey}"`
+      envContent = `$env:GROK_MODELS_BASE_URL=${quotePowerShellValue(baseUrl)}
+$env:XAI_API_KEY=${quotePowerShellValue(apiKey)}`
       break
     default:
       envPath = 'Terminal'
-      envContent = `export GROK_MODELS_BASE_URL="${baseUrl}"
-export XAI_API_KEY="${apiKey}"`
+      envContent = `export GROK_MODELS_BASE_URL=${quoteUnixShellValue(baseUrl)}
+export XAI_API_KEY=${quoteUnixShellValue(apiKey)}`
   }
 
   // Shape follows Grok Build user guide (~/.grok/docs + custom-models) and production-ready Sub2API Plus setups.
@@ -1032,10 +1100,10 @@ export XAI_API_KEY="${apiKey}"`
 # Global inference / catalog endpoints (same role as env GROK_MODELS_BASE_URL).
 # When models_base_url is set, Grok uses API-key Bearer auth (no grok login required).
 [endpoints]
-models_base_url = "${baseUrl}"              # inference base; model list defaults to {base}/models
-models_list_url = "${modelsListUrl}"        # optional override (env: GROK_MODELS_LIST_URL)
-xai_api_base_url = "${baseUrl}"             # public xAI API base override for gateway routing
-cli_chat_proxy_base_url = "${baseUrl}"      # CLI chat-proxy base (env: GROK_CLI_CHAT_PROXY_BASE_URL)
+models_base_url = "${escapeTomlBasicString(baseUrl)}"              # inference base; model list defaults to {base}/models
+models_list_url = "${escapeTomlBasicString(modelsListUrl)}"        # optional override (env: GROK_MODELS_LIST_URL)
+xai_api_base_url = "${escapeTomlBasicString(baseUrl)}"             # public xAI API base override for gateway routing
+cli_chat_proxy_base_url = "${escapeTomlBasicString(baseUrl)}"      # CLI chat-proxy base (env: GROK_CLI_CHAT_PROXY_BASE_URL)
 
 # Prefer API key when using a custom gateway (matches Sub2API Plus).
 # Requires XAI_API_KEY env or per-model env_key / api_key.
@@ -1047,8 +1115,8 @@ model = "grok-4.5"                          # id sent to the API
 name = "Grok 4.5"                           # shown in /model picker
 description = "Grok 4.5 via Sub2API Plus (Responses)"
 # base_url inherits from [endpoints].models_base_url; override only if needed:
-# base_url = "${baseUrl}"
-env_key = "XAI_API_KEY"                     # or: api_key = "${apiKey}"  (not recommended)
+# base_url = "${escapeTomlBasicString(baseUrl)}"
+env_key = "XAI_API_KEY"                     # or: api_key = "${escapeTomlBasicString(apiKey)}"  (not recommended)
 api_backend = "responses"                   # chat_completions | responses | messages
 context_window = 500000                     # drives auto-compaction timing
 # Optional sampling (global defaults can live under [models] instead):
@@ -1143,16 +1211,16 @@ function generateGrokCodexFiles(baseUrl: string, apiKey: string): FileConfig[] {
   switch (shell) {
     case 'cmd':
       envPath = 'Command Prompt'
-      envContent = `set SUB2API_API_KEY=${apiKey}`
+      envContent = formatCmdEnvironmentAssignment('SUB2API_API_KEY', apiKey)
       break
     case 'powershell':
     case 'windows':
       envPath = 'PowerShell'
-      envContent = `$env:SUB2API_API_KEY="${apiKey}"`
+      envContent = `$env:SUB2API_API_KEY=${quotePowerShellValue(apiKey)}`
       break
     default:
       envPath = 'Terminal'
-      envContent = `export SUB2API_API_KEY="${apiKey}"`
+      envContent = `export SUB2API_API_KEY=${quoteUnixShellValue(apiKey)}`
   }
 
   const configContent = `# Codex CLI → Sub2API Plus Grok group
@@ -1174,11 +1242,11 @@ model_catalog_json = "${escapeTomlBasicString(codexModelCatalogPath.value)}"
 
 [model_providers.sub2api]
 name = "Sub2API Plus Grok"
-base_url = "${baseUrl}"
+base_url = "${escapeTomlBasicString(baseUrl)}"
 # Prefer env_key (variable NAME). Do not combine with experimental_bearer_token.
 env_key = "SUB2API_API_KEY"
 # Fallback only if you cannot set env (discouraged — keeps secret on disk):
-# experimental_bearer_token = "${apiKey}"
+# experimental_bearer_token = "${escapeTomlBasicString(apiKey)}"
 wire_api = "responses"
 # API-key providers: do not require ChatGPT OAuth login
 requires_openai_auth = false
@@ -1207,7 +1275,7 @@ function generateRoutedCodexFiles(
   const isWindows = activeTab.value === 'windows'
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
   const preferredModels: Partial<Record<GroupPlatform, string>> = {
-    openai: 'gpt-5.5',
+    openai: DEFAULT_CODEX_MODEL,
     anthropic: 'claude-sonnet-4-6',
     gemini: 'gemini-2.5-pro',
     antigravity: 'claude-sonnet-4-6',
@@ -1215,10 +1283,14 @@ function generateRoutedCodexFiles(
     kimi: 'kimi-k2.5',
     zhipu: 'glm-4.7',
     deepseek: 'deepseek-v4-pro',
-    composite: 'gpt-5.5'
+    composite: DEFAULT_CODEX_MODEL
   }
   const preferredModel = preferredModels[platform] || ''
   const model = selectCodexCatalogModel(preferredModel)
+  const reasoningEffortLine =
+    (platform === 'openai' || platform === 'composite') && model === DEFAULT_CODEX_MODEL
+      ? codexReasoningEffortTomlLine(model, DEFAULT_CODEX_REASONING_EFFORT)
+      : ''
   const labels: Record<GroupPlatform, string> = {
     anthropic: 'Anthropic',
     openai: 'OpenAI',
@@ -1232,19 +1304,19 @@ function generateRoutedCodexFiles(
   }
   const label = labels[platform]
   const envContent = isWindows
-    ? `$env:SUB2API_API_KEY="${apiKey}"`
-    : `export SUB2API_API_KEY="${apiKey}"`
+    ? `$env:SUB2API_API_KEY=${quotePowerShellValue(apiKey)}`
+    : `export SUB2API_API_KEY=${quoteUnixShellValue(apiKey)}`
 
   const configContent = `# Codex CLI -> Sub2API ${label} group
 model_provider = "sub2api"
 model = "${model}"
 review_model = "${model}"
-disable_response_storage = true
+${reasoningEffortLine}disable_response_storage = true
 model_catalog_json = "${escapeTomlBasicString(codexModelCatalogPath.value)}"
 
 [model_providers.sub2api]
 name = "Sub2API ${label}"
-base_url = "${baseUrl}"
+base_url = "${escapeTomlBasicString(baseUrl)}"
 env_key = "SUB2API_API_KEY"
 wire_api = "responses"
 requires_openai_auth = false
@@ -1267,8 +1339,11 @@ supports_websockets = false`
 function generateOpenAIWsFiles(baseUrl: string, apiKey: string): FileConfig[] {
   const isWindows = activeTab.value === 'windows'
   const configDir = isWindows ? '%userprofile%\\.codex' : '~/.codex'
-  const model = selectCodexCatalogModel('gpt-5.5')
-  const reasoningEffortLine = codexReasoningEffortTomlLine(model)
+  const model = selectCodexCatalogModel(DEFAULT_CODEX_MODEL)
+  const reasoningEffortLine = codexReasoningEffortTomlLine(
+    model,
+    model === DEFAULT_CODEX_MODEL ? DEFAULT_CODEX_REASONING_EFFORT : undefined
+  )
 
   // config.toml content with WebSocket v2
   const configContent = `model_provider = "OpenAI"
@@ -1281,31 +1356,16 @@ windows_wsl_setup_acknowledged = true
 
 [model_providers.OpenAI]
 name = "OpenAI"
-base_url = "${baseUrl}"
+base_url = "${escapeTomlBasicString(baseUrl)}"
 wire_api = "responses"
 supports_websockets = true
-${generateCodexProviderAuthConfig()}
+${generateCodexProviderAuthConfig(apiKey)}
 
 [features]
 responses_websockets_v2 = true
 goals = true`
 
-  // auth.json content
-  const authContent = `{
-  "OPENAI_API_KEY": "${apiKey}"
-}`
-
-  return [
-    {
-      path: `${configDir}/config.toml`,
-      content: configContent,
-      hint: t('keys.useKeyModal.openai.configTomlHint')
-    },
-    {
-      path: `${configDir}/auth.json`,
-      content: authContent
-    }
-  ]
+  return buildOpenAICodexFileConfigs(configDir, configContent, apiKey)
 }
 
 function generateOpenCodeConfig(platform: string, baseUrl: string, apiKey: string, pathLabel?: string): FileConfig {

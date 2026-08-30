@@ -479,3 +479,19 @@ func TestOpenAIWSStateStore_BindResponseAccountDetachedWriteContext(t *testing.T
 	require.Greater(t, probe.setDeadlineDelta, 2*time.Second)
 	require.LessOrEqual(t, probe.setDeadlineDelta, 3*time.Second)
 }
+
+func TestOpenAIWSStateStore_BindHTTPResponseOwnerDetachedWriteContext(t *testing.T) {
+	probe := &openAIWSStateStoreTimeoutProbeCache{}
+	store := NewOpenAIWSStateStore(probe)
+	parent := context.WithValue(context.Background(), openAIWSStateStoreProbeContextKey{}, "trace-owner")
+	ctx, cancel := context.WithCancel(parent)
+	cancel()
+
+	err := store.BindHTTPResponseOwner(ctx, 9, "resp_owner_detached_write", 77, 88, time.Minute)
+	require.Error(t, err, "probe deliberately rejects the owner write")
+	require.False(t, probe.setCanceled, "durable owner binding must outlive request cancellation")
+	require.Equal(t, "trace-owner", probe.setValue, "context values must remain available to the write")
+	require.True(t, probe.setHasDeadline)
+	require.Greater(t, probe.setDeadlineDelta, 2*time.Second)
+	require.LessOrEqual(t, probe.setDeadlineDelta, 3*time.Second)
+}

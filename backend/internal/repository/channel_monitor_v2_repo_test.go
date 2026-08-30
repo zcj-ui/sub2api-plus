@@ -93,6 +93,33 @@ func TestChannelMonitorV2WhereRejectsGroupFilterOutsideConfiguredScope(t *testin
 	require.Len(t, args, 3)
 }
 
+func TestChannelMonitorV2RestrictedGroupScopeIntersectsAndDoesNotWiden(t *testing.T) {
+	cfg := service.ChannelMonitorV2Config{
+		Platforms: []service.ChannelMonitorV2PlatformConfig{{Platform: "openai", Enabled: true}},
+		GroupIDs:  []int64{2, 3, 4},
+	}
+
+	filter := service.ChannelMonitorV2Filter{Platforms: []string{"openai"}, RestrictGroups: true, AllowedGroupIDs: []int64{3, 9}}
+	where, args := channelMonitorV2Where(filterWithMonitorWindow(filter), cfg, "m")
+	require.Contains(t, where, "m.group_id = ANY($4)")
+	require.Len(t, args, 4)
+	require.False(t, channelMonitorV2RestrictedGroupScopeEmpty(filter, cfg))
+
+	// A user with no available groups must not inherit the configured "all"
+	// scope. The repository can return an empty result without querying data.
+	empty := service.ChannelMonitorV2Filter{RestrictGroups: true}
+	require.True(t, channelMonitorV2RestrictedGroupScopeEmpty(empty, cfg))
+	where, args = channelMonitorV2Where(filterWithMonitorWindow(empty), cfg, "m")
+	require.Contains(t, where, "FALSE")
+	require.Len(t, args, 3)
+}
+
+func filterWithMonitorWindow(filter service.ChannelMonitorV2Filter) service.ChannelMonitorV2Filter {
+	filter.Start = time.Unix(1, 0)
+	filter.End = time.Unix(2, 0)
+	return filter
+}
+
 func TestChannelMonitorV2ErrorAggregationCountsFinalUserErrorsOnly(t *testing.T) {
 	query := strings.ToLower(channelMonitorV2ErrorAggregationSQL)
 	require.Contains(t, query, "not current_error.is_count_tokens")

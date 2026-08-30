@@ -158,6 +158,10 @@ type AccountTestService struct {
 	// grokWSDialer is optional; realtime account tests use the default OpenAI-style
 	// WS dialer when nil (supports proxy + coder/websocket handshake).
 	grokWSDialer openAIWSClientDialer
+	// openAIModelSyncChromeRequester is injectable for deterministic tests and
+	// lets OpenAI API-key model discovery retry a transient TLS EOF with a
+	// browser-shaped client without changing other provider probes.
+	openAIModelSyncChromeRequester func(*http.Request, string) (*http.Response, error)
 }
 
 func (s *AccountTestService) SetSettingService(settingService *SettingService) {
@@ -196,14 +200,15 @@ func NewAccountTestService(
 	tlsFPProfileService *TLSFingerprintProfileService,
 ) *AccountTestService {
 	return &AccountTestService{
-		accountRepo:               accountRepo,
-		geminiTokenProvider:       geminiTokenProvider,
-		claudeTokenProvider:       claudeTokenProvider,
-		grokTokenProvider:         grokTokenProvider,
-		antigravityGatewayService: antigravityGatewayService,
-		httpUpstream:              httpUpstream,
-		cfg:                       cfg,
-		tlsFPProfileService:       tlsFPProfileService,
+		accountRepo:                    accountRepo,
+		geminiTokenProvider:            geminiTokenProvider,
+		claudeTokenProvider:            claudeTokenProvider,
+		grokTokenProvider:              grokTokenProvider,
+		antigravityGatewayService:      antigravityGatewayService,
+		httpUpstream:                   httpUpstream,
+		cfg:                            cfg,
+		tlsFPProfileService:            tlsFPProfileService,
+		openAIModelSyncChromeRequester: doOpenAIModelSyncChromeRequest,
 	}
 }
 

@@ -68,6 +68,20 @@ func TestWSResponseCreate_ExplicitFilterStripsServiceTier(t *testing.T) {
 	require.NotContains(t, string(updated), `"service_tier"`)
 }
 
+func TestWSResponseCreate_MissingTierRuleIsApplied(t *testing.T) {
+	settings := &OpenAIFastPolicySettings{Rules: []OpenAIFastPolicyRule{
+		{ServiceTier: OpenAIFastTierAny, Action: BetaPolicyActionFilter, Scope: BetaPolicyScopeAll},
+		{ServiceTier: OpenAIFastTierMissing, Action: OpenAIFastPolicyActionForcePriority, Scope: BetaPolicyScopeAll},
+	}}
+	svc := newOpenAIGatewayServiceWithSettings(t, settings)
+	account := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	frame := []byte(`{"type":"response.create","model":"gpt-5.5"}`)
+	updated, blocked, err := svc.applyOpenAIFastPolicyToWSResponseCreate(context.Background(), account, "gpt-5.5", frame)
+	require.NoError(t, err)
+	require.Nil(t, blocked)
+	require.Equal(t, OpenAIFastTierPriority, gjson.GetBytes(updated, "service_tier").String())
+}
+
 func TestWSResponseCreate_UserScopedRuleOverridesGlobalRule(t *testing.T) {
 	settings := &OpenAIFastPolicySettings{
 		Rules: []OpenAIFastPolicyRule{

@@ -114,3 +114,40 @@ describe('PlatformTypeBadge OpenAI authentication modes', () => {
     expect(wrapper.text()).toContain('OAuth')
   })
 })
+
+describe('PlatformTypeBadge OpenAI subscription plans', () => {
+  it.each([
+    ['go', 'Go'],
+    ['plus', 'Plus'],
+    ['pro', 'Pro'],
+    ['chatgptpro', 'Pro'],
+    ['pro_lite', 'Pro Lite'],
+    ['self_serve_business_prolite', 'Pro Lite'],
+    ['business', 'Business'],
+    ['self_serve_business_usage_based', 'Business'],
+    ['enterprise', 'Enterprise'],
+    ['enterprise_cbp_usage_based', 'Enterprise'],
+    ['edu', 'Education'],
+    ['edu_plus', 'Education Plus'],
+    ['edu-pro', 'Education Pro'],
+    ['k12', 'K-12'],
+    ['free_workspace', 'Free Workspace'],
+    ['quorum', 'Quorum'],
+    ['guest', 'Guest'],
+  ])('renders %s as %s', (planType, label) => {
+    const wrapper = mount(PlatformTypeBadge, {
+      props: {
+        platform: 'openai',
+        type: 'oauth',
+        planType,
+      },
+    })
+
+    expect(wrapper.text()).toContain(label)
+    // The raw wire identifier should not leak for aliases that have a stable
+    // user-facing label (for example, `edu_plus` → `Education Plus`).
+    if (planType !== label) {
+      expect(wrapper.text()).not.toContain(planType)
+    }
+  })
+})

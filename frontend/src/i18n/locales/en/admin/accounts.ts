@@ -92,6 +92,8 @@ export default {
       oauthType: 'OAuth',
       setupToken: 'Setup Token',
       apiKey: 'API Key',
+      serviceAccountType: 'Service Account',
+      upstreamType: 'Upstream',
       // Schedulable toggle
       schedulable: 'Schedulable',
       schedulableHint: 'Enable to include this account in API request scheduling',
@@ -470,6 +472,7 @@ export default {
         selectAllFailed: 'Failed to load all accounts. The previous selection was kept.',
         clear: 'Clear selection',
         edit: 'Bulk Edit',
+        editFiltered: 'Update by Filters',
         delete: 'Bulk Delete',
         confirmDelete: 'Delete the selected {count} account(s)? This action cannot be undone.',
         deleteSuccess: 'Deleted {count} account(s)',
@@ -489,6 +492,7 @@ export default {
         failurePoolHint: 'OAuth quota/reset-credit queries or API Key connection tests failed twice consecutively.',
         completed: 'Health probe complete: {healthy} healthy, {skipped} skipped',
         completedWithFailures: 'Health probe complete: {healthy} healthy, {failed} dead, {skipped} skipped',
+        partial: 'Health probe partially complete: {completed} accounts processed; {failed} accounts in {batches} batch(es) failed at the request level. Completed results were kept.',
         batchLimit: 'A health probe can include at most 200 accounts',
         failed: 'Batch health probe failed'
       },
@@ -513,6 +517,9 @@ export default {
         empty: 'No inventory results',
         completed: 'Inventory complete: {healthy} healthy, {skipped} skipped, {quota} quota snapshots fetched',
         completedWithFailures: 'Inventory complete: {healthy} healthy, {failed} failed, {skipped} skipped, {quota} quota snapshots fetched',
+        partial: 'Inventory partially complete: {healthy} healthy, {failed} failed, {skipped} skipped, {quota} quota snapshots fetched; {requestFailed} accounts in {batches} batch(es) failed at the request level.',
+        requestFailedAccounts: 'Batch request failures',
+        partialHint: '{accounts} accounts in {batches} batch(es) returned no result. Completed batches were kept; close this dialog and rerun the inventory for the selected accounts.',
         batchLimit: 'An inventory can include at most 200 selected accounts',
         requestFailed: 'Selected account inventory failed'
       },
@@ -520,6 +527,12 @@ export default {
         title: 'Bulk Edit Accounts',
         selectionInfo:
           '{count} account(s) selected. Only checked or filled fields will be updated; others stay unchanged.',
+        filteredSelectionInfo:
+          'This will update all {count} account(s) matched by the current filters, not only the checked rows.',
+        filteredScopeWarning:
+          'This is a filter-wide update and will apply to all {count} accounts matched by the current filters.',
+        filteredScopeConfirm: 'I confirm that this change should apply to every account in the filtered scope.',
+        filteredScopeConfirmRequired: 'Confirm the full filtered target scope before updating accounts.',
         baseUrlPlaceholder: 'https://api.anthropic.com or https://api.openai.com',
         baseUrlNotice: 'Applies to API Key accounts and the forwarding endpoint of Grok OAuth accounts; leave empty to keep existing value',
         submit: 'Update Accounts',
@@ -656,6 +669,7 @@ export default {
         capabilityChatCompletions: 'Chat Completions',
         capabilityChatCompletionsAuto: 'Chat Completions (auto probe)',
         capabilityEmbeddings: 'Embeddings',
+        capabilityPromptCacheRetention: 'Legacy prompt-cache retention',
         responsesStatusAutoSupported: 'Auto probe: Responses',
         responsesStatusAutoUnsupported: 'Auto probe: Chat Completions',
         responsesStatusAutoUnknown: 'Auto probe: unknown',
@@ -665,6 +679,10 @@ export default {
         planTypeDesc:
           "Manually correct this account's ChatGPT plan tier (Plus / Pro / Free). Note: a token refresh near expiry or a 429 rate-limit response will auto-overwrite this with the real tier.",
         planTypeClear: 'Clear (auto-detect)',
+        customUserAgent: 'Custom User-Agent',
+        customUserAgentDesc:
+          'Optional per-account Codex User-Agent fingerprint for OpenAI OAuth. The client/version identity is normalized on egress; leave blank to use the global setting.',
+        customUserAgentPlaceholder: 'e.g. codex-tui/0.146.0 (macOS 15.1; arm64) iTerm.app',
         codexCLIOnly: 'Codex official clients only',
         codexCLIOnlyDesc:
           'Only applies to OpenAI OAuth. When enabled, only Codex official client families are allowed; when disabled, the gateway bypasses this restriction and keeps existing behavior.',
@@ -1579,6 +1597,9 @@ export default {
         reset: 'Reset',
         balanceReferenceHint: 'USD is a UI reference calculated as Credit ÷ 25',
         unlimitedBalance: 'Unlimited',
+        spendControl: 'Workspace limit',
+        spendControlHint: 'Team/Business/Enterprise/Edu/K12 spend-control limit',
+        spendControlReached: 'Limit reached',
         countTooltipLoad: 'Click to load the available reset-credit count',
         countTooltipRefresh: 'Click to refresh the available reset-credit count',
         resetTooltipReady: 'Consume 1 reset credit to immediately restore the window',

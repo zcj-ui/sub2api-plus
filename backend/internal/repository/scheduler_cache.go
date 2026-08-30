@@ -1053,6 +1053,7 @@ func filterSchedulerExtra(extra map[string]any) map[string]any {
 		"codex_5h_reset_after_seconds",
 		"codex_7d_reset_after_seconds",
 		"codex_usage_updated_at",
+		"codex_plan_type",
 		"codex_credit_snapshot",
 		service.AccountHealthProbeExtraKey,
 		"auto_pause_5h_threshold",

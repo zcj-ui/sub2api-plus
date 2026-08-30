@@ -448,6 +448,14 @@ type RateLimit429CooldownSettings struct {
 	CooldownSeconds int  `json:"cooldown_seconds"`
 }
 
+// OpenAI403CooldownSettings OpenAI 403 临时冷却配置 DTO
+type OpenAI403CooldownSettings struct {
+	Enabled          bool `json:"enabled"`
+	CooldownMinutes  int  `json:"cooldown_minutes"`
+	DisableThreshold int  `json:"disable_threshold"`
+	WindowMinutes    int  `json:"window_minutes"`
+}
+
 // OpenAIImagesOAuthUnavailableCooldownSettings controls the OpenAI OAuth
 // image-tool unavailable cooldown.  It is intentionally separate from the
 // general 429 setting and is not used by Claude/CC channels.

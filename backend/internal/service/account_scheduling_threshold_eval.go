@@ -247,7 +247,7 @@ func openAIThresholdCandidate(extra map[string]any, window string, now time.Time
 	}
 
 	usedPercent, ok := extra[usedPercentKey]
-	if !ok {
+	if !ok || usedPercent == nil {
 		return nil
 	}
 	if openAIQuotaWindowReset(extra, window, now) || openAICodexSnapshotStaleForPause(extra, now) {

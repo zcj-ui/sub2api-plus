@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +18,14 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"go.uber.org/zap"
+)
+
+// Codex quota windows are currently five hours and seven days. Keep a small
+// amount of clock/relay skew while rejecting untrusted reset headers that
+// would otherwise overflow time.Duration or pin an account for months.
+const (
+	maxCodexResetAfterSeconds = int64(8 * 24 * 60 * 60)
+	maxCodexWindowMinutes     = maxCodexResetAfterSeconds / 60
 )
 
 // OpenAIRecordUsageInput input for recording usage
@@ -149,7 +159,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if !isGrokVideoUsageResult(result, nil) {
 		ApplyOpenAIImageBillingResolution(result)
 	}
-	logServiceTierBillingDowngrade("service.openai_gateway", account, result.RequestID, ApplyOpenAIServiceTierBillingResolution(result))
+	logServiceTierBillingDowngrade("service.openai_gateway", account, result.RequestID, ApplyOpenAIServiceTierBillingResolution(account, result))
 
 	// OpenAI input_tokens 是总输入，包含缓存读取和缓存写入明细。
 	// 将三类 token 拆成互斥桶，避免缓存写入同时按普通输入和 cache_write 重复计费。
@@ -906,7 +916,8 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 	// Helper to parse float64 from header
 	parseFloat := func(key string) *float64 {
 		if v := headers.Get(key); v != "" {
-			if f, err := strconv.ParseFloat(v, 64); err == nil {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil &&
+				!math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 {
 				return &f
 			}
 		}
@@ -914,25 +925,39 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 	}
 
 	// Helper to parse int from header
-	parseInt := func(key string) *int {
+	parseWindowInt := func(key string) *int {
 		if v := headers.Get(key); v != "" {
-			if i, err := strconv.Atoi(v); err == nil {
-				return &i
+			if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil &&
+				i > 0 && i <= maxCodexWindowMinutes {
+				value := int(i)
+				return &value
 			}
 		}
 		return nil
 	}
+	parseResetInt := func(key string) *int {
+		if v := headers.Get(key); v != "" {
+			if i, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil &&
+				i >= 0 && i <= maxCodexResetAfterSeconds {
+				value := int(i)
+				return &value
+			}
+		}
+		return nil
+	}
+	// Keep this parser deliberately field-specific. Window lengths and reset
+	// countdowns are trusted only within the documented 5h/7d envelope.
 
 	// Primary (weekly) limits
 	if v := parseFloat("x-codex-primary-used-percent"); v != nil {
 		snapshot.PrimaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-primary-reset-after-seconds"); v != nil {
+	if v := parseResetInt("x-codex-primary-reset-after-seconds"); v != nil {
 		snapshot.PrimaryResetAfterSeconds = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-primary-window-minutes"); v != nil {
+	if v := parseWindowInt("x-codex-primary-window-minutes"); v != nil {
 		snapshot.PrimaryWindowMinutes = v
 		hasData = true
 	}
@@ -942,11 +967,11 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		snapshot.SecondaryUsedPercent = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-secondary-reset-after-seconds"); v != nil {
+	if v := parseResetInt("x-codex-secondary-reset-after-seconds"); v != nil {
 		snapshot.SecondaryResetAfterSeconds = v
 		hasData = true
 	}
-	if v := parseInt("x-codex-secondary-window-minutes"); v != nil {
+	if v := parseWindowInt("x-codex-secondary-window-minutes"); v != nil {
 		snapshot.SecondaryWindowMinutes = v
 		hasData = true
 	}
@@ -961,7 +986,7 @@ func ParseCodexRateLimitHeaders(headers http.Header) *OpenAICodexUsageSnapshot {
 		return nil
 	}
 
-	snapshot.UpdatedAt = time.Now().Format(time.RFC3339)
+	snapshot.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	return snapshot
 }
 
@@ -972,7 +997,7 @@ func codexSnapshotBaseTime(snapshot *OpenAICodexUsageSnapshot, fallback time.Tim
 	if snapshot.UpdatedAt == "" {
 		return fallback
 	}
-	base, err := time.Parse(time.RFC3339, snapshot.UpdatedAt)
+	base, err := time.Parse(time.RFC3339Nano, snapshot.UpdatedAt)
 	if err != nil {
 		return fallback
 	}
@@ -985,10 +1010,91 @@ func codexResetAtRFC3339(base time.Time, resetAfterSeconds *int) *string {
 	}
 	sec := *resetAfterSeconds
 	if sec < 0 {
-		sec = 0
+		// Header values are untrusted relay input.  Treat negative reset values as
+		// absent instead of converting them into an immediate reset timestamp;
+		// callers can still use the observed usage percentage to render an
+		// already-exhausted window.
+		return nil
+	}
+	if int64(sec) > maxCodexResetAfterSeconds {
+		return nil
 	}
 	resetAt := base.Add(time.Duration(sec) * time.Second).Format(time.RFC3339)
 	return &resetAt
+}
+
+// addCodexUsageWindowTombstones marks fields from a quota window that the
+// upstream explicitly did not return.  Account extra updates are top-level
+// JSON merges, so simply omitting a missing 5h/7d slot leaves an older snapshot
+// alive and can make scheduling/UI report a window that no longer exists
+// (for example a weekly-only Free plan).  We only emit tombstones when one or
+// both valid window lengths identify the layout; header responses without any
+// window length remain conservative and do not erase data on a partial relay.
+func addCodexUsageWindowTombstones(
+	updates map[string]any,
+	snapshot *OpenAICodexUsageSnapshot,
+	normalized *NormalizedCodexLimits,
+) {
+	if len(updates) == 0 || snapshot == nil {
+		return
+	}
+	validWindow := func(value *int) bool {
+		return value != nil && *value > 0 && int64(*value) <= maxCodexWindowMinutes
+	}
+	primaryKnown := validWindow(snapshot.PrimaryWindowMinutes)
+	secondaryKnown := validWindow(snapshot.SecondaryWindowMinutes)
+	if primaryKnown == secondaryKnown {
+		return
+	}
+
+	// Clear the raw source slot that is absent, including any stale countdown
+	// and percentage values left by a prior two-window observation.
+	if primaryKnown {
+		for _, key := range []string{
+			"codex_secondary_used_percent",
+			"codex_secondary_reset_after_seconds",
+			"codex_secondary_window_minutes",
+		} {
+			updates[key] = nil
+		}
+	} else {
+		for _, key := range []string{
+			"codex_primary_used_percent",
+			"codex_primary_reset_after_seconds",
+			"codex_primary_window_minutes",
+		} {
+			updates[key] = nil
+		}
+	}
+
+	if normalized == nil {
+		return
+	}
+	// Clear each absent canonical field separately. A slot may have a valid
+	// window length but no reset countdown; retaining the old reset_at would be
+	// just as misleading as retaining the old utilization percentage.
+	clear5h := func(key string) { updates[key] = nil }
+	clear7d := func(key string) { updates[key] = nil }
+	if normalized.Used5hPercent == nil {
+		clear5h(OpenAIQuotaUsed5hPercentExtraKey)
+	}
+	if normalized.Reset5hSeconds == nil {
+		clear5h(OpenAIQuotaReset5hSecondsExtraKey)
+		clear5h(OpenAIQuotaReset5hAtExtraKey)
+	}
+	if normalized.Window5hMinutes == nil {
+		clear5h(OpenAIQuotaWindow5hMinutesExtraKey)
+	}
+	if normalized.Used7dPercent == nil {
+		clear7d(OpenAIQuotaUsed7dPercentExtraKey)
+	}
+	if normalized.Reset7dSeconds == nil {
+		clear7d(OpenAIQuotaReset7dSecondsExtraKey)
+		clear7d(OpenAIQuotaReset7dAtExtraKey)
+	}
+	if normalized.Window7dMinutes == nil {
+		clear7d(OpenAIQuotaWindow7dMinutesExtraKey)
+	}
 }
 
 func buildCodexUsageExtraUpdates(snapshot *OpenAICodexUsageSnapshot, fallbackNow time.Time) map[string]any {
@@ -1003,25 +1109,28 @@ func buildCodexUsageExtraUpdates(snapshot *OpenAICodexUsageSnapshot, fallbackNow
 	if snapshot.PrimaryUsedPercent != nil {
 		updates["codex_primary_used_percent"] = *snapshot.PrimaryUsedPercent
 	}
-	if snapshot.PrimaryResetAfterSeconds != nil {
+	if snapshot.PrimaryResetAfterSeconds != nil && *snapshot.PrimaryResetAfterSeconds >= 0 && int64(*snapshot.PrimaryResetAfterSeconds) <= maxCodexResetAfterSeconds {
 		updates["codex_primary_reset_after_seconds"] = *snapshot.PrimaryResetAfterSeconds
 	}
-	if snapshot.PrimaryWindowMinutes != nil {
+	if snapshot.PrimaryWindowMinutes != nil && *snapshot.PrimaryWindowMinutes > 0 && int64(*snapshot.PrimaryWindowMinutes) <= maxCodexWindowMinutes {
 		updates["codex_primary_window_minutes"] = *snapshot.PrimaryWindowMinutes
 	}
 	if snapshot.SecondaryUsedPercent != nil {
 		updates["codex_secondary_used_percent"] = *snapshot.SecondaryUsedPercent
 	}
-	if snapshot.SecondaryResetAfterSeconds != nil {
+	if snapshot.SecondaryResetAfterSeconds != nil && *snapshot.SecondaryResetAfterSeconds >= 0 && int64(*snapshot.SecondaryResetAfterSeconds) <= maxCodexResetAfterSeconds {
 		updates["codex_secondary_reset_after_seconds"] = *snapshot.SecondaryResetAfterSeconds
 	}
-	if snapshot.SecondaryWindowMinutes != nil {
+	if snapshot.SecondaryWindowMinutes != nil && *snapshot.SecondaryWindowMinutes > 0 && int64(*snapshot.SecondaryWindowMinutes) <= maxCodexWindowMinutes {
 		updates["codex_secondary_window_minutes"] = *snapshot.SecondaryWindowMinutes
 	}
 	if snapshot.PrimaryOverSecondaryPercent != nil {
 		updates["codex_primary_over_secondary_percent"] = *snapshot.PrimaryOverSecondaryPercent
 	}
 	updates["codex_usage_updated_at"] = baseTime.Format(time.RFC3339)
+	if !baseTime.IsZero() {
+		updates[OpenAICodexUsageObservedAtUnixNanoExtraKey] = baseTime.UnixNano()
+	}
 
 	// 归一化到 5h/7d 规范字段
 	if normalized := snapshot.Normalize(); normalized != nil {
@@ -1049,6 +1158,7 @@ func buildCodexUsageExtraUpdates(snapshot *OpenAICodexUsageSnapshot, fallbackNow
 		if reset7dAt := codexResetAtRFC3339(baseTime, normalized.Reset7dSeconds); reset7dAt != nil {
 			updates["codex_7d_reset_at"] = *reset7dAt
 		}
+		addCodexUsageWindowTombstones(updates, snapshot, normalized)
 	}
 
 	return updates
@@ -1059,12 +1169,15 @@ func buildCodexUsageExtraUpdates(snapshot *OpenAICodexUsageSnapshot, fallbackNow
 // ⚠️ 调用方必须排除 spark 影子账号(account.IsShadow()):影子的 codex_* 仅由 QueryUsage
 // (/wham/usage bengalfox 道)更新,不能被全局头口径污染(外审第7轮 P1)。本函数仅持 accountID,
 // 无法在此自检影子,故守卫前置到各调用点。
-func (s *OpenAIGatewayService) updateCodexUsageSnapshot(ctx context.Context, accountID int64, snapshot *OpenAICodexUsageSnapshot) {
+func (s *OpenAIGatewayService) updateCodexUsageSnapshot(ctx context.Context, accountID int64, snapshot *OpenAICodexUsageSnapshot, accountOpt ...*Account) {
 	if snapshot == nil {
 		return
 	}
 	if s == nil || s.accountRepo == nil {
 		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	now := time.Now()
@@ -1072,11 +1185,39 @@ func (s *OpenAIGatewayService) updateCodexUsageSnapshot(ctx context.Context, acc
 	if len(updates) == 0 {
 		return
 	}
-	if !s.getCodexSnapshotThrottle().Allow(accountID, now) {
+	account := (*Account)(nil)
+	if len(accountOpt) > 0 {
+		account = accountOpt[0]
+	}
+	throttle := s.getCodexSnapshotThrottle()
+	if account != nil && s.codexSnapshotReachesAutoPauseThreshold(ctx, account, updates) {
+		unlockWrite, allowed := s.codexSnapshotWriteLocks.LockIfAllowed(accountID, func() bool {
+			return throttle.AllowCritical(accountID, now)
+		})
+		if !allowed {
+			return
+		}
+		defer unlockWrite()
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := s.accountRepo.UpdateExtra(persistCtx, accountID, updates); err != nil {
+			throttle.CancelCritical(accountID, now)
+			slog.Warn("openai_codex_auto_pause_snapshot_persist_failed", "account_id", accountID, "error", err)
+		} else {
+			// Keep the auto-reset worker informed for the synchronous critical
+			// path just as it is for ordinary asynchronous snapshot writes.
+			notifyOpenAIAutoReset(accountID)
+		}
 		return
 	}
-
+	unlockWrite, allowed := s.codexSnapshotWriteLocks.LockIfAllowed(accountID, func() bool {
+		return throttle.Allow(accountID, now)
+	})
+	if !allowed {
+		return
+	}
 	go func() {
+		defer unlockWrite()
 		updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := s.accountRepo.UpdateExtra(updateCtx, accountID, updates); err == nil {
@@ -1092,4 +1233,39 @@ func (s *OpenAIGatewayService) UpdateCodexUsageSnapshotFromHeaders(ctx context.C
 	if snapshot := ParseCodexRateLimitHeaders(headers); snapshot != nil {
 		s.updateCodexUsageSnapshot(ctx, accountID, snapshot)
 	}
+}
+
+// UpdateCodexUsageSnapshotFromHeadersForAccount is the account-aware variant
+// used by OpenAI forwarding paths. It can detect an auto-pause threshold before
+// the response body is drained and persist that critical snapshot immediately;
+// the legacy accountID API remains for callers that only have an ID.
+func (s *OpenAIGatewayService) UpdateCodexUsageSnapshotFromHeadersForAccount(ctx context.Context, account *Account, headers http.Header) {
+	if account == nil || account.ID <= 0 || headers == nil {
+		return
+	}
+	if snapshot := ParseCodexRateLimitHeaders(headers); snapshot != nil {
+		s.updateCodexUsageSnapshot(ctx, account.ID, snapshot, account)
+	}
+}
+
+func (s *OpenAIGatewayService) codexSnapshotReachesAutoPauseThreshold(ctx context.Context, account *Account, updates map[string]any) bool {
+	if account == nil || !account.IsOpenAI() || len(updates) == 0 {
+		return false
+	}
+	if _, has5h := updates["codex_5h_used_percent"]; !has5h {
+		if _, has7d := updates["codex_7d_used_percent"]; !has7d {
+			return false
+		}
+	}
+	mergedExtra := make(map[string]any, len(account.Extra)+len(updates))
+	for key, value := range account.Extra {
+		mergedExtra[key] = value
+	}
+	for key, value := range updates {
+		mergedExtra[key] = value
+	}
+	accountSnapshot := *account
+	accountSnapshot.Extra = mergedExtra
+	paused, _ := shouldAutoPauseOpenAIAccountByQuota(s.withOpenAIQuotaAutoPauseContext(ctx), &accountSnapshot)
+	return paused
 }

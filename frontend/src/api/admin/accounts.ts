@@ -23,6 +23,7 @@ import type {
   CheckMixedChannelResponse,
   UpstreamBillingProbeResult,
   UpstreamBillingProbeSettings,
+  UpstreamBillingRatesResponse,
   OllamaCloudUsageSettings,
   OllamaCloudUsageState
 } from '@/types'
@@ -68,6 +69,41 @@ export interface AccountListWithEtagResult {
   notModified: boolean
   etag: string | null
   data: PaginatedResponse<Account> | null
+}
+
+export interface AccountUpstreamBillingRatesWithEtagResult {
+  notModified: boolean
+  etag: string | null
+  data: UpstreamBillingRatesResponse | null
+}
+
+/** Read compact persisted billing snapshots without reloading full account rows. */
+export async function getUpstreamBillingRatesWithEtag(
+  page: number = 1,
+  pageSize: number = 20,
+  filters?: {
+    platform?: string
+    type?: string
+    status?: string
+    group?: string
+    search?: string
+    privacy_mode?: string
+    sort_by?: string
+    sort_order?: 'asc' | 'desc'
+  },
+  options?: { signal?: AbortSignal; etag?: string | null }
+): Promise<AccountUpstreamBillingRatesWithEtagResult> {
+  const headers: Record<string, string> = {}
+  if (options?.etag) headers['If-None-Match'] = options.etag
+  const response = await apiClient.get<UpstreamBillingRatesResponse>('/admin/accounts/upstream-billing-rates', {
+    params: { page, page_size: pageSize, ...filters },
+    headers,
+    signal: options?.signal,
+    validateStatus: (status) => (status >= 200 && status < 300) || status === 304
+  })
+  const etag = typeof response.headers?.etag === 'string' ? response.headers.etag : null
+  if (response.status === 304) return { notModified: true, etag, data: null }
+  return { notModified: false, etag, data: response.data }
 }
 
 export async function listWithEtag(
@@ -355,6 +391,10 @@ export interface BatchAccountHealthProbeResponse {
   healthy: number
   failed: number
   skipped: number
+  /** Client-side batch aggregation fields (omitted by the server). */
+  request_failed_accounts?: number
+  request_failed_batches?: number
+  request_failed_reason?: string
 }
 
 // A 200-account batch runs with backend concurrency 8. OAuth health checks can
@@ -387,6 +427,10 @@ export interface BatchAccountInventoryResponse {
   failed: number
   skipped: number
   quota_fetched: number
+  /** Client-side batch aggregation fields (omitted by the server). */
+  request_failed_accounts?: number
+  request_failed_batches?: number
+  request_failed_reason?: string
 }
 
 export async function batchInventory(accountIds: number[]): Promise<BatchAccountInventoryResponse> {
@@ -921,7 +965,25 @@ export interface OpenAICodexCredits {
   has_credits: boolean
   unlimited: boolean
   overage_limit_reached: boolean
-  balance: string
+  /** WHAM normally returns a decimal string; compatibility relays may emit a number. */
+  balance: string | number
+}
+
+/** Workspace spend-control data returned for Team/Business/Enterprise/Edu/K12 plans. */
+export interface OpenAISpendControlLimit {
+  source?: string
+  limit?: string
+  used?: string
+  remaining?: string
+  used_percent?: number
+  remaining_percent?: number
+  reset_after_seconds?: number
+  reset_at?: number
+}
+
+export interface OpenAISpendControl {
+  reached: boolean
+  individual_limit?: OpenAISpendControlLimit | null
 }
 
 export interface OpenAIQuotaUsage {
@@ -932,6 +994,7 @@ export interface OpenAIQuotaUsage {
   rate_limit?: OpenAIRateLimit | null
   additional_rate_limits?: OpenAIAdditionalRateLimit[]
   credits?: OpenAICodexCredits | null
+  spend_control?: OpenAISpendControl | null
   rate_limit_reset_credits?: OpenAIRateLimitResetCredits | null
   fetched_at: number
 }
@@ -1089,6 +1152,7 @@ export async function refreshOllamaCloudUsage(id: number): Promise<OllamaCloudUs
 export const accountsAPI = {
   list,
   listWithEtag,
+  getUpstreamBillingRatesWithEtag,
   getById,
   create,
   duplicate,

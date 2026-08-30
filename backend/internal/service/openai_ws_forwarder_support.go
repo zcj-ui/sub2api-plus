@@ -14,6 +14,30 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// openAIWSRateLimitSignalTracker de-duplicates account side effects for one
+// upstream turn. A status-less semantic usage/rate-limit code is still a
+// useful request failover signal, but it is not proof of an HTTP 429 and must
+// not consume one of the OAuth two-strike confirmations. Keep that observation
+// separate so a later frame in the same turn carrying an explicit 429 can still
+// be processed.
+type openAIWSRateLimitSignalTracker struct {
+	explicit429Handled bool
+}
+
+func (t *openAIWSRateLimitSignalTracker) observe(isRateLimit, explicit429 bool) (signal, applySideEffect bool) {
+	if !isRateLimit {
+		return false, false
+	}
+	if !explicit429 || t == nil {
+		return true, false
+	}
+	if t.explicit429Handled {
+		return true, false
+	}
+	t.explicit429Handled = true
+	return true, true
+}
+
 func (s *OpenAIGatewayService) isOpenAIWSGeneratePrewarmEnabled() bool {
 	return s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.PrewarmGenerateEnabled
 }
@@ -104,19 +128,24 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	prewarmResponseID := ""
 	prewarmEventCount := 0
 	prewarmTerminalCount := 0
-	rateLimitSignalHandled := false
+	rateLimitSignalTracker := &openAIWSRateLimitSignalTracker{}
 	recordPrewarmRateLimit := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
 		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
 		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
-		if !isRateLimit || rateLimitSignalHandled {
-			return isRateLimit
+		isRateLimit, applySideEffect := rateLimitSignalTracker.observe(isRateLimit, explicit429)
+		if !isRateLimit {
+			return false
+		}
+		if !applySideEffect {
+			return true
 		}
 		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
-			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
+			prewarmModel, _ := prewarmPayload["model"].(string)
+			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody, prewarmModel)
 		} else {
-			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
+			prewarmModel, _ := prewarmPayload["model"].(string)
+			s.persistOpenAIWSRateLimitSignalForModel(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, prewarmModel, upstreamStatus)
 		}
-		rateLimitSignalHandled = true
 		// A prewarm 429 can be the second explicit signal that confirms the
 		// already-acquired socket. A lease observed during the transition is
 		// eligible only when the exact socket was already pooled before it;
@@ -450,9 +479,30 @@ func openAIWSPayloadTransientStatus(payload []byte) int {
 }
 
 func (s *OpenAIGatewayService) handleOpenAIWSTerminalTransientFailure(ctx context.Context, account *Account, canonicalModel string, headers http.Header, payload []byte) string {
+	return s.handleOpenAIWSTerminalTransientFailureAfterRateLimitSignal(ctx, account, canonicalModel, headers, payload, false)
+}
+
+// handleOpenAIWSTerminalTransientFailureAfterRateLimitSignal is the terminal
+// event variant used by relays that already classified the same response.failed
+// frame before returning it to this helper. The rate-limit side effect must be
+// applied exactly once: re-entering HandleUpstreamError here would turn one
+// explicit OAuth 429 into the second confirmation strike. A status-less
+// usage_limit/rate_limit semantic signal is also deliberately not converted
+// into an implicit 429 confirmation.
+func (s *OpenAIGatewayService) handleOpenAIWSTerminalTransientFailureAfterRateLimitSignal(
+	ctx context.Context,
+	account *Account,
+	canonicalModel string,
+	headers http.Header,
+	payload []byte,
+	rateLimitSignalObserved bool,
+) string {
 	eventType, _, _ := parseOpenAIWSEventEnvelope(payload)
 	terminalEvent := normalizeOpenAIWSTerminalEvent(eventType)
 	if terminalEvent != "response.failed" {
+		return terminalEvent
+	}
+	if rateLimitSignalObserved && openAIStreamFailureStatus(payload, extractOpenAISSEErrorMessage(payload)) == http.StatusTooManyRequests {
 		return terminalEvent
 	}
 	s.handleOpenAIWSFailureAccountSideEffects(ctx, account, canonicalModel, headers, payload)
@@ -466,6 +516,9 @@ func (s *OpenAIGatewayService) handleOpenAIWSErrorEventTransientFailure(ctx cont
 	}
 	status := openAIWSPayloadTransientStatus(payload)
 	if status != 0 {
+		if status == http.StatusTooManyRequests {
+			headers = openAIWSSemantic429Headers(account, canonicalModel, headers)
+		}
 		s.handleOpenAIAccountUpstreamError(ctx, account, status, headers, payload, canonicalModel)
 	}
 }
@@ -478,13 +531,13 @@ func (s *OpenAIGatewayService) handleOpenAIWSFailureAccountSideEffects(ctx conte
 	status := openAIStreamFailureStatus(payload, message)
 	switch status {
 	case http.StatusUnauthorized, http.StatusTooManyRequests, 529:
-		s.handleOpenAIStreamTerminalAccountSideEffects(nil, account, payload, message, headers)
+		s.handleOpenAIStreamTerminalAccountSideEffects(nil, account, payload, message, headers, canonicalModel)
 		return true
 	case http.StatusForbidden:
 		if !openAIStream403AccountFailure(payload, message) {
 			return false
 		}
-		s.handleOpenAIStreamTerminalAccountSideEffects(nil, account, payload, message, headers)
+		s.handleOpenAIStreamTerminalAccountSideEffects(nil, account, payload, message, headers, canonicalModel)
 		return true
 	}
 
@@ -710,7 +763,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		}
 	}
 
-	account, err := s.getSchedulableAccount(ctx, accountID)
+	account, err := s.getOpenAIAccountForScheduling(ctx, accountID, requireCompact)
 	if err != nil || account == nil {
 		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 		return 0, nil, "", nil
@@ -722,7 +775,7 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if !account.IsOpenAIApiKey() && s.getOpenAIWSProtocolResolver().Resolve(account).Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 		return 0, nil, "", nil
 	}
-	if shouldClearStickySession(account, requestedModel) || !account.IsOpenAI() || !account.IsSchedulable() {
+	if shouldClearStickySessionForOpenAIRequest(ctx, account, requestedModel, requireCompact) || !account.IsOpenAI() {
 		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 		return 0, nil, "", nil
 	}
@@ -749,8 +802,10 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	// account over its 5h/7d threshold keeps serving the same response chain even though
 	// normal scheduling skips it. Pause is transient, so fall through to normal scheduling
 	// without deleting the binding (the window may reset before the next turn).
-	if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
-		return 0, nil, "", nil
+	if !requireCompact {
+		if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
+			return 0, nil, "", nil
+		}
 	}
 	// 分组利润控制：与 quota auto-pause 同语义——利润不合格是暂时
 	// 状态（上游倍率/高峰随时间变化），只跳过本次复用、落回普通调度，不删除
@@ -764,7 +819,12 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 			return 0, nil, "", nil
 		}
-		if shouldClearStickySession(latest, requestedModel) || !latest.IsOpenAI() || !latest.IsSchedulable() {
+		latest = effectiveOpenAIShadowUpstreamProfile(latest, s.parentAccountLookup(ctx))
+		if latest == nil {
+			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+			return 0, nil, "", nil
+		}
+		if shouldClearStickySessionForOpenAIRequest(ctx, latest, requestedModel, requireCompact) || !latest.IsOpenAI() {
 			_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
 			return 0, nil, "", nil
 		}
@@ -784,8 +844,10 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 		if !latest.SupportsOpenAIEndpointCapability(requiredCapability) {
 			return 0, nil, "", nil
 		}
-		if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, latest); paused {
-			return 0, nil, "", nil
+		if !requireCompact {
+			if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, latest); paused {
+				return 0, nil, "", nil
+			}
 		}
 		// 利润门对最新账号状态复检一次，语义同上：跳过复用、不删绑定。
 		if vetoed, _ := openAIProfitControlVetoReason(ctx, latest); vetoed {
@@ -796,6 +858,14 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 			return 0, nil, "", nil
 		}
 		account = latest
+	}
+	// Snapshot-only deployments do not enter the DB recheck above; project the
+	// selected Spark shadow here as well so continuation requests use the
+	// parent's OpenAI upstream profile.
+	account = effectiveOpenAIShadowUpstreamProfile(account, s.parentAccountLookup(ctx))
+	if account == nil {
+		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
+		return 0, nil, "", nil
 	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
 		_ = store.DeleteResponseAccount(ctx, derefGroupID(groupID), responseID)
@@ -1081,6 +1151,14 @@ func openAIWS429GuardErrorEventFailureStatus(upstreamStatus int, codeRaw, errTyp
 }
 
 func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw string, upstreamStatus ...int) {
+	model := strings.TrimSpace(firstNonEmpty(
+		gjson.GetBytes(responseBody, "model").String(),
+		gjson.GetBytes(responseBody, "response.model").String(),
+	))
+	s.persistOpenAIWSRateLimitSignalForModel(ctx, account, headers, responseBody, codeRaw, errTypeRaw, msgRaw, model, upstreamStatus...)
+}
+
+func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignalForModel(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw, canonicalModel string, upstreamStatus ...int) {
 	if s == nil || account == nil || account.Platform != PlatformOpenAI {
 		return
 	}
@@ -1091,7 +1169,22 @@ func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Contex
 	if !isOpenAIWSExplicit429Signal(status, codeRaw, errTypeRaw, msgRaw, responseBody) {
 		return
 	}
-	s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, headers, responseBody)
+	// A handshake failure body is an HTTP error document; its x-codex-* headers
+	// are the only quota snapshot available and must be retained.  WS
+	// response.failed/error events carry a top-level `type`, so only those
+	// event payloads use the semantic header filter that strips ordinary OAuth
+	// handshake quota metadata.
+	if len(responseBody) > 0 && strings.TrimSpace(gjson.GetBytes(responseBody, "type").String()) != "" {
+		headers = openAIWSSemantic429Headers(account, canonicalModel, headers)
+	}
+	s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, headers, responseBody, canonicalModel)
+}
+
+func openAIWSSemantic429Headers(account *Account, model string, headers http.Header) http.Header {
+	if isCodexSparkModel(model) && isOpenAIOAuthAccount(account) {
+		return headers
+	}
+	return nil
 }
 
 func (s *OpenAIGatewayService) newOpenAIWSRateLimitFailoverError(account *Account, headers http.Header, responseBody []byte, message string) *UpstreamFailoverError {

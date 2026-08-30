@@ -88,6 +88,13 @@ type OpenAIAccountScheduleRequest struct {
 	RequiredTransport       OpenAIUpstreamTransport
 	RequiredCapability      OpenAIEndpointCapability
 	RequiredImageCapability OpenAIImagesCapability
+	// RoutingAccountIDs is an optional, already-resolved group model-routing
+	// rule.  A non-empty list is treated as a preferred candidate pool: usable
+	// routed accounts are selected first, while the normal pool remains a
+	// fail-open fallback when every routed account is unavailable.  Keeping the
+	// resolved IDs on the request makes the rule apply consistently to previous
+	// response, sticky-session, load-balance, and per-WS-turn paths.
+	RoutingAccountIDs []int64
 	// RequireCompact is only for legacy /responses/compact capability filtering
 	// and compact_model_mapping; native remote compaction v2 leaves it false.
 	RequireCompact bool
@@ -383,6 +390,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	if req.RequireCompact {
+		ctx = withOpenAICompactSchedulingContext(ctx)
+	}
 	if s != nil && s.service != nil && s.service.openAIGroupRequiresPrivacySet(ctx, req.GroupID) {
 		req.RequirePrivacySet = true
 	}
@@ -421,6 +431,17 @@ func (s *defaultOpenAIAccountScheduler) Select(
 					selection.ReleaseFunc()
 				}
 				selection = nil
+			}
+		}
+		if selection != nil && selection.Account != nil {
+			if len(req.RoutingAccountIDs) > 0 && !openAIAccountInRouting(req.RoutingAccountIDs, selection.Account.ID) {
+				if selection.ReleaseFunc != nil {
+					selection.ReleaseFunc()
+				}
+				selection = nil
+				if req.SessionHash != "" {
+					_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
+				}
 			}
 		}
 		if selection != nil && selection.Account != nil {
@@ -525,18 +546,28 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	if accountID <= 0 {
 		return nil, false, nil
 	}
+	if len(req.RoutingAccountIDs) > 0 && !openAIAccountInRouting(req.RoutingAccountIDs, accountID) {
+		// An explicit model route supersedes an older sticky binding. Always
+		// clear the binding here (even when PreserveStickyBinding is set for a
+		// guardian flow) so the next turn can bind to a routed account.
+		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+		// This is an intentional route replacement, not a capacity escape. Keep
+		// PreserveStickyBinding false so the newly selected routed account is
+		// written back to the session cache.
+		return nil, false, nil
+	}
 	if req.ExcludedIDs != nil {
 		if _, excluded := req.ExcludedIDs[accountID]; excluded {
 			return nil, false, nil
 		}
 	}
 
-	account, err := s.service.getSchedulableAccount(ctx, accountID)
+	account, err := s.service.getOpenAIAccountForScheduling(ctx, accountID, req.RequireCompact)
 	if err != nil || account == nil {
 		clearBinding()
 		return nil, false, nil
 	}
-	if shouldClearStickySession(account, req.RequestedModel) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() || !account.IsSchedulable() {
+	if shouldClearStickySessionForOpenAIRequest(ctx, account, req.RequestedModel, req.RequireCompact) || account.Platform != NormalizeOpenAICompatiblePlatform(req.Platform) || !account.IsOpenAICompatible() {
 		clearBinding()
 		return nil, false, nil
 	}
@@ -1243,7 +1274,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			continue
 		}
 
-		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			release(result)
 			continue
@@ -1252,7 +1283,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 			release(result)
 			break
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			release(result)
 			continue
@@ -1324,7 +1355,7 @@ func (s *defaultOpenAIAccountScheduler) tryFallbackToWeightedSticky(
 				continue
 			}
 		}
-		account, err := s.service.getSchedulableAccount(ctx, accountID)
+		account, err := s.service.getOpenAIAccountForScheduling(ctx, accountID, req.RequireCompact)
 		if err != nil || account == nil {
 			continue
 		}
@@ -1443,21 +1474,51 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	ctx context.Context,
 	req OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, int, int, float64, error) {
+	if len(req.RoutingAccountIDs) == 0 {
+		return s.selectByLoadBalanceWithRouting(ctx, req, nil)
+	}
+
+	// Try the explicitly routed pool first.  The helper returns the same
+	// no-account errors as the normal path when every routed account is
+	// filtered by health/capability/quota/slot checks; in that case retry once
+	// against the complete pool so a stale or unavailable route never turns a
+	// group-wide request into an outage.
+	routedResult, candidateCount, topK, loadSkew, err := s.selectByLoadBalanceWithRouting(ctx, req, req.RoutingAccountIDs)
+	if routedResult != nil || (err != nil && !errors.Is(err, ErrNoAvailableAccounts) && !errors.Is(err, ErrNoAvailableCompactAccounts)) {
+		return routedResult, candidateCount, topK, loadSkew, err
+	}
+	req.RoutingAccountIDs = nil
+	return s.selectByLoadBalanceWithRouting(ctx, req, nil)
+}
+
+func (s *defaultOpenAIAccountScheduler) selectByLoadBalanceWithRouting(
+	ctx context.Context,
+	req OpenAIAccountScheduleRequest,
+	routingIDs []int64,
+) (*AccountSelectionResult, int, int, float64, error) {
 	budget := newOpenAISelectionProbeBudget()
-	accounts, err := s.service.listSchedulableAccounts(ctx, req.GroupID, req.Platform)
+	accounts, err := s.service.listOpenAIAccountCandidates(ctx, req.GroupID, req.Platform, req.RequireCompact)
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
 	if len(accounts) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false, openAISelectionFilterStats{}.summary(""))
+		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact, openAISelectionFilterStats{}.summary(""))
+	}
+	if len(routingIDs) > 0 {
+		accounts = filterOpenAIAccountsByRouting(accounts, routingIDs)
+		if len(accounts) == 0 {
+			return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact, openAISelectionFilterStats{}.summary("model_routing_no_candidates"))
+		}
 	}
 	// Local free-tier soft gate on the Grok scheduling path only (not admin probe).
-	accounts = s.filterGrokFreeQuotaAccounts(ctx, accounts)
+	if !req.RequireCompact {
+		accounts = s.filterGrokFreeQuotaAccounts(ctx, accounts)
+	}
 	if len(accounts) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false, openAISelectionFilterStats{}.summary("grok_free_quota_soft_gate"))
+		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact, openAISelectionFilterStats{}.summary("grok_free_quota_soft_gate"))
 	}
 	// Team+model rate-limit cool: siblings of a 429'd team skip the hot model.
-	if req.Platform == PlatformGrok {
+	if !req.RequireCompact && req.Platform == PlatformGrok {
 		now := time.Now()
 		filtered := filterGrokTeamModelRateLimitedAccounts(accounts, req.RequestedModel, now)
 		if len(filtered) == 0 && len(accounts) > 0 {
@@ -1491,7 +1552,11 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 				continue
 			}
 		}
-		if !account.IsSchedulable() {
+		schedulable := account.IsSchedulable()
+		if req.RequireCompact {
+			schedulable = account.IsSchedulableForCompactModelWithContext(ctx, req.RequestedModel)
+		}
+		if !schedulable {
 			filterStats.exclude("not_schedulable")
 			continue
 		}
@@ -1525,7 +1590,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		})
 	}
 	if len(filtered) == 0 {
-		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, false, filterStats.summary(""))
+		return nil, 0, 0, 0, noAvailableOpenAISelectionError(req.RequestedModel, req.RequireCompact, filterStats.summary(""))
 	}
 
 	loadMap := map[int64]*AccountLoadInfo{}
@@ -1749,14 +1814,14 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 					continue
 				}
 			}
-			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			fresh := s.service.resolveFreshSchedulableOpenAIAccount(ctx, candidate.account, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
 			}
 			if !s.consumeOpenAISelectionDBRecheck(budget) {
 				return nil, candidateCount, topK, loadSkew, noAvailableOpenAISelectionError(req.RequestedModel, compactBlocked, filterStats.summary("selection_order_exhausted"))
 			}
-			fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, false, req.RequiredCapability)
+			fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.Platform, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 			if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 				continue
 			}
@@ -1831,15 +1896,17 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	// TopK candidate pool can be filled with paused accounts and the later fresh/DB
 	// rechecks won't reach healthy accounts that fell outside TopK — manifesting as
 	// "no available accounts" even though healthy ones exist.
-	if paused, decision := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
-		if decision.reason != "" {
-			return false, decision.reason
+	if !req.RequireCompact {
+		if paused, decision := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
+			if decision.reason != "" {
+				return false, decision.reason
+			}
+			reason := "quota_auto_pause"
+			if decision.window != "" {
+				reason += "_" + decision.window
+			}
+			return false, reason
 		}
-		reason := "quota_auto_pause"
-		if decision.window != "" {
-			reason += "_" + decision.window
-		}
-		return false, reason
 	}
 	// 母账号健康联动：影子账号的凭据来自母账号，母账号不可调度时影子也不应被选中。
 	// Parent-health gate: shadow borrows the parent's credentials; an unschedulable
@@ -2284,6 +2351,72 @@ func (s *OpenAIGatewayService) loadOpenAIGroupRequiresPrivacySet(ctx context.Con
 	return group != nil && group.RequirePrivacySet
 }
 
+// openAISelectionSessionLimitRetryMax bounds the number of account candidates
+// that can be skipped when an API-key account has reached max_sessions.  The
+// normal scheduler already bounds its probe work; this separate guard prevents
+// a malformed scheduler implementation from spinning forever while preserving
+// support for large account pools.
+const openAISelectionSessionLimitRetryMax = 4096
+
+// selectWithOpenAISessionLimit applies the optional active-session cap to the
+// result of the OpenAI scheduler.  SessionLimitCache.RegisterSession is an
+// atomic Redis operation, so checking after account acquisition closes the
+// race between candidate filtering and admission.  A denied candidate is
+// released/excluded and the scheduler is asked for the next candidate; no
+// request payload or Claude/CC protocol path is changed.
+func (s *OpenAIGatewayService) selectWithOpenAISessionLimit(
+	ctx context.Context,
+	scheduler OpenAIAccountScheduler,
+	req OpenAIAccountScheduleRequest,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	if scheduler == nil {
+		return nil, OpenAIAccountScheduleDecision{}, ErrNoAvailableAccounts
+	}
+	if s == nil || s.sessionLimitCache == nil || strings.TrimSpace(req.SessionHash) == "" {
+		return scheduler.Select(ctx, req)
+	}
+
+	effectiveExcluded := cloneExcludedAccountIDs(req.ExcludedIDs)
+	var lastDecision OpenAIAccountScheduleDecision
+	for attempt := 0; attempt < openAISelectionSessionLimitRetryMax; attempt++ {
+		req.ExcludedIDs = effectiveExcluded
+		selection, decision, err := scheduler.Select(ctx, req)
+		lastDecision = decision
+		if err != nil || selection == nil || selection.Account == nil {
+			return selection, decision, err
+		}
+		if registerAccountSessionWithLimit(ctx, s.sessionLimitCache, selection.Account, req.SessionHash) {
+			return selection, decision, nil
+		}
+
+		accountID := selection.Account.ID
+		if selection.ReleaseFunc != nil {
+			selection.ReleaseFunc()
+		}
+		if effectiveExcluded == nil {
+			effectiveExcluded = make(map[int64]struct{})
+		}
+		if _, duplicate := effectiveExcluded[accountID]; duplicate {
+			break
+		}
+		effectiveExcluded[accountID] = struct{}{}
+		// Do not discard a still-usable sticky binding merely because a routed
+		// fallback candidate hit its own session cap.  Clear only when the
+		// rejected account is the binding currently being retried (or when no
+		// binding was known to the scheduler).
+		if req.SessionHash != "" && !req.PreserveStickyBinding &&
+			(req.StickyAccountID <= 0 || req.StickyAccountID == accountID) {
+			_ = s.deleteStickySessionAccountID(ctx, req.GroupID, req.SessionHash)
+		}
+	}
+
+	return nil, lastDecision, noAvailableOpenAISelectionError(
+		req.RequestedModel,
+		req.RequireCompact,
+		openAISelectionFilterStats{pool: len(effectiveExcluded)}.summary("session_limit"),
+	)
+}
+
 func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	ctx context.Context,
 	groupID *int64,
@@ -2300,6 +2433,9 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
+	if requireCompact {
+		ctx = withOpenAICompactSchedulingContext(ctx)
+	}
 	ctx = s.withOpenAIGroupPrivacyRequirement(ctx, groupID)
 	// 分组利润控制：唯一文本调度入口的防御性装门。handler 文本
 	// 入口已在请求开始经 WithOpenAIRequestPricingContext 装门并固定 pricingAt，
@@ -2311,6 +2447,11 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		ctx = s.withOpenAIProfitControlGate(ctx, groupID)
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
+	// Resolve group model routing once per scheduling attempt.  The resolved
+	// list is carried through every scheduler layer (including sticky and WS
+	// continuation paths) so OpenAI/Codex honors the same admin setting as the
+	// generic gateway scheduler.
+	routingAccountIDs := s.openAIModelRoutingAccountIDs(ctx, groupID, requestedModel, platform)
 	decision := OpenAIAccountScheduleDecision{}
 	// Pricing restrictions are a request-level gate and must run before every
 	// scheduling fast path, including a 429-guard continuation. A bound old
@@ -2321,7 +2462,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 			"model", requestedModel)
 		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
 	}
-	if selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
+	selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
 		ctx,
 		groupID,
 		platform,
@@ -2333,9 +2474,21 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		requiredCapability,
 		requireCompact,
 		requiredImageCapability,
-	); continuationErr != nil {
+	)
+	if continuationErr != nil {
 		return nil, decision, continuationErr
 	} else if continuation && selection != nil && selection.Account != nil {
+		if len(routingAccountIDs) > 0 && !openAIAccountInRouting(routingAccountIDs, selection.Account.ID) {
+			// A permanently guarded socket outside the current model route must
+			// not override an explicit admin route.  Release its generation slot
+			// and continue through the routed/normal scheduler below.
+			if selection.ReleaseFunc != nil {
+				selection.ReleaseFunc()
+			}
+			selection = nil
+		}
+	}
+	if continuation && selection != nil && selection.Account != nil {
 		decision.Layer = openAIAccountScheduleLayer429Continuation
 		decision.StickyPreviousHit = strings.TrimSpace(previousResponseID) != ""
 		decision.StickySessionHit = !decision.StickyPreviousHit && strings.TrimSpace(sessionHash) != ""
@@ -2351,6 +2504,34 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
+		// Model routing is an explicit group contract and must remain effective
+		// even when the optional advanced OpenAI scheduler is disabled.  Reuse
+		// the deterministic default scheduler for this request; its routed-pool
+		// wrapper still falls back to the normal pool when every routed account is
+		// unavailable, matching the generic gateway semantics.
+		if len(routingAccountIDs) > 0 {
+			routedScheduler := &defaultOpenAIAccountScheduler{service: s, stats: newOpenAIAccountRuntimeStats()}
+			routedReq := OpenAIAccountScheduleRequest{
+				GroupID:                 groupID,
+				Platform:                platform,
+				SessionHash:             sessionHash,
+				GuardianParentAccountID: guardianParentAccountID,
+				PreserveStickyBinding:   preserveGuardianParentBinding,
+				RequirePrivacySet:       s.openAIGroupRequiresPrivacySet(ctx, groupID),
+				PreviousResponseID:      previousResponseID,
+				PreviousResponseCanMove: previousResponseCanMove,
+				UseUpstreamTokenCost:    useUpstreamTokenCost,
+				RequestedModel:          requestedModel,
+				RequiredTransport:       requiredTransport,
+				RequiredCapability:      requiredCapability,
+				RequiredImageCapability: requiredImageCapability,
+				RequireCompact:          requireCompact,
+				ExcludedIDs:             excludedIDs,
+				RoutingAccountIDs:       routingAccountIDs,
+			}
+			selection, routedDecision, routedErr := s.selectWithOpenAISessionLimit(ctx, routedScheduler, routedReq)
+			return selection, routedDecision, routedErr
+		}
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
 		if guardianParentAccountID > 0 {
 			if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
@@ -2370,9 +2551,18 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				RequireCompact:          requireCompact,
 				ExcludedIDs:             excludedIDs,
 				RequirePrivacySet:       s.openAIGroupRequiresPrivacySet(ctx, groupID),
+				RoutingAccountIDs:       routingAccountIDs,
 			})
 			if err != nil {
 				return nil, decision, err
+			}
+			if selection != nil && selection.Account != nil {
+				if !registerAccountSessionWithLimit(ctx, s.sessionLimitCache, selection.Account, sessionHash) {
+					if selection.ReleaseFunc != nil {
+						selection.ReleaseFunc()
+					}
+					selection = nil
+				}
 			}
 			if selection != nil && selection.Account != nil {
 				decision.Layer = openAIAccountScheduleLayerGuardianParent
@@ -2396,7 +2586,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				if selection == nil || selection.Account == nil {
 					return selection, decision, nil
 				}
-				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) &&
+					registerAccountSessionWithLimit(ctx, s.sessionLimitCache, selection.Account, legacySessionHash) {
 					return selection, decision, nil
 				}
 				if selection.ReleaseFunc != nil {
@@ -2422,7 +2613,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				return selection, decision, nil
 			}
 			if s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport) &&
-				accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+				accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) &&
+				registerAccountSessionWithLimit(ctx, s.sessionLimitCache, selection.Account, legacySessionHash) {
 				return selection, decision, nil
 			}
 			if selection.ReleaseFunc != nil {
@@ -2451,7 +2643,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		stickyPreviousAccountID = s.ResolveAccountIDByPreviousResponseIDForScheduler(ctx, groupID, previousResponseID, requestedModel, excludedIDs, requiredCapability, requireCompact)
 	}
 
-	return scheduler.Select(ctx, OpenAIAccountScheduleRequest{
+	return s.selectWithOpenAISessionLimit(ctx, scheduler, OpenAIAccountScheduleRequest{
 		GroupID:                 groupID,
 		Platform:                platform,
 		SessionHash:             sessionHash,
@@ -2471,6 +2663,7 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		RequiredImageCapability: requiredImageCapability,
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
+		RoutingAccountIDs:       routingAccountIDs,
 	})
 }
 

@@ -119,3 +119,47 @@ type SchedulerCache interface {
 	// SetOutboxWatermark 保存 outbox 水位。
 	SetOutboxWatermark(ctx context.Context, id int64) error
 }
+
+// SchedulerAccountRuntimeBlockObserver receives fresh account snapshots after
+// the scheduler outbox has applied an account change.  OpenAI/Grok keep a
+// process-local fast-path block for immediate failover; the observer lets the
+// owning gateway retire that block when another instance has durably cleared
+// the account cooldown.  It is intentionally optional so custom scheduler
+// implementations and unit fixtures do not need another dependency.
+type SchedulerAccountRuntimeBlockObserver interface {
+	// observedAt is captured immediately before the authoritative DB read that
+	// produced account.  The gateway uses it as a wall-clock CAS guard so a
+	// block installed while that read/outbox event is in flight is never erased
+	// by the older clear observation.
+	ReconcileOpenAIAccountRuntimeBlock(account *Account, observedAt time.Time)
+}
+
+// SchedulerAccountRuntimeBlockEventObserver is the payload-aware variant used
+// by the built-in scheduler.  A newer account UpdatedAt alone is not proof that
+// a runtime cooldown was cleared: quota/proxy/name updates can advance the row
+// while a failed 429 persistence still needs to remain fail-closed.  Producers
+// that explicitly clear the durable cooldown set this marker in the outbox
+// payload.
+type SchedulerAccountRuntimeBlockEventObserver interface {
+	ReconcileOpenAIAccountRuntimeBlockEvent(account *Account, observedAt time.Time, payload map[string]any)
+}
+
+const SchedulerRuntimeBlockClearPayloadKey = "runtime_block_clear"
+
+func SchedulerRuntimeBlockClearRequested(payload map[string]any) bool {
+	if payload == nil {
+		return false
+	}
+	raw, ok := payload[SchedulerRuntimeBlockClearPayloadKey]
+	if !ok {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true") || strings.TrimSpace(value) == "1"
+	default:
+		return false
+	}
+}

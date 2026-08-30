@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,6 +31,12 @@ type Profile struct {
 	KeyShareGroups      []uint16 // Empty uses [X25519]
 	PSKModes            []uint16 // Empty uses [psk_dhe_ke]
 	Extensions          []uint16 // Extension type IDs in order; empty uses default Node.js 24.x order
+
+	// RandomizeExtensionOrder makes a fresh copy of Extensions and shuffles it
+	// for each ClientHello.  It is opt-in so existing Claude/Node profiles keep
+	// their established order while rustls-based profiles can mirror the
+	// per-connection order variation observed in the official Codex CLI.
+	RandomizeExtensionOrder bool
 }
 
 // Dialer creates TLS connections with custom fingerprints.
@@ -391,6 +398,9 @@ func buildClientHelloSpecFromProfile(profile *Profile) *utls.ClientHelloSpec {
 	if profile != nil && len(profile.Extensions) > 0 {
 		extOrder = profile.Extensions
 	}
+	if profile != nil && profile.RandomizeExtensionOrder {
+		extOrder = shuffleExtensionOrder(extOrder)
+	}
 
 	// Build extensions list from the ordered IDs.
 	// Parametric extensions (curves, sigalgs, etc.) are populated with resolved profile values.
@@ -454,6 +464,18 @@ func buildClientHelloSpecFromProfile(profile *Profile) *utls.ClientHelloSpec {
 		TLSVersMax:         utls.VersionTLS13,
 		TLSVersMin:         utls.VersionTLS10,
 	}
+}
+
+// shuffleExtensionOrder returns a new slice and never mutates the profile's
+// backing array. Profiles are shared by concurrent requests, so in-place
+// shuffling would introduce both a data race and nondeterministic corruption
+// of custom profile definitions.
+func shuffleExtensionOrder(ids []uint16) []uint16 {
+	shuffled := append([]uint16(nil), ids...)
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	return shuffled
 }
 
 // toUint8s converts []uint16 to []uint8 (for utls fields that require []uint8).

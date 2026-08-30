@@ -531,7 +531,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 	if handleErr == nil && account.Type == AccountTypeOAuth && !account.IsShadow() && account.Platform != PlatformGrok {
 		if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
-			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
+			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot, account)
 		}
 	} else if handleErr == nil && account.IsShadow() && account.ParentAccountID != nil {
 		notifyOpenAIAutoReset(*account.ParentAccountID)
@@ -621,7 +621,7 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
 		if openAIStreamFailedEventShouldFailover(payload, message) {
-			return nil, s.newOpenAIStreamFailoverError(c, account, false, requestID, payload, message, resp.Header)
+			return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, upstreamModel, resp.Header)
 		}
 		message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payload, message)
 		// 统一走语义状态推断 + body 归一化（与 /v1/responses 路径一致），
@@ -1056,7 +1056,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					shouldFailover = openAIStreamErrorEventShouldFailover(payloadBytes, message)
 				}
 				if !clientOutputStarted && shouldFailover {
-					streamFailoverErr = s.newOpenAIStreamFailoverError(c, account, false, requestID, payloadBytes, message, resp.Header)
+					streamFailoverErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payloadBytes, message, upstreamModel, resp.Header)
 					return true
 				}
 				message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payloadBytes, message)
@@ -1165,7 +1165,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 		}
 		message := "OpenAI messages stream ended before a terminal event"
 		if !clientOutputStarted {
-			return result, s.newOpenAIStreamFailoverError(c, account, false, requestID, nil, message)
+			return result, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, nil, message, upstreamModel)
 		}
 		s.recordOpenAIMessagesStreamUpstreamError(c, account, requestID, "stream_missing_terminal", message)
 		return result, fmt.Errorf("stream usage incomplete: missing terminal event")

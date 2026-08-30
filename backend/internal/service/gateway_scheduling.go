@@ -1408,33 +1408,51 @@ func (s *GatewayService) IncrementAccountRPM(ctx context.Context, accountID int6
 	return err
 }
 
-// checkAndRegisterSession 检查并注册会话，用于会话数量限制
-// 仅适用于 Anthropic OAuth/SetupToken 账号
-// sessionID: 会话标识符（使用粘性会话的 hash）
-// 返回 true 表示允许（在限制内或会话已存在），false 表示拒绝（超出限制且是新会话）
-func (s *GatewayService) checkAndRegisterSession(ctx context.Context, account *Account, sessionID string) bool {
-	// 只检查 Anthropic OAuth/SetupToken 账号
-	if !account.IsAnthropicOAuthOrSetupToken() {
+// accountSupportsSessionLimit reports whether an account participates in the
+// optional active-session cap.  API-key accounts are commonly shared by
+// several callers, so they need the same cap as the existing Anthropic
+// OAuth/SetupToken accounts.  This is a scheduling-only gate; it does not
+// alter any provider request payload or protocol conversion.
+func accountSupportsSessionLimit(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	return account.IsAnthropicOAuthOrSetupToken() || account.Type == AccountTypeAPIKey
+}
+
+// registerAccountSessionWithLimit applies the account-level session cap and
+// preserves the existing fail-open behavior when the Redis-backed cache is
+// unavailable.  A blank session ID or a non-positive max_sessions value keeps
+// the account unlimited.
+func registerAccountSessionWithLimit(
+	ctx context.Context,
+	cache SessionLimitCache,
+	account *Account,
+	sessionID string,
+) bool {
+	if !accountSupportsSessionLimit(account) || cache == nil {
 		return true
 	}
-
 	maxSessions := account.GetMaxSessions()
+	sessionID = strings.TrimSpace(sessionID)
 	if maxSessions <= 0 || sessionID == "" {
-		return true // 未启用会话限制或无会话ID
+		return true
 	}
-
-	if s.sessionLimitCache == nil {
-		return true // 缓存不可用时允许通过
-	}
-
 	idleTimeout := time.Duration(account.GetSessionIdleTimeoutMinutes()) * time.Minute
-
-	allowed, err := s.sessionLimitCache.RegisterSession(ctx, account.ID, sessionID, maxSessions, idleTimeout)
+	allowed, err := cache.RegisterSession(ctx, account.ID, sessionID, maxSessions, idleTimeout)
 	if err != nil {
-		// 失败开放：缓存错误时允许通过
+		// 失败开放：缓存错误时允许通过，保持与原 Anthropic 路径一致。
 		return true
 	}
 	return allowed
+}
+
+// checkAndRegisterSession 检查并注册会话，用于会话数量限制
+// 适用于 Anthropic OAuth/SetupToken，以及显式配置 max_sessions 的 API Key 账号
+// sessionID: 会话标识符（使用粘性会话的 hash）
+// 返回 true 表示允许（在限制内或会话已存在），false 表示拒绝（超出限制且是新会话）
+func (s *GatewayService) checkAndRegisterSession(ctx context.Context, account *Account, sessionID string) bool {
+	return registerAccountSessionWithLimit(ctx, s.sessionLimitCache, account, sessionID)
 }
 
 func (s *GatewayService) getSchedulableAccount(ctx context.Context, accountID int64) (*Account, error) {

@@ -20,7 +20,10 @@ import (
 )
 
 const (
-	openAIWSConnMaxAge             = 60 * time.Minute
+	// The upstream Responses WebSocket has an observed hard lifetime of about
+	// 60 minutes. Retire pooled sockets five minutes earlier so a long-lived
+	// ingress session never starts a turn on a socket at that boundary.
+	openAIWSConnMaxAge             = 55 * time.Minute
 	openAIWSConnHealthCheckIdle    = 90 * time.Second
 	openAIWSConnHealthCheckTO      = 2 * time.Second
 	openAIWSConnPrewarmExtraDelay  = 2 * time.Second
@@ -112,6 +115,20 @@ type openAIWSConnLease struct {
 	// redialing the same account after the cooldown expires.
 	openAI429GuardProven atomic.Bool
 	released             atomic.Bool
+}
+
+// ShouldRetire reports whether this lease's socket has crossed the local
+// retirement line. A permanent 429 guard socket is deliberately exempt: its
+// continuation identity must remain available until the guard is explicitly
+// detached or the transport closes.
+func (l *openAIWSConnLease) ShouldRetire() bool {
+	if l == nil || l.conn == nil || l.released.Load() {
+		return false
+	}
+	if l.pool == nil {
+		return l.conn.age(time.Now()) >= openAIWSConnMaxAge
+	}
+	return l.pool.shouldRetireConn(l.accountID, l.conn, time.Now())
 }
 
 func (l *openAIWSConnLease) activeConn() (*openAIWSConn, error) {
@@ -260,6 +277,7 @@ func (l *openAIWSConnLease) Release() {
 	}
 	l.conn.release()
 	if l.pool != nil {
+		l.pool.retireConnAfterRelease(l.accountID, l.conn)
 		l.pool.notifyAccountPoolChanged(l.accountID)
 	}
 }
@@ -292,6 +310,10 @@ type openAIWSConn struct {
 	createdAtNano atomic.Int64
 	lastUsedNano  atomic.Int64
 	prewarmed     atomic.Bool
+	// retireOnRelease is set when a leased socket crosses the local age line.
+	// It prevents the connection from returning to the idle pool after the
+	// current turn, while allowing a permanent 429 guard to clear the marker.
+	retireOnRelease atomic.Bool
 	// guardConfirmed429Generation is positive only after this exact pooled
 	// socket has observed the confirming 429 for the corresponding runtime
 	// block generation. It prevents ordinary sticky bindings from promoting a
@@ -322,6 +344,9 @@ func newOpenAIWSConn(id string, accountID int64, ws openAIWSClientConn, handshak
 
 func (c *openAIWSConn) tryAcquire() bool {
 	if c == nil {
+		return false
+	}
+	if c.retireOnRelease.Load() {
 		return false
 	}
 	select {
@@ -367,6 +392,10 @@ func (c *openAIWSConn) acquire(ctx context.Context) error {
 				c.release()
 				return errOpenAIWSConnClosed
 			default:
+			}
+			if c.retireOnRelease.Load() {
+				c.release()
+				return errOpenAIWSConnClosed
 			}
 			return nil
 		}
@@ -990,6 +1019,9 @@ retryAcquire:
 			}
 			preferredConn, ok := ap.conns[preferredConnID]
 			guardPinned := ok && p.isPermanentGuardConnLocked(ap, preferredConnID)
+			if ok && !guardPinned && p.shouldRetireConnLocked(ap, preferredConn, now) {
+				ok = false
+			}
 			// A confirmed 429 guard keeps one already-negotiated socket alive.
 			// Its handshake capability snapshot belongs to that socket, so a later
 			// turn must not lose the exact continuation merely because the current
@@ -1083,7 +1115,7 @@ retryAcquire:
 		}
 
 		if preferredConnID != "" {
-			if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(req.ProxyURL) && conn.matchesWSURL(req.WSURL) && conn.tryAcquire() {
+			if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && !p.shouldRetireConnLocked(ap, conn, now) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(req.ProxyURL) && conn.matchesWSURL(req.WSURL) && conn.tryAcquire() {
 				connPick := time.Since(pickStartedAt)
 				p.recordConnPickDuration(connPick)
 				ap.mu.Unlock()
@@ -1133,7 +1165,7 @@ retryAcquire:
 		}
 		if routingAffinity == "" || len(ap.conns)+ap.creating >= effectiveMaxConns {
 			for _, conn := range ap.conns {
-				if conn == nil || conn == best || p.isPermanentGuardConnLocked(ap, conn.id) ||
+				if conn == nil || conn == best || p.isPermanentGuardConnLocked(ap, conn.id) || p.shouldRetireConnLocked(ap, conn, now) ||
 					!conn.matchesHandshakeCompatibility(compatibility) ||
 					!conn.matchesProxyURL(req.ProxyURL) ||
 					!conn.matchesWSURL(req.WSURL) {
@@ -1478,6 +1510,68 @@ func (p *openAIWSConnPool) isPermanentGuardConnLocked(ap *openAIWSAccountPool, c
 	return pinned && until.IsZero()
 }
 
+// shouldRetireConnLocked centralizes age filtering for every pool picker. A
+// permanent 429 guard is the sole exception because it carries the upstream
+// continuation identity intentionally retained across turns.
+func (p *openAIWSConnPool) shouldRetireConnLocked(ap *openAIWSAccountPool, conn *openAIWSConn, now time.Time) bool {
+	if conn == nil {
+		return true
+	}
+	if ap != nil && p.isPermanentGuardConnLocked(ap, conn.id) {
+		conn.retireOnRelease.Store(false)
+		return false
+	}
+	if conn.retireOnRelease.Load() {
+		return true
+	}
+	maxAge := p.maxConnAge()
+	return maxAge > 0 && !conn.createdAt().IsZero() && conn.age(now) >= maxAge
+}
+
+func (p *openAIWSConnPool) shouldRetireConn(accountID int64, conn *openAIWSConn, now time.Time) bool {
+	if p == nil || conn == nil {
+		return false
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return conn.retireOnRelease.Load() || (p.maxConnAge() > 0 && conn.age(now) >= p.maxConnAge())
+	}
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	return p.shouldRetireConnLocked(ap, conn, now)
+}
+
+// retireConnAfterRelease removes an aged socket immediately after its lease
+// is returned. The operation is deliberately skipped for a permanent 429
+// guard, which must keep its old socket available for safe continuation.
+func (p *openAIWSConnPool) retireConnAfterRelease(accountID int64, conn *openAIWSConn) {
+	if p == nil || conn == nil || accountID <= 0 {
+		return
+	}
+	ap, ok := p.getAccountPool(accountID)
+	if !ok || ap == nil {
+		return
+	}
+	var closeConn *openAIWSConn
+	ap.mu.Lock()
+	if current, exists := ap.conns[conn.id]; exists && current == conn {
+		if p.isPermanentGuardConnLocked(ap, conn.id) {
+			conn.retireOnRelease.Store(false)
+		} else if p.shouldRetireConnLocked(ap, conn, time.Now()) && !conn.isLeased() {
+			delete(ap.conns, conn.id)
+			delete(ap.pinnedConns, conn.id)
+			delete(ap.guardPinnedUntil, conn.id)
+			conn.retireOnRelease.Store(false)
+			ap.signalChangedLocked()
+			closeConn = conn
+		}
+	}
+	ap.mu.Unlock()
+	if closeConn != nil {
+		closeConn.close()
+	}
+}
+
 func (p *openAIWSConnPool) hasNonGuardConnLocked(ap *openAIWSAccountPool) bool {
 	if ap == nil {
 		return false
@@ -1570,7 +1664,40 @@ func (p *openAIWSConnPool) cleanupAccountLocked(ap *openAIWSAccountPool, now tim
 			continue
 		default:
 		}
+		// Retire aged sockets before consulting ordinary sticky pins. A normal
+		// session pin must not let an upstream-60-minute socket survive forever;
+		// only the permanent confirmed-429 guard is exempt.
+		if p.shouldRetireConnLocked(ap, conn, now) {
+			if p.isPermanentGuardConnLocked(ap, id) {
+				continue
+			}
+			if conn.isLeased() {
+				conn.retireOnRelease.Store(true)
+				continue
+			}
+			delete(ap.conns, id)
+			delete(ap.pinnedConns, id)
+			delete(ap.guardPinnedUntil, id)
+			evicted = append(evicted, conn)
+			continue
+		}
 		if p.isConnPinnedLocked(ap, id) {
+			continue
+		}
+		// coder/websocket requires an active Reader to consume Pong control
+		// frames, so idle pooled connections cannot be probed safely. Rotate
+		// unsupported idle sockets before reuse instead of handing a server-
+		// closed (1011 keepalive timeout) connection to a new first turn.
+		if !conn.isLeased() && !conn.supportsIdlePingWithoutReader() &&
+			conn.idleDuration(now) >= openAIWSConnHealthCheckIdle {
+			delete(ap.conns, id)
+			if len(ap.pinnedConns) > 0 {
+				delete(ap.pinnedConns, id)
+			}
+			if len(ap.guardPinnedUntil) > 0 {
+				delete(ap.guardPinnedUntil, id)
+			}
+			evicted = append(evicted, conn)
 			continue
 		}
 		if maxAge > 0 && !conn.isLeased() && conn.age(now) > maxAge {
@@ -1652,7 +1779,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	}
 	preferredConnID = stringsTrim(preferredConnID)
 	if preferredConnID != "" {
-		if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) {
+		if conn, ok := ap.conns[preferredConnID]; ok && !p.isPermanentGuardConnLocked(ap, conn.id) && !p.shouldRetireConnLocked(ap, conn, time.Now()) && conn.matchesHandshakeCompatibility(compatibility) && conn.matchesProxyURL(proxyURL) && conn.matchesWSURL(wsURL) {
 			return conn
 		}
 	}
@@ -1660,7 +1787,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnLocked(
 	var bestWaiters int32
 	var bestLastUsed time.Time
 	for _, conn := range ap.conns {
-		if conn == nil || p.isPermanentGuardConnLocked(ap, conn.id) || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesProxyURL(proxyURL) || !conn.matchesWSURL(wsURL) {
+		if conn == nil || p.isPermanentGuardConnLocked(ap, conn.id) || p.shouldRetireConnLocked(ap, conn, time.Now()) || !conn.matchesHandshakeCompatibility(compatibility) || !conn.matchesProxyURL(proxyURL) || !conn.matchesWSURL(wsURL) {
 			continue
 		}
 		waiters := conn.waiters.Load()
@@ -1692,6 +1819,7 @@ func (p *openAIWSConnPool) pickLeastBusyConnWithRoutingAffinityLocked(
 	for _, conn := range ap.conns {
 		if conn == nil ||
 			p.isPermanentGuardConnLocked(ap, conn.id) ||
+			p.shouldRetireConnLocked(ap, conn, time.Now()) ||
 			!conn.matchesHandshakeCompatibility(compatibility) ||
 			!conn.matchesProxyURL(proxyURL) ||
 			!conn.matchesWSURL(wsURL) ||
@@ -2215,6 +2343,9 @@ func (p *openAIWSConnPool) pinGuardConnLocked(ap *openAIWSAccountPool, connID st
 	// time.Time{} is the permanent-pin sentinel. Do not downgrade an
 	// already-permanent pin if an older caller still supplies a TTL.
 	ap.guardPinnedUntil[connID] = time.Time{}
+	// A confirmed 429 guard is the one intentional exception to the local
+	// retirement line; preserve this socket's continuation identity.
+	conn.retireOnRelease.Store(false)
 	ap.signalChangedLocked()
 	return true
 }

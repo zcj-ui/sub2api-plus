@@ -42,6 +42,25 @@ func (w *failingOpenAIImageWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+func TestNormalizeOpenAIImageBase64PreservesPadding(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "single padding", raw: "aGk=", want: "aGk="},
+		{name: "double padding", raw: "aA==", want: "aA=="},
+		{name: "unpadded", raw: "aGk", want: "aGk="},
+		{name: "data URL", raw: "data:image/png;base64,aA==", want: "aA=="},
+		{name: "invalid", raw: "not base64!", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, normalizeOpenAIImageBase64(tt.raw))
+		})
+	}
+}
+
 func TestOpenAIGatewayServiceParseOpenAIImagesRequest_JSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"gpt-image-2","prompt":"draw a cat","size":"1024x1024","quality":"high","stream":true}`)

@@ -103,4 +103,48 @@ describe('AccountInventoryModal', () => {
     expect(text).toContain('admin.accounts.inventory.skipped')
     expect(text).toContain('health mode supports OpenAI OAuth and API Key accounts only')
   })
+
+  it('accepts numeric credits.balance values from compatibility relays', () => {
+    const wrapper = mount(AccountInventoryModal, {
+      props: {
+        show: true,
+        response: {
+          healthy: 1,
+          failed: 0,
+          skipped: 0,
+          quota_fetched: 1,
+          results: [{
+            account_id: 21,
+            name: 'Numeric credit relay',
+            platform: 'openai',
+            type: 'oauth',
+            healthy: true,
+            dead: false,
+            attempts: 1,
+            mode: 'openai_oauth_quota',
+            quota: {
+              fetched_at: 1,
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                overage_limit_reached: false,
+                balance: 12.5
+              }
+            }
+          }]
+        }
+      },
+      global: {
+        stubs: {
+          BaseDialog: {
+            props: ['show', 'title'],
+            template: '<div v-if="show"><slot /><slot name="footer" /></div>'
+          }
+        }
+      }
+    })
+
+    expect(wrapper.text()).toContain('12.5 Credit')
+    expect(wrapper.text()).toContain('≈ $0.50')
+  })
 })

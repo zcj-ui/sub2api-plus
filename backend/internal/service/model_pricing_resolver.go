@@ -85,7 +85,7 @@ func (r *ModelPricingResolver) Resolve(ctx context.Context, input PricingInput) 
 
 	var chPricing *ChannelModelPricing
 	if input.GroupID != nil && r.channelService != nil {
-		chPricing = r.channelService.GetChannelModelPricing(ctx, *input.GroupID, input.Model)
+		chPricing = r.lookupChannelPricingNormalized(ctx, *input.GroupID, input.Model)
 		if chPricing != nil {
 			mode := chPricing.BillingMode
 			if mode == "" {
@@ -177,9 +177,27 @@ func (r *ModelPricingResolver) resolveBasePricing(model string) (*ModelPricing, 
 	return pricing, PricingSourceLiteLLM
 }
 
+// lookupChannelPricingNormalized resolves channel pricing using the literal
+// model name first, then retries with the canonical OpenAI/Codex model name.
+// This keeps explicit variant prices authoritative while allowing a base
+// channel price (for example gpt-5.6-luna) to cover effort/date suffixes.
+func (r *ModelPricingResolver) lookupChannelPricingNormalized(ctx context.Context, groupID int64, model string) *ChannelModelPricing {
+	if r.channelService == nil {
+		return nil
+	}
+	if pricing := r.channelService.GetChannelModelPricing(ctx, groupID, model); pricing != nil {
+		return pricing
+	}
+	normalized := normalizeKnownOpenAICodexModel(model)
+	if normalized == "" || strings.EqualFold(normalized, strings.TrimSpace(model)) {
+		return nil
+	}
+	return r.channelService.GetChannelModelPricing(ctx, groupID, normalized)
+}
+
 // applyChannelOverrides 应用渠道定价覆盖
 func (r *ModelPricingResolver) applyChannelOverrides(ctx context.Context, groupID int64, model string, resolved *ResolvedPricing) {
-	chPricing := r.channelService.GetChannelModelPricing(ctx, groupID, model)
+	chPricing := r.lookupChannelPricingNormalized(ctx, groupID, model)
 	if chPricing == nil {
 		return
 	}

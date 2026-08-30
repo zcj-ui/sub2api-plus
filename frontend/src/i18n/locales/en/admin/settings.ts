@@ -1007,6 +1007,20 @@ export default {
         saved: '429 default cooldown settings saved',
         saveFailed: 'Failed to save 429 default cooldown settings'
       },
+      openAI403Cooldown: {
+        title: 'OpenAI 403 Temporary Cooldown',
+        description: 'Configure count-based temporary cooldowns for structured 403 responses from OpenAI/Codex accounts',
+        enabled: 'Enable 403 Temporary Cooldown',
+        enabledHint: 'When disabled, a 403 only triggers failover without pausing, counting, or changing account state; Claude/CC are unaffected',
+        cooldownMinutes: 'Cooldown Duration (minutes)',
+        cooldownMinutesHint: 'Duration to pause account scheduling after a 403 (1-1440 minutes, default 10)',
+        disableThreshold: 'Error Threshold (count)',
+        disableThresholdHint: 'Mark the account as errored after this many 403 responses within the window (1-100, default 3)',
+        windowMinutes: 'Counting Window (minutes)',
+        windowMinutesHint: 'Time window used to count consecutive 403 responses (1-1440 minutes, default 180)',
+        saved: 'OpenAI 403 cooldown settings saved',
+        saveFailed: 'Failed to save OpenAI 403 cooldown settings'
+      },
       streamTimeout: {
         title: 'Stream Timeout Handling',
         description: 'Configure account handling strategy when upstream response times out',
@@ -1088,6 +1102,7 @@ export default {
         saveHint: 'Saved together with system settings (click the global Save button at the bottom of the page).',
         serviceTier: 'service_tier match',
         tierAll: 'All tier values',
+        tierMissing: 'Missing (service_tier omitted)',
         tierPriority: 'priority (fast)',
         tierFlex: 'flex',
         action: 'Action',

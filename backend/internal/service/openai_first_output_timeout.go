@@ -25,12 +25,100 @@ const (
 	openAIFirstOutputScannerFramingAllowance = 64
 	openAIFirstOutputGuardQueueSize          = 1
 	openAIDefaultStreamQueueSize             = 16
+	// WSv2 keeps non-semantic lifecycle events private until the first visible
+	// output.  Keep that pre-output queue bounded independently of the upstream
+	// frame limit: a provider can legally send an arbitrary number of
+	// response.created/in_progress-style events before producing a token.
+	openAIWSBufferedStreamEventsMaxBytes           = openAIFirstOutputStageMaxBytes
+	openAIWSBufferedStreamEventsMaxCount           = 256
+	openAIWSBufferedStreamEventFrameOverhead int64 = int64(len("data: \n\n"))
 )
 
 var (
 	errOpenAIFirstOutputStageLimit   = errors.New("openai first-output staging limit exceeded")
 	errOpenAIFirstOutputScannerLimit = errors.New("openai pre-output scanner token limit exceeded")
+	// errOpenAIPendingSSELinesLimit guards small in-memory pre-output buffers in
+	// passthrough/Chat-Completions readers.  The full first-output stage already
+	// uses the same 8 MiB ceiling; keeping one shared limit prevents a malformed
+	// upstream that never emits visible output from growing an unbounded slice.
+	errOpenAIPendingSSELinesLimit = errors.New("openai pending SSE lines limit exceeded")
 )
+
+// appendOpenAIPendingSSELine appends one line to a pre-output buffer while
+// enforcing a byte ceiling.  The extra byte accounts for the newline emitted
+// when the buffered line is later flushed.  On overflow the caller gets a
+// typed sentinel and the buffer is cleared so rejected data is not retained.
+func appendOpenAIPendingSSELine(lines *[]string, totalBytes *int64, line string, limit int64) error {
+	if lines == nil || totalBytes == nil {
+		return errOpenAIPendingSSELinesLimit
+	}
+	if limit <= 0 {
+		limit = openAIFirstOutputStageMaxBytes
+	}
+	incoming := int64(len(line)) + 1
+	if incoming < 0 || *totalBytes > limit || incoming > limit-*totalBytes {
+		clearOpenAIPendingSSELines(lines, totalBytes)
+		return fmt.Errorf("%w: limit=%d", errOpenAIPendingSSELinesLimit, limit)
+	}
+	*lines = append(*lines, line)
+	*totalBytes += incoming
+	return nil
+}
+
+// clearOpenAIPendingSSELines releases references held by a flushed/rejected
+// pre-output buffer.  A reslice-to-zero would retain every large string until
+// the enclosing request returns, which is particularly costly for long-lived
+// streams that later produce normal output.
+func clearOpenAIPendingSSELines(lines *[]string, totalBytes *int64) {
+	if lines != nil && *lines != nil {
+		clear(*lines)
+		*lines = nil
+	}
+	if totalBytes != nil {
+		*totalBytes = 0
+	}
+}
+
+// appendOpenAIWSBufferedStreamEvent appends one pre-output WS event while
+// enforcing both a byte and an event-count ceiling.  The byte accounting
+// includes the small SSE framing that emitStreamMessage adds when the event is
+// eventually released.  On overflow the queue is cleared so rejected payloads
+// cannot remain reachable through a retained backing slice.
+func appendOpenAIWSBufferedStreamEvent(events *[][]byte, totalBytes *int64, payload []byte, byteLimit int64, eventLimit int) error {
+	if events == nil || totalBytes == nil {
+		return errOpenAIPendingSSELinesLimit
+	}
+	if byteLimit <= 0 {
+		byteLimit = openAIWSBufferedStreamEventsMaxBytes
+	}
+	if eventLimit <= 0 {
+		eventLimit = openAIWSBufferedStreamEventsMaxCount
+	}
+	incoming := int64(len(payload)) + openAIWSBufferedStreamEventFrameOverhead
+	if incoming < 0 || *totalBytes < 0 || *totalBytes > byteLimit ||
+		incoming > byteLimit-*totalBytes || len(*events) >= eventLimit {
+		buffered, queued := *totalBytes, len(*events)
+		clearOpenAIWSBufferedStreamEvents(events, totalBytes)
+		return fmt.Errorf("%w: buffered=%d incoming=%d limit=%d events=%d max_events=%d",
+			errOpenAIPendingSSELinesLimit, buffered, incoming, byteLimit, queued, eventLimit)
+	}
+	*events = append(*events, append([]byte(nil), payload...))
+	*totalBytes += incoming
+	return nil
+}
+
+// clearOpenAIWSBufferedStreamEvents releases both the payload references and
+// the backing slice after a flush/rejection.  Reslicing to zero would retain
+// every pre-output event until the surrounding request returns.
+func clearOpenAIWSBufferedStreamEvents(events *[][]byte, totalBytes *int64) {
+	if events != nil && *events != nil {
+		clear(*events)
+		*events = nil
+	}
+	if totalBytes != nil {
+		*totalBytes = 0
+	}
+}
 
 type openAIFirstOutputStage struct {
 	limit      int64
@@ -174,7 +262,9 @@ func (s *openAIFirstOutputStage) prepareWrite(incoming int) error {
 	}
 	s.tempFile = file
 	s.tempPath = path
-	s.memory.Reset()
+	// The spool now owns the staged bytes; release the in-memory backing array
+	// immediately instead of retaining up to the full stage limit until Close.
+	s.memory = bytes.Buffer{}
 	return nil
 }
 
@@ -211,7 +301,10 @@ func (s *openAIFirstOutputStage) Close() error {
 	}
 	s.closed = true
 	s.size = 0
-	s.memory.Reset()
+	// Resetting a bytes.Buffer keeps its backing array alive.  First-output
+	// staging can reach several MiB, so drop the buffer value itself on every
+	// close to make the memory promptly collectible on long-lived streams.
+	s.memory = bytes.Buffer{}
 	closeErr := s.cleanupErr
 	s.cleanupErr = nil
 	if s.tempFile != nil {

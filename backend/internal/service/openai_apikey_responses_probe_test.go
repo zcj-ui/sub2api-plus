@@ -162,3 +162,59 @@ func TestSelectResponsesProbeModel(t *testing.T) {
 	}}
 	require.Equal(t, openai.DefaultTestModel, selectResponsesProbeModel(acctAllWild))
 }
+
+func TestSelectResponsesProbeModelsDeduplicatesAndBoundsCandidates(t *testing.T) {
+	mapping := map[string]any{}
+	for i := 0; i < openaiResponsesProbeMaxModels+4; i++ {
+		mapping["client-"+string(rune('a'+i))] = "model-" + string(rune('a'+i))
+	}
+	// Two client aliases target the same upstream model and must only consume
+	// one probe slot.
+	mapping["duplicate-a"] = "model-a"
+	account := &Account{Credentials: map[string]any{"model_mapping": mapping}}
+	models, truncated := selectResponsesProbeModelsBounded(account)
+	require.Len(t, models, openaiResponsesProbeMaxModels)
+	require.True(t, truncated)
+	require.Equal(t, "model-a", models[0])
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if _, exists := seen[model]; exists {
+			t.Fatalf("duplicate probe model %q", model)
+		}
+		seen[model] = struct{}{}
+	}
+}
+
+func TestResponsesProbeBodyIndicatesModelSpecificFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "openai model not found code",
+			body: `{"error":{"code":"model_not_found","param":"model","message":"The model does not exist"}}`,
+			want: true,
+		},
+		{
+			name: "vllm detail",
+			body: `{"detail":"The requested model is not available"}`,
+			want: true,
+		},
+		{
+			name: "responses endpoint missing",
+			body: `{"error":{"message":"Not Found"}}`,
+			want: false,
+		},
+		{
+			name: "unstructured html",
+			body: `<html>404 Not Found</html>`,
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, responsesProbeBodyIndicatesModelSpecificFailure([]byte(tc.body)))
+		})
+	}
+}

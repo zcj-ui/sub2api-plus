@@ -542,17 +542,113 @@ func TestResponsesToChatCompletionsRequest_NamespaceToolFlattensChildren(t *test
 			Name: "gmail",
 			Tools: []ResponsesTool{
 				{Type: "function", Name: "send", Description: "Send mail", Parameters: json.RawMessage(`{"type":"object","properties":{}}`)},
-				{Type: "custom", Name: "ignored_child"},
+				{Type: "custom", Name: "exec", Description: "Run commands"},
 			},
 		}},
 	}
 
 	out, err := ResponsesToChatCompletionsRequest(req)
 	require.NoError(t, err)
-	require.Len(t, out.Tools, 1, "namespace 子工具中仅 function 类型被摊平")
+	require.Len(t, out.Tools, 2, "namespace 中的 function/custom 子工具都应被摊平")
 
 	assert.Equal(t, "gmail__send", out.Tools[0].Function.Name)
 	assert.Equal(t, "Send mail", out.Tools[0].Function.Description)
+	assert.Equal(t, "gmail__exec", out.Tools[1].Function.Name)
+	assert.Equal(t, "Run commands", out.Tools[1].Function.Description)
+	assert.JSONEq(t, customToolInputSchema, string(out.Tools[1].Function.Parameters))
+}
+
+func TestResponsesChatBridge_NamespaceCustomChildRoundTripNonStreaming(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "deepseek-v4-pro",
+		Input: json.RawMessage(`[{
+			"type":"custom_tool_call","call_id":"call_exec","name":"exec",
+			"namespace":"functions","input":"pwd"
+		},{
+			"type":"custom_tool_call_output","call_id":"call_exec","output":"/workspace"
+		}]`),
+		Tools: []ResponsesTool{{
+			Type: "namespace", Name: "functions",
+			Tools: []ResponsesTool{{Type: "custom", Name: "exec", Description: "Run shell commands"}},
+		}},
+	}
+
+	chatReq, err := ResponsesToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, chatReq.Tools, 1)
+	assert.Equal(t, "functions__exec", chatReq.Tools[0].Function.Name)
+	assert.JSONEq(t, customToolInputSchema, string(chatReq.Tools[0].Function.Parameters))
+	require.Len(t, chatReq.Messages, 2)
+	assert.Equal(t, "functions__exec", chatReq.Messages[0].ToolCalls[0].Function.Name)
+	assert.JSONEq(t, `{"input":"pwd"}`, chatReq.Messages[0].ToolCalls[0].Function.Arguments)
+
+	namespaceTools := NamespaceToolNames(req.Tools)
+	entry, ok := namespaceTools["functions__exec"]
+	require.True(t, ok)
+	require.True(t, entry.Custom)
+
+	upstream := &ChatCompletionsResponse{Choices: []ChatChoice{{Message: ChatMessage{ToolCalls: []ChatToolCall{{
+		ID: "call_exec", Function: ChatFunctionCall{Name: "functions__exec", Arguments: `{"input":"Get-Location"}`},
+	}}}}}}
+	responses := ChatCompletionsResponseToResponses(upstream, req.Model, nil, nil, false, namespaceTools)
+	require.Len(t, responses.Output, 1)
+	item := responses.Output[0]
+	assert.Equal(t, "custom_tool_call", item.Type)
+	assert.Equal(t, "functions", item.Namespace)
+	assert.Equal(t, "exec", item.Name)
+	assert.Equal(t, "call_exec", item.CallID)
+	assert.Equal(t, "Get-Location", item.Input)
+	assert.Empty(t, item.Arguments)
+	wire, err := json.Marshal(item)
+	require.NoError(t, err)
+	assert.Contains(t, string(wire), `"namespace":"functions"`)
+}
+
+func TestResponsesChatBridge_NamespaceCustomChildRoundTripStreaming(t *testing.T) {
+	state := NewChatCompletionsToResponsesStreamState("deepseek-v4-pro")
+	state.NamespaceTools = map[string]NamespacedToolName{
+		"functions__exec": {Namespace: "functions", Name: "exec", Custom: true},
+	}
+	idx := 0
+	events := ChatCompletionsChunkToResponsesEvents(&ChatCompletionsChunk{
+		ID: "cc-resp",
+		Choices: []ChatChunkChoice{{Delta: ChatDelta{ToolCalls: []ChatToolCall{{
+			Index: &idx, ID: "call_exec", Function: ChatFunctionCall{Name: "functions__exec", Arguments: `{"input":"pwd"}`},
+		}}}}},
+	}, state)
+	events = append(events, FinalizeChatCompletionsResponsesStream(state)...)
+
+	var added, inputDone, itemDone *ResponsesStreamEvent
+	for i := range events {
+		event := &events[i]
+		switch event.Type {
+		case "response.output_item.added":
+			if event.Item != nil && event.Item.Type == "custom_tool_call" {
+				added = event
+			}
+		case "response.custom_tool_call_input.done":
+			inputDone = event
+		case "response.output_item.done":
+			if event.Item != nil && event.Item.Type == "custom_tool_call" {
+				itemDone = event
+			}
+		}
+	}
+	require.NotNil(t, added)
+	assert.Equal(t, "exec", added.Item.Name)
+	assert.Equal(t, "functions", added.Item.Namespace)
+	require.NotNil(t, inputDone)
+	assert.Equal(t, "exec", inputDone.Name)
+	assert.Equal(t, "pwd", inputDone.Input)
+	require.NotNil(t, itemDone)
+	assert.Equal(t, "exec", itemDone.Item.Name)
+	assert.Equal(t, "functions", itemDone.Item.Namespace)
+	assert.Equal(t, "pwd", itemDone.Item.Input)
+
+	wire, err := ResponsesEventToSSE(*itemDone)
+	require.NoError(t, err)
+	assert.Contains(t, wire, `"type":"custom_tool_call"`)
+	assert.Contains(t, wire, `"namespace":"functions"`)
 }
 
 func TestResponsesToolsParsing_StringToolBecomesCustom(t *testing.T) {
@@ -717,8 +813,9 @@ func TestNamespaceToolNames_MapsFlattenedNames(t *testing.T) {
 	}
 
 	m := NamespaceToolNames(tools)
-	require.Len(t, m, 2)
+	require.Len(t, m, 3)
 	assert.Equal(t, NamespacedToolName{Namespace: "gmail", Name: "send"}, m["gmail__send"])
+	assert.Equal(t, NamespacedToolName{Namespace: "gmail", Name: "skip_me", Custom: true}, m["gmail__skip_me"])
 	assert.Equal(t, NamespacedToolName{Namespace: "crm", Name: "query"}, m["crm__query"])
 
 	// 摊平名超长时截断加哈希，无法按字符串切分还原，必须经映射反查。

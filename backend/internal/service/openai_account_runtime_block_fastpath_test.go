@@ -16,13 +16,23 @@ import (
 
 type oauth429RateLimitRepo struct {
 	mockAccountRepoForGemini
-	setRateLimitedCalls  int
-	lastRateLimitedUntil time.Time
+	setRateLimitedCalls       int
+	lastRateLimitedUntil      time.Time
+	setModelRateLimitCalls    int
+	lastModelRateLimitKey     string
+	lastModelRateLimitedUntil time.Time
 }
 
 func (r *oauth429RateLimitRepo) SetRateLimited(_ context.Context, _ int64, until time.Time) error {
 	r.setRateLimitedCalls++
 	r.lastRateLimitedUntil = until
+	return nil
+}
+
+func (r *oauth429RateLimitRepo) SetModelRateLimit(_ context.Context, _ int64, scope string, until time.Time, _ ...string) error {
+	r.setModelRateLimitCalls++
+	r.lastModelRateLimitKey = scope
+	r.lastModelRateLimitedUntil = until
 	return nil
 }
 
@@ -42,6 +52,46 @@ func TestOpenAI429FastPath_RequiresTwoOAuthResponsesBeforeCoolingDown(t *testing
 	secondShouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
 	require.False(t, secondShouldDisable)
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestOpenAI429FastPath_DisabledFallbackDoesNotCreateRuntimeCooldown(t *testing.T) {
+	repo := &oauth429RateLimitRepo{}
+	settingsRepo := newMockSettingRepo()
+	settingsRepo.data[SettingKeyRateLimit429CooldownSettings] = `{"enabled":false,"cooldown_seconds":12}`
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	rateLimitService.SetSettingService(NewSettingService(settingsRepo, &config.Config{}))
+	svc := &OpenAIGatewayService{accountRepo: repo, rateLimitService: rateLimitService}
+	rateLimitService.SetAccountRuntimeBlocker(svc)
+	account := &Account{ID: 425, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+
+	// The first 429 is only an observation.  The second confirms the pair, but
+	// with the fallback switch off it must not create a synthetic local cooldown.
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.Zero(t, repo.setRateLimitedCalls)
+}
+
+func TestOpenAI429FastPath_DisabledFallbackStillHonorsExhaustedQuotaReset(t *testing.T) {
+	repo := &oauth429RateLimitRepo{}
+	settingsRepo := newMockSettingRepo()
+	settingsRepo.data[SettingKeyRateLimit429CooldownSettings] = `{"enabled":false,"cooldown_seconds":12}`
+	rateLimitService := NewRateLimitService(repo, nil, &config.Config{}, nil, nil)
+	rateLimitService.SetSettingService(NewSettingService(settingsRepo, &config.Config{}))
+	svc := &OpenAIGatewayService{accountRepo: repo, rateLimitService: rateLimitService}
+	rateLimitService.SetAccountRuntimeBlocker(svc)
+	account := &Account{ID: 426, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	headers := http.Header{}
+	headers.Set("x-codex-primary-used-percent", "100")
+	headers.Set("x-codex-primary-reset-after-seconds", "3600")
+	headers.Set("x-codex-primary-window-minutes", "300")
+
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+	svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, headers, nil)
+
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, time.Until(repo.lastRateLimitedUntil) > 59*time.Minute)
 }
 
 func TestOpenAI429FastPath_KeepsOAuthAccountSchedulableDuringRetryWindow(t *testing.T) {
@@ -420,7 +470,7 @@ func TestOpenAIStream429IgnoresSuccessfulQuotaSnapshotHeaders(t *testing.T) {
 	}
 }
 
-func TestOpenAIHTTP429StillUsesQuotaResetHeaders(t *testing.T) {
+func TestOpenAIHTTP429WithPartiallyUsedWindowsUsesBoundedFallback(t *testing.T) {
 	svc := &OpenAIGatewayService{rateLimitService: &RateLimitService{}}
 	account := &Account{ID: 422, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	svc.openaiOAuth429RetryStartedAt.Store(account.ID, time.Now().Add(-openAIOAuth429RetryWindow-time.Second))
@@ -435,7 +485,8 @@ func TestOpenAIHTTP429StillUsesQuotaResetHeaders(t *testing.T) {
 	require.True(t, ok)
 	blockedUntil, ok := value.(time.Time)
 	require.True(t, ok)
-	require.Greater(t, time.Until(blockedUntil), 6*24*time.Hour, "real HTTP 429 must retain the upstream quota reset")
+	require.Greater(t, time.Until(blockedUntil), 0*time.Second)
+	require.Less(t, time.Until(blockedUntil), time.Minute, "a burst 429 must not inherit a multi-day quota window")
 }
 
 func TestOpenAI429RetryDelayHonorsBoundedRetryAfter(t *testing.T) {

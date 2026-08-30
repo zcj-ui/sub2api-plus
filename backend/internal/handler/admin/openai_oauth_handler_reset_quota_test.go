@@ -395,6 +395,28 @@ func TestOpenAIRefreshQuota_PersistsSnapshot(t *testing.T) {
 	require.Zero(t, quota.resetCalls)
 }
 
+func TestOpenAIRefreshQuota_OmittedResetCreditEnvelopeStillReportsPersisted(t *testing.T) {
+	quota := successfulOpenAIQuotaWorkflowStub()
+	quota.queryResult = &service.OpenAIQuotaUsage{
+		FetchedAt:             789,
+		RateLimitResetCredits: nil,
+	}
+	handler := &OpenAIOAuthHandler{
+		adminService: &openAIResetAdminServiceStub{},
+		quotaService: quota,
+	}
+
+	status, envelope := performOpenAIQuotaRefreshRequest(t, handler)
+
+	require.Equal(t, http.StatusOK, status)
+	require.True(t, envelope.Data.CachePersisted,
+		"a valid quota snapshot without reset-credit cards should still be persisted")
+	require.Equal(t, int64(789), envelope.Data.FetchedAt)
+	require.Equal(t, 1, quota.usageCacheCalls)
+	require.Zero(t, quota.cacheCalls,
+		"there is no reset-credit snapshot to write when the upstream omits the envelope")
+}
+
 // A rejected snapshot write must never discard the usage payload: otherwise the
 // card loses its credit count and the reset button stays disabled forever.
 func TestOpenAIRefreshQuota_PersistFailureStillReturnsUsage(t *testing.T) {

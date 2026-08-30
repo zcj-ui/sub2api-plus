@@ -232,6 +232,13 @@ func (h *OpenAIOAuthHandler) RefreshToken(c *gin.Context) {
 		return
 	}
 
+	// This endpoint intentionally returns a short-lived token pair to the
+	// authenticated admin UI so it can build a new account credential set. Keep
+	// browsers, intermediary proxies, and service-worker caches from retaining
+	// the bearer material beyond this request.
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 	response.Success(c, tokenInfo)
 }
 
@@ -539,10 +546,15 @@ func (h *OpenAIOAuthHandler) RefreshQuota(c *gin.Context) {
 	// A failed snapshot write leaves the previous cache intact — report it as a
 	// partial success instead of discarding the usage payload we just fetched,
 	// which would leave the card without a credit count at all.
-	if err := h.quotaService.CacheResetCreditsSnapshot(c.Request.Context(), accountID, usage.RateLimitResetCredits); err != nil {
-		slog.Warn("openai_quota_reset_credit_cache_persist_failed", "account_id", accountID, "error", err)
-		response.Success(c, refreshResponse)
-		return
+	// Some valid workspace plans omit the reset-credit envelope entirely. In
+	// that case there is no per-credit snapshot to write; the usage/window
+	// snapshot above is still fully persisted and should be reported as such.
+	if usage.RateLimitResetCredits != nil {
+		if err := h.quotaService.CacheResetCreditsSnapshot(c.Request.Context(), accountID, usage.RateLimitResetCredits); err != nil {
+			slog.Warn("openai_quota_reset_credit_cache_persist_failed", "account_id", accountID, "error", err)
+			response.Success(c, refreshResponse)
+			return
+		}
 	}
 	refreshResponse.CachePersisted = true
 	response.Success(c, refreshResponse)

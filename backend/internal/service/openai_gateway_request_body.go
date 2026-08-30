@@ -1017,6 +1017,21 @@ func normalizeOpenAIOAuthResponsesCompatibilityBody(body []byte) ([]byte, bool, 
 	return normalized, changed, nil
 }
 
+// stripOpenAIDisabledTruncationJSON is the byte-oriented counterpart of the
+// structured Codex OAuth transform.  "auto" and any other caller-provided
+// policy remain intact; only the legacy string value "disabled" is removed.
+func stripOpenAIDisabledTruncationJSON(body []byte) ([]byte, bool, error) {
+	truncation := gjson.GetBytes(body, "truncation")
+	if !truncation.Exists() || truncation.Type != gjson.String || truncation.String() != "disabled" {
+		return body, false, nil
+	}
+	normalized, err := sjson.DeleteBytes(body, "truncation")
+	if err != nil {
+		return body, false, fmt.Errorf("delete disabled truncation: %w", err)
+	}
+	return normalized, true, nil
+}
+
 func normalizeOpenAIResponsesReasoningMode(body []byte) ([]byte, bool, error) {
 	if len(body) == 0 {
 		return body, false, nil
@@ -1136,6 +1151,12 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 			normalized = next
 			changed = true
 		}
+		if next, truncationChanged, truncationErr := stripOpenAIDisabledTruncationJSON(normalized); truncationErr != nil {
+			return body, false, truncationErr
+		} else if truncationChanged {
+			normalized = next
+			changed = true
+		}
 	}
 	needsOrphanCleanup := account != nil && account.IsOpenAIOAuthLike() &&
 		gjson.GetBytes(normalized, "input").IsArray()
@@ -1237,6 +1258,12 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 		if err != nil {
 			return body, false, fmt.Errorf("normalize passthrough body delete %s: %w", field, err)
 		}
+		normalized = next
+		changed = true
+	}
+	if next, truncationChanged, truncationErr := stripOpenAIDisabledTruncationJSON(normalized); truncationErr != nil {
+		return body, false, truncationErr
+	} else if truncationChanged {
 		normalized = next
 		changed = true
 	}
@@ -1579,7 +1606,12 @@ func evaluateOpenAIFastPolicyWithSettings(settings *OpenAIFastPolicySettings, us
 				continue
 			}
 			ruleTier := strings.ToLower(strings.TrimSpace(rule.ServiceTier))
-			if ruleTier != "" && ruleTier != OpenAIFastTierAny && ruleTier != tier {
+			// `all` intentionally covers explicit tiers only; use `missing` when
+			// an administrator wants to match requests that omitted service_tier.
+			if ruleTier != "" &&
+				(ruleTier == OpenAIFastTierMissing && tier != OpenAIFastTierMissing ||
+					ruleTier == OpenAIFastTierAny && tier == OpenAIFastTierMissing ||
+					ruleTier != OpenAIFastTierAny && ruleTier != OpenAIFastTierMissing && ruleTier != tier) {
 				continue
 			}
 			eff := BetaPolicyRule{
@@ -1663,9 +1695,28 @@ func (s *OpenAIGatewayService) applyOpenAIFastPolicyToBody(ctx context.Context, 
 	if len(body) == 0 {
 		return body, nil
 	}
-	rawTier := gjson.GetBytes(body, "service_tier").String()
+	tierResult := gjson.GetBytes(body, "service_tier")
+	rawTier := tierResult.String()
 	if rawTier == "" {
-		return body, nil
+		if tierResult.Exists() && tierResult.Type != gjson.Null {
+			return body, nil
+		}
+		action, errMsg := s.evaluateOpenAIFastPolicy(ctx, account, model, OpenAIFastTierMissing)
+		switch action {
+		case BetaPolicyActionBlock:
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("openai service_tier=%s is not allowed for model %s", OpenAIFastTierMissing, model)
+			}
+			return body, &OpenAIFastBlockedError{Message: errMsg}
+		case OpenAIFastPolicyActionForcePriority:
+			updated, err := sjson.SetBytes(body, "service_tier", OpenAIFastTierPriority)
+			if err != nil {
+				return body, fmt.Errorf("force service_tier priority on missing tier: %w", err)
+			}
+			return updated, nil
+		default:
+			return body, nil
+		}
 	}
 	normTier := normalizedOpenAIServiceTierValue(rawTier)
 	if normTier == "" {
@@ -1776,7 +1827,26 @@ func (s *OpenAIGatewayService) applyOpenAIFastPolicyToWSResponseCreate(
 	}
 	rawTier := gjson.GetBytes(frame, "service_tier").String()
 	if rawTier == "" {
-		return frame, nil, nil
+		tierResult := gjson.GetBytes(frame, "service_tier")
+		if tierResult.Exists() && tierResult.Type != gjson.Null {
+			return frame, nil, nil
+		}
+		action, errMsg := s.evaluateOpenAIFastPolicy(ctx, account, model, OpenAIFastTierMissing)
+		switch action {
+		case BetaPolicyActionBlock:
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("openai service_tier=%s is not allowed for model %s", OpenAIFastTierMissing, model)
+			}
+			return frame, &OpenAIFastBlockedError{Message: errMsg}, nil
+		case OpenAIFastPolicyActionForcePriority:
+			updated, err := sjson.SetBytes(frame, "service_tier", OpenAIFastTierPriority)
+			if err != nil {
+				return frame, nil, fmt.Errorf("force service_tier priority on missing ws tier: %w", err)
+			}
+			return updated, nil, nil
+		default:
+			return frame, nil, nil
+		}
 	}
 	normTier := normalizedOpenAIServiceTierValue(rawTier)
 	if normTier == "" {

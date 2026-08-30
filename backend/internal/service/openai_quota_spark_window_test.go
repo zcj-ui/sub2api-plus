@@ -60,6 +60,9 @@ func (r *stubQuotaAccountRepo) UpdateExtra(_ context.Context, id int64, updates 
 		r.extraUpdates = make(map[int64]map[string]any)
 	}
 	r.extraUpdates[id] = updates
+	if account := r.accounts[id]; account != nil {
+		mergeAccountExtra(account, updates)
+	}
 	return nil
 }
 
@@ -172,6 +175,7 @@ func TestBuildOpenAIQuotaExtraUpdates_PersistsOrdinaryWindowsAndCredits(t *testi
 	now := time.Now().UTC()
 	account := &Account{ID: 10, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	usage := &OpenAIQuotaUsage{
+		PlanType: "team",
 		RateLimit: &OpenAIRateLimit{
 			PrimaryWindow: &OpenAIRateLimitWindow{
 				UsedPercent:        42,
@@ -200,9 +204,34 @@ func TestBuildOpenAIQuotaExtraUpdates_PersistsOrdinaryWindowsAndCredits(t *testi
 	require.Equal(t, "1000.0000000000", snapshot.Balance)
 	require.True(t, snapshot.HasCredits)
 	require.NotEmpty(t, snapshot.UpdatedAt)
+	require.Equal(t, "team", updates[OpenAIQuotaPlanTypeExtraKey])
 
 	account.Extra = updates
 	require.True(t, account.HasAvailableCodexCredits())
+}
+
+func TestBuildOpenAIQuotaExtraUpdates_ClearsStaleFiveHourWindowForWeeklyOnly(t *testing.T) {
+	now := time.Now().UTC()
+	account := &Account{ID: 11, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	usage := &OpenAIQuotaUsage{RateLimit: &OpenAIRateLimit{
+		PrimaryWindow: &OpenAIRateLimitWindow{
+			UsedPercent:        17,
+			LimitWindowSeconds: 604800,
+			ResetAfterSeconds:  3600,
+		},
+	}}
+
+	updates := buildOpenAIQuotaExtraUpdates(account, usage, now)
+	for _, key := range []string{
+		OpenAIQuotaUsed5hPercentExtraKey,
+		OpenAIQuotaReset5hSecondsExtraKey,
+		OpenAIQuotaWindow5hMinutesExtraKey,
+		OpenAIQuotaReset5hAtExtraKey,
+	} {
+		value, ok := updates[key]
+		require.True(t, ok, "weekly-only snapshot must include a tombstone for %s", key)
+		require.Nil(t, value, "weekly-only snapshot must clear stale %s", key)
+	}
 }
 
 func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T) {
@@ -221,6 +250,16 @@ func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T)
 	}
 
 	require.True(t, base().HasAvailableCodexCredits())
+	numeric := base()
+	numericCredits, ok := numeric.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	numericCredits["balance"] = float64(1000)
+	require.True(t, numeric.HasAvailableCodexCredits(), "legacy numeric balance must remain spendable")
+	infinite := base()
+	infiniteCredits, ok := infinite.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	infiniteCredits["balance"] = "+Inf"
+	require.False(t, infinite.HasAvailableCodexCredits(), "non-finite balances must not bypass quota guards")
 	zero := base()
 	zeroCredits, ok := zero.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
 	require.True(t, ok)
@@ -254,6 +293,18 @@ func TestHasAvailableCodexCredits_RequiresExplicitSpendableBalance(t *testing.T)
 	require.True(t, stale.HasAvailableCodexCredits(), "a confirmed positive balance remains spendable until a newer probe disproves it")
 }
 
+func TestOpenAIChatGPTSubscriptionUsesPersistedQuotaPlanTypeFallback(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra:    map[string]any{OpenAIQuotaPlanTypeExtraKey: "team"},
+	}
+	require.True(t, account.IsOpenAIChatGPTSubscription())
+
+	account.Extra[OpenAIQuotaPlanTypeExtraKey] = "free"
+	require.False(t, account.IsOpenAIChatGPTSubscription())
+}
+
 func TestCacheUsageSnapshotRestoresThresholdPausedAccountWhenCreditsAppear(t *testing.T) {
 	until := time.Now().Add(4 * time.Hour)
 	account := &Account{
@@ -275,6 +326,64 @@ func TestCacheUsageSnapshotRestoresThresholdPausedAccountWhenCreditsAppear(t *te
 	require.Equal(t, []int64{55}, repo.clearedTempIDs)
 	require.Nil(t, account.TempUnschedulableUntil)
 	require.Empty(t, account.TempUnschedulableReason)
+}
+
+// A delayed WHAM response may lose the repository's observation-time CAS while
+// UpdateExtra still reports one affected account row. The stale response must
+// not clear a newer threshold pause or replace its credit snapshot in memory.
+func TestCacheUsageSnapshot_DoesNotReconcileStaleObservation(t *testing.T) {
+	until := time.Now().Add(4 * time.Hour)
+	account := &Account{
+		ID:                     56,
+		Platform:               PlatformOpenAI,
+		Type:                   AccountTypeOAuth,
+		Extra:                  map[string]any{},
+		TempUnschedulableUntil: &until,
+		TempUnschedulableReason: BuildAccountSchedulingThresholdReason(
+			"5h quota threshold reached",
+		),
+	}
+	// Simulate a newer durable snapshot that exhausted credits. The fake
+	// UpdateExtra below deliberately discards the older candidate update.
+	account.Extra[openaiQuotaCreditBalanceKey] = map[string]any{
+		"has_credits": false,
+		"balance":     "0",
+		"updated_at":  time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}
+	repo := &staleQuotaSnapshotRepo{account: account}
+	svc := &OpenAIQuotaService{accountRepo: repo}
+
+	err := svc.CacheUsageSnapshot(context.Background(), account.ID, &OpenAIQuotaUsage{
+		Credits: &OpenAICodexCredits{HasCredits: true, Balance: "25"},
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, repo.clearedTempIDs, "a stale positive response must not reopen the newer exhausted account")
+	require.NotNil(t, account.TempUnschedulableUntil)
+	credits, ok := account.Extra[openaiQuotaCreditBalanceKey].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "0", credits["balance"], "the newer durable credit snapshot must remain authoritative")
+}
+
+type staleQuotaSnapshotRepo struct {
+	AccountRepository
+	account        *Account
+	clearedTempIDs []int64
+}
+
+func (r *staleQuotaSnapshotRepo) GetByID(context.Context, int64) (*Account, error) {
+	return r.account, nil
+}
+
+func (r *staleQuotaSnapshotRepo) UpdateExtra(context.Context, int64, map[string]any) error {
+	// Deliberately do not merge: the repository's SQL observation CAS rejects
+	// this older candidate while still updating updated_at on the row.
+	return nil
+}
+
+func (r *staleQuotaSnapshotRepo) ClearTempUnschedulable(_ context.Context, id int64) error {
+	r.clearedTempIDs = append(r.clearedTempIDs, id)
+	return nil
 }
 
 // ── Part C: ResetCredit 影子拒绝 ───────────────────────────────────────────

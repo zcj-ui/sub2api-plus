@@ -625,6 +625,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 	reqModel := modelResult.String()
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
+	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 	if !openAICompatibleTextTargetAllowed(c, apiKey, reqModel) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Model is not supported by this OpenAI-compatible endpoint for composite groups")
 		return
@@ -643,7 +644,11 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+	previousResponseID, previousResponseIDErr := service.ParseOpenAIPreviousResponseIDField(body)
+	if previousResponseIDErr != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", previousResponseIDErr.Error())
+		return
+	}
 	if previousResponseID != "" {
 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 		reqLog = reqLog.With(
@@ -662,20 +667,26 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if apiKey.GroupID != nil {
 			groupID = *apiKey.GroupID
 		}
-		owned, ownershipErr := h.gatewayService.ValidateOpenAIHTTPResponseOwner(
-			c.Request.Context(),
-			groupID,
-			previousResponseID,
-			subject.UserID,
-			apiKey.ID,
-		)
-		if ownershipErr != nil {
-			reqLog.Warn("openai.previous_response_owner_lookup_failed", zap.Error(ownershipErr))
-		}
-		if !owned {
-			reqLog.Warn("openai.request_validation_failed", zap.String("reason", "previous_response_owner_mismatch"))
-			h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "previous_response_id is not available for this user")
-			return
+		// HTTP owner bindings are a Plus safeguard for native OpenAI/Codex
+		// Responses IDs. Grok/CN-compatible upstreams have their own continuation
+		// semantics and historically did not populate this store; do not reject
+		// their valid upstream IDs here.
+		if requestPlatform == service.PlatformOpenAI {
+			owned, ownershipErr := h.gatewayService.ValidateOpenAIHTTPResponseOwner(
+				c.Request.Context(),
+				groupID,
+				previousResponseID,
+				subject.UserID,
+				apiKey.ID,
+			)
+			if ownershipErr != nil {
+				reqLog.Warn("openai.previous_response_owner_lookup_failed", zap.Error(ownershipErr))
+			}
+			if !owned {
+				reqLog.Warn("openai.request_validation_failed", zap.String("reason", "previous_response_owner_mismatch"))
+				h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "previous_response_id is not available for this user")
+				return
+			}
 		}
 	}
 	service.SetOpenAIHTTPResponseOwner(c, subject.UserID, apiKey.ID)
@@ -734,7 +745,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 
 	// Get subscription info (may be nil)
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
-	requestPlatform := openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
+	requestPlatform = openAICompatibleRequestPlatform(c.Request.Context(), apiKey)
 
 	service.SetOpsLatencyMs(c, service.OpsAuthLatencyMsKey, time.Since(requestStart).Milliseconds())
 	routingStart := time.Now()
@@ -786,6 +797,15 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 该判断已排除 Codex 被动 image_gen namespace，避免 CC-only 账号被误过滤（#4476）。
 	needsResponses := nativeV2 || legacyCompact
 	requiredCapability := openAIResponsesRequiredCapabilityForRequest(imageIntent, needsResponses, requestPlatform)
+	// A plain previous_response_id continuation has server-side state that a
+	// Chat Completions fallback cannot reconstruct. Require a Responses-capable
+	// OpenAI account in that case so the request is rejected/failed over clearly
+	// instead of silently becoming a contextless new answer. Complete tool-call
+	// history remains eligible for the existing local rebuild path.
+	if requestPlatform == service.PlatformOpenAI && previousResponseID != "" &&
+		!service.CanRebuildOpenAIHTTPContinuationFromInput(body) {
+		requiredCapability = service.OpenAIEndpointCapabilityResponses
+	}
 
 	// 分组利润控制：请求级装配定价上下文——pricingAt 固定本请求的
 	// D 与计费高峰因子，选号、槽位终检与全部 failover 重入共用同一门与阈值。
@@ -869,27 +889,37 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		)
 		account := selection.Account
 		if previousResponseID != "" && requestPlatform == service.PlatformOpenAI && !account.IsOpenAIApiKey() {
-			// The public Responses HTTP API supports previous_response_id on API-key
-			// accounts. OAuth/SetupToken upstreams do not, so keep searching instead
-			// of silently deleting continuation state from a mixed account pool.
-			failedAccountIDs[account.ID] = struct{}{}
-			if selection.ReleaseFunc != nil {
-				selection.ReleaseFunc()
-				selection.ReleaseFunc = nil
+			// ChatGPT OAuth/SetupToken HTTP endpoints reject previous_response_id.
+			// A sub2api→sub2api hop can still use these accounts when the request's
+			// input contains every tool-call context item needed to rebuild the turn;
+			// the forward transform then removes previous_response_id at egress. A
+			// plain follow-up (or partially covered tool output) must stay on an
+			// API-key account so we never silently lose server-side conversation
+			// state.
+			if !service.CanRebuildOpenAIHTTPContinuationFromInput(body) {
+				failedAccountIDs[account.ID] = struct{}{}
+				if selection.ReleaseFunc != nil {
+					selection.ReleaseFunc()
+					selection.ReleaseFunc = nil
+				}
+				lastFailoverErr = &service.UpstreamFailoverError{
+					StatusCode:       http.StatusBadRequest,
+					Stage:            service.GatewayFailureStageInference,
+					Scope:            service.GatewayFailureScopeRequest,
+					Reason:           service.OpenAIHTTPContinuationUnsupportedReason,
+					ClientStatusCode: http.StatusBadRequest,
+					ClientMessage:    "previous_response_id requires an OpenAI API-key account for HTTP requests",
+				}
+				reqLog.Debug("openai.account_skipped_http_continuation_unsupported",
+					zap.Int64("account_id", account.ID),
+					zap.String("account_type", account.Type),
+				)
+				continue
 			}
-			lastFailoverErr = &service.UpstreamFailoverError{
-				StatusCode:       http.StatusBadRequest,
-				Stage:            service.GatewayFailureStageInference,
-				Scope:            service.GatewayFailureScopeRequest,
-				Reason:           service.OpenAIHTTPContinuationUnsupportedReason,
-				ClientStatusCode: http.StatusBadRequest,
-				ClientMessage:    "previous_response_id requires an OpenAI API-key account for HTTP requests",
-			}
-			reqLog.Debug("openai.account_skipped_http_continuation_unsupported",
+			reqLog.Debug("openai.account_allowed_http_continuation_rebuilt_from_input",
 				zap.Int64("account_id", account.ID),
 				zap.String("account_type", account.Type),
 			)
-			continue
 		}
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
@@ -1101,7 +1131,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		if result != nil {
 			// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 			if account.Type == service.AccountTypeOAuth && !account.IsShadow() {
-				h.gatewayService.UpdateCodexUsageSnapshotFromHeaders(c.Request.Context(), account.ID, result.ResponseHeaders)
+				h.gatewayService.UpdateCodexUsageSnapshotFromHeadersForAccount(c.Request.Context(), account, result.ResponseHeaders)
 			}
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, result), openAIForwardSucceededForScheduling(result), result.FirstTokenMs)
 		} else {
@@ -1142,23 +1172,11 @@ func isOpenAIRemoteCompactionV2Request(body []byte) bool {
 	return valid && stream && service.HasCompactionTriggerInInput(body)
 }
 
-// isOpenAIRemoteCompactionV2RequestForContext keeps the hop-by-hop beta
-// negotiation authoritative while allowing the documented Codex Desktop
-// fallback when an earlier gateway stripped that header. Legacy CLI and
-// unknown clients must continue using the /responses/compact bridge.
+// isOpenAIRemoteCompactionV2RequestForContext is retained as a call-site
+// compatibility wrapper. Endpoint selection follows the official protocol
+// shape; optional client headers are deliberately not used as a heuristic.
 func isOpenAIRemoteCompactionV2RequestForContext(c *gin.Context, body []byte) bool {
-	if !isOpenAIRemoteCompactionV2Request(body) || c == nil || c.Request == nil {
-		return false
-	}
-	for _, value := range c.Request.Header.Values("x-codex-beta-features") {
-		for _, token := range strings.Split(value, ",") {
-			if strings.TrimSpace(token) == "remote_compaction_v2" {
-				return true
-			}
-		}
-	}
-	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
-	return len(ua) > len("Codex Desktop/") && strings.HasPrefix(strings.ToLower(ua), "codex desktop/")
+	return isOpenAIRemoteCompactionV2Request(body)
 }
 
 // normalizeOpenAIResponsesCompactRequest keeps Codex remote compaction v2 on
@@ -1399,7 +1417,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
-	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel, body)
+	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(c, requestPlatform, sessionHash, promptCacheKey, reqModel, body)
 	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatAnthropic) {
 		return
 	}
@@ -1677,10 +1695,21 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	}
 }
 
-func resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel string, body []byte) (string, string) {
+func resolveOpenAIMessagesMetadataSession(c *gin.Context, requestPlatform, sessionHash, promptCacheKey, reqModel string, body []byte) (string, string) {
 	// Anthropic metadata.user_id 只作为账号粘性信号。上游 GPT/Codex 缓存键
 	// 交给 ForwardAsAnthropic 从 cache_control 或完整消息 digest 派生，避免
 	// 固定 metadata key 压住后续 turn 的缓存滚动。
+	// Claude Code 的会话头比消息内容回退哈希稳定，但只有在没有任何
+	// OpenAI 自带的显式会话信号时才参与路由；它绝不升级为 prompt_cache_key。
+	// The /v1/messages handler can dispatch to either an OpenAI/Codex account
+	// or an Anthropic account.  X-Claude-Code-Session-Id is an OpenAI routing
+	// compatibility signal only; applying it to native Claude/CC scheduling
+	// would change their established session hash and sticky semantics.
+	if requestPlatform == service.PlatformOpenAI && promptCacheKey == "" && service.OpenAIExplicitSessionIDFromHeader(c) == "" {
+		if claudeSessionID := service.ClaudeCodeSessionIDFromHeader(c); claudeSessionID != "" {
+			return service.DeriveSessionHashFromSeed(claudeSessionID), promptCacheKey
+		}
+	}
 	if sessionHash != "" {
 		return sessionHash, promptCacheKey
 	}
@@ -2210,7 +2239,11 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return
 		}
 	}
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(firstMessage, "previous_response_id").String())
+	previousResponseID, previousResponseIDErr := service.ParseOpenAIPreviousResponseIDField(firstMessage)
+	if previousResponseIDErr != nil {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, previousResponseIDErr.Error())
+		return
+	}
 	previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 	if previousResponseID != "" && previousResponseIDKind == service.OpenAIPreviousResponseIDKindMessageID {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "previous_response_id must be a response.id (resp_*), not a message id")
@@ -2519,7 +2552,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 			return false
 		}
 		payload := append([]byte(nil), resume.ReplayPayload...)
-		if !gjson.ValidBytes(payload) || strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" {
+		if !gjson.ValidBytes(payload) {
+			return false
+		}
+		if previousID, previousIDErr := service.ParseOpenAIPreviousResponseIDField(payload); previousIDErr != nil || previousID != "" {
 			return false
 		}
 		var setModelErr error
@@ -2845,6 +2881,26 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if model == "" {
 					model = reqModel
 				}
+				// Keep the Responses continuation field strict on every turn, not
+				// only during the handshake.  A malformed/duplicate value here can
+				// otherwise be coerced by gjson in the scheduler and accidentally
+				// attach a later turn to the wrong local response binding.  Native
+				// Claude/Grok-compatible turns keep their historical wire behavior.
+				turnPlatform := requestPlatform
+				if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
+					if detected, ok := service.DetectModelPlatform(model); ok {
+						turnPlatform = detected
+					}
+				}
+				if turnPlatform == service.PlatformOpenAI {
+					previousID, previousIDErr := service.ParseOpenAIPreviousResponseIDField(payload)
+					if previousIDErr != nil {
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, previousIDErr.Error(), previousIDErr)
+					}
+					if previousID != "" && service.ClassifyOpenAIPreviousResponseIDKind(previousID) == service.OpenAIPreviousResponseIDKindMessageID {
+						return service.NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "previous_response_id must be a response.id (resp_*), not a message id", nil)
+					}
+				}
 				if decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn"); decision != nil && !decision.AllowNextStage {
 					writeSecurityAuditWSError(ctx, wsConn, decision)
 					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
@@ -3000,7 +3056,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				)
 				// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 				if account.Type == service.AccountTypeOAuth && !account.IsShadow() {
-					h.gatewayService.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, result.ResponseHeaders)
+					h.gatewayService.UpdateCodexUsageSnapshotFromHeadersForAccount(ctx, account, result.ResponseHeaders)
 				}
 				scheduleModel := turnUpstreamModel
 				if scheduleModel == "" {
@@ -3853,6 +3909,9 @@ func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn b
 // payload, not to the connection's first response.create frame.
 func openAIWSCurrentTurnRetryPayloadState(payload []byte) ([]byte, string, service.ToolCallOutputContextCoverage, bool) {
 	if !gjson.ValidBytes(payload) {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	if previousID, previousIDErr := service.ParseOpenAIPreviousResponseIDField(payload); previousIDErr != nil || previousID != "" {
 		return nil, "", service.ToolCallOutputContextCoverage{}, false
 	}
 	if messageType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); messageType != "response.create" {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"net/url"
 	"reflect"
 	"sort"
@@ -93,21 +94,41 @@ const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 // values stay disabled so existing accounts do not change behavior silently.
 const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
 
+// AccountErrorRestoreSchedulableExtraKey is an internal, short-lived marker
+// written when an account is quarantined by SetError.  It records that the
+// account was schedulable before the system-owned error transition so a later
+// automatic recovery can restore that state without overriding an explicit
+// administrator disable.  The marker is removed as soon as schedulability is
+// explicitly changed or the error is cleared.
+const AccountErrorRestoreSchedulableExtraKey = "_sub2api_error_restore_schedulable"
+
 // Runtime extra keys written by quota refresh / health probe. Generic account
 // Update must preserve the current database values so a concurrent
 // UpdateExtra is not clobbered by a stale in-memory snapshot.
 const (
-	OpenAIQuotaCreditBalanceExtraKey   = "codex_credit_snapshot"
-	OpenAIQuotaResetCreditsExtraKey    = "codex_reset_credit_snapshot"
-	OpenAIQuotaUsageUpdatedAtExtraKey  = "codex_usage_updated_at"
-	OpenAIQuotaUsed5hPercentExtraKey   = "codex_5h_used_percent"
-	OpenAIQuotaReset5hSecondsExtraKey  = "codex_5h_reset_after_seconds"
-	OpenAIQuotaWindow5hMinutesExtraKey = "codex_5h_window_minutes"
-	OpenAIQuotaReset5hAtExtraKey       = "codex_5h_reset_at"
-	OpenAIQuotaUsed7dPercentExtraKey   = "codex_7d_used_percent"
-	OpenAIQuotaReset7dSecondsExtraKey  = "codex_7d_reset_after_seconds"
-	OpenAIQuotaWindow7dMinutesExtraKey = "codex_7d_window_minutes"
-	OpenAIQuotaReset7dAtExtraKey       = "codex_7d_reset_at"
+	OpenAIQuotaCreditBalanceExtraKey = "codex_credit_snapshot"
+	// OpenAIQuotaPlanTypeExtraKey caches the plan_type returned by WHAM so the
+	// account list and scheduler can distinguish Free/Plus/Team/Business/Edu/K12
+	// even when credentials were imported without a plan field.
+	OpenAIQuotaPlanTypeExtraKey = "codex_plan_type"
+	// OpenAIQuotaSpendControlExtraKey stores the latest workspace spend-control
+	// envelope (team/business/enterprise/edu/k12). It is a derived snapshot and
+	// is refreshed together with codex_usage_updated_at.
+	OpenAIQuotaSpendControlExtraKey   = "codex_spend_control_snapshot"
+	OpenAIQuotaResetCreditsExtraKey   = "codex_reset_credit_snapshot"
+	OpenAIQuotaUsageUpdatedAtExtraKey = "codex_usage_updated_at"
+	// OpenAICodexUsageObservedAtUnixNanoExtraKey is the monotonic capture time
+	// for Codex quota windows. Repository writes compare it atomically so an
+	// older response cannot overwrite a newer snapshot across gateway nodes.
+	OpenAICodexUsageObservedAtUnixNanoExtraKey = "codex_usage_observed_at_unix_nano"
+	OpenAIQuotaUsed5hPercentExtraKey           = "codex_5h_used_percent"
+	OpenAIQuotaReset5hSecondsExtraKey          = "codex_5h_reset_after_seconds"
+	OpenAIQuotaWindow5hMinutesExtraKey         = "codex_5h_window_minutes"
+	OpenAIQuotaReset5hAtExtraKey               = "codex_5h_reset_at"
+	OpenAIQuotaUsed7dPercentExtraKey           = "codex_7d_used_percent"
+	OpenAIQuotaReset7dSecondsExtraKey          = "codex_7d_reset_after_seconds"
+	OpenAIQuotaWindow7dMinutesExtraKey         = "codex_7d_window_minutes"
+	OpenAIQuotaReset7dAtExtraKey               = "codex_7d_reset_at"
 )
 
 // AccountRuntimeExtraKeys are identity-independent snapshots restored from the
@@ -116,8 +137,11 @@ func AccountRuntimeExtraKeys() []string {
 	return []string{
 		AccountHealthProbeExtraKey,
 		OpenAIQuotaCreditBalanceExtraKey,
+		OpenAIQuotaPlanTypeExtraKey,
+		OpenAIQuotaSpendControlExtraKey,
 		OpenAIQuotaResetCreditsExtraKey,
 		OpenAIQuotaUsageUpdatedAtExtraKey,
+		OpenAICodexUsageObservedAtUnixNanoExtraKey,
 		OpenAIQuotaUsed5hPercentExtraKey,
 		OpenAIQuotaReset5hSecondsExtraKey,
 		OpenAIQuotaWindow5hMinutesExtraKey,
@@ -144,7 +168,8 @@ const (
 	// （openai_responses_supported / openai_responses_mode），而非
 	// credentials["openai_capabilities"] 配置集。仅用于生图意图的 /v1/responses
 	// 调度，避免把请求调度到会在 forward 阶段被降级为 Chat Completions 的账号（#4417）。
-	OpenAIEndpointCapabilityResponses OpenAIEndpointCapability = "responses"
+	OpenAIEndpointCapabilityResponses            OpenAIEndpointCapability = "responses"
+	OpenAIEndpointCapabilityPromptCacheRetention OpenAIEndpointCapability = "prompt_cache_retention"
 )
 
 const openAIEndpointCapabilitiesCredentialKey = "openai_capabilities"
@@ -1374,7 +1399,7 @@ func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
 				HasCredits:          resolveAccountExtraBool(value, "has_credits"),
 				Unlimited:           resolveAccountExtraBool(value, "unlimited"),
 				OverageLimitReached: resolveAccountExtraBool(value, "overage_limit_reached"),
-				Balance:             firstStringValue(value, "balance"),
+				Balance:             openAICreditBalanceString(value["balance"]),
 			},
 			UpdatedAt: firstStringValue(value, "updated_at"),
 		}
@@ -1398,7 +1423,49 @@ func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
 		return false
 	}
 	balance, err := strconv.ParseFloat(strings.TrimSpace(snapshot.Balance), 64)
-	return err == nil && balance > 0
+	return err == nil && !math.IsNaN(balance) && !math.IsInf(balance, 0) && balance > 0
+}
+
+// openAICreditBalanceString accepts both the string representation written by
+// the current quota parser and numeric values found in legacy/imported JSONB
+// snapshots. A numeric balance must not silently become an empty string: doing
+// so would make a healthy paid-credit account look exhausted to the 429 guard.
+func openAICreditBalanceString(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	case float64:
+		if typed != typed || typed > 1.7976931348623157e+308 || typed < -1.7976931348623157e+308 {
+			return ""
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(typed), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(typed)
+	case int8:
+		return strconv.FormatInt(int64(typed), 10)
+	case int16:
+		return strconv.FormatInt(int64(typed), 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case uint:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint32:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint64:
+		return strconv.FormatUint(typed, 10)
+	default:
+		return ""
+	}
 }
 
 // IsOpenAIOAuthLike reports OpenAI credentials that use the ChatGPT/Codex
@@ -1418,7 +1485,11 @@ func (a *Account) IsOpenAIChatGPTSubscription() bool {
 	if !a.IsOpenAIOAuth() {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(a.GetCredential("plan_type"))) {
+	planType := strings.TrimSpace(a.GetCredential("plan_type"))
+	if planType == "" {
+		planType = a.getExtraString(OpenAIQuotaPlanTypeExtraKey)
+	}
+	switch strings.ToLower(strings.TrimSpace(planType)) {
 	case "", "free", "abnormal":
 		return false
 	default:
@@ -1937,6 +2008,10 @@ func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapa
 		}
 	case OpenAIEndpointCapabilityEmbeddings:
 		if a.Type != AccountTypeAPIKey {
+			return false
+		}
+	case OpenAIEndpointCapabilityPromptCacheRetention:
+		if a.Platform != PlatformOpenAI || a.Type != AccountTypeAPIKey {
 			return false
 		}
 	default:

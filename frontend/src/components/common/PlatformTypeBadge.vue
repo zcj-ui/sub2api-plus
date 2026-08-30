@@ -128,6 +128,12 @@ const normalizedPlanType = computed(() =>
 const planLabel = computed(() => {
   if (!normalizedPlanType.value) return ''
   switch (normalizedPlanType.value) {
+    // OpenAI/ChatGPT plan identifiers arrive in several forms depending on
+    // whether the value came from the OAuth claims, a persisted manual
+    // override, or a compatibility relay. Keep the display stable while
+    // preserving the original value for unknown/future plans below.
+    case 'go':
+      return 'Go'
     case 'plus':
       return 'Plus'
     case 'team':
@@ -135,9 +141,35 @@ const planLabel = computed(() => {
     case 'chatgptpro':
     case 'pro':
       return 'Pro'
+    case 'prolite':
+    case 'selfservebusinessprolite':
+      return 'Pro Lite'
+    case 'selfservebusinessusagebased':
+    case 'business':
+      return 'Business'
+    case 'enterprise':
+    case 'enterprisecbpusagebased':
+    case 'enterprisecbpautomation':
+    case 'ent26':
+      return 'Enterprise'
+    case 'edu':
+    case 'education':
+      return 'Education'
+    case 'eduplus':
+      return 'Education Plus'
+    case 'edupro':
+      return 'Education Pro'
+    case 'k12':
+      return 'K-12'
     case 'free':
     case 'basic':
       return props.platform === 'grok' ? 'Grok Free' : 'Free'
+    case 'freeworkspace':
+      return 'Free Workspace'
+    case 'quorum':
+      return 'Quorum'
+    case 'guest':
+      return 'Guest'
     case 'supergrok':
       return 'SuperGrok'
     case 'supergroklite':

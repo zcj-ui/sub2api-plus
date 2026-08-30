@@ -221,6 +221,27 @@
             </div>
           </div>
         </div>
+        <div
+          v-if="healthProbePartial"
+          class="mb-3 flex items-start justify-between gap-3 border-y border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200"
+          data-testid="account-health-partial"
+        >
+          <div class="min-w-0">
+            <div class="font-medium">
+              {{ t('admin.accounts.healthProbe.partial', {
+                completed: healthProbePartial.completedAccounts,
+                failed: healthProbePartial.requestFailedAccounts,
+                batches: healthProbePartial.requestFailedBatches
+              }) }}
+            </div>
+            <div v-if="healthProbePartial.reason" class="mt-0.5 break-words text-xs text-amber-700/80 dark:text-amber-300/80">
+              {{ healthProbePartial.reason }}
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-sm shrink-0" @click="healthProbePartial = null">
+            {{ t('common.close') }}
+          </button>
+        </div>
         <div ref="accountTableRef" class="flex min-h-0 flex-1 flex-col overflow-hidden">
         <DataTable
           ref="dataTableRef"
@@ -529,6 +550,7 @@ import { useAuthStore } from '@/stores/auth'
 import { adminAPI } from '@/api/admin'
 import { useTableLoader } from '@/composables/useTableLoader'
 import { useSwipeSelect, type SwipeSelectVirtualContext } from '@/composables/useSwipeSelect'
+import { mergeDefinedAccountFields } from './account-row-merge'
 import { useTableSelection } from '@/composables/useTableSelection'
 import { useStepUp, isStepUpBlocked, isStepUpCancelled, stepUpBlockReason } from '@/composables/useStepUp'
 import TotpStepUpDialog from '@/components/auth/TotpStepUpDialog.vue'
@@ -637,12 +659,21 @@ const exportingData = ref(false)
 const probingUpstreamBilling = reactive(new Set<number>())
 const healthProbeFailurePool = ref<AccountHealthProbeResult[]>([])
 const healthProbeRunning = ref(false)
+const healthProbePartial = ref<{
+  completedAccounts: number
+  requestFailedAccounts: number
+  requestFailedBatches: number
+  reason: string
+} | null>(null)
 const inventoryRunning = ref(false)
 const showInventory = ref(false)
 const inventoryResponse = ref<BatchAccountInventoryResponse | null>(null)
 const upstreamBillingProbeGloballyEnabled = ref<boolean | undefined>(undefined)
 const upstreamBillingNow = ref(Date.now())
-let lastUpstreamBillingSortRefreshMinute = -1
+const upstreamBillingRateETag = ref<string | null>(null)
+const upstreamBillingRateRefreshing = ref(false)
+let upstreamBillingRateAbortController: AbortController | null = null
+let upstreamBillingRateGeneration = 0
 useIntervalFn(() => { upstreamBillingNow.value = Date.now() }, 60_000)
 
 // Account tools dropdown
@@ -1166,26 +1197,25 @@ useSwipeSelect(accountTableRef, {
 
 const resetAutoRefreshCache = () => {
   autoRefreshETag.value = null
+  upstreamBillingRateETag.value = null
+  upstreamBillingRateGeneration += 1
+  upstreamBillingRateAbortController?.abort()
 }
 
-function markUpstreamBillingSortRefresh() {
-  if (sortState.sort_by === 'upstream_billing_rate') {
-    lastUpstreamBillingSortRefreshMinute = Math.floor(Date.now() / 60_000)
-  }
+type AccountLoadOptions = {
+  refreshTodayStats?: boolean
 }
 
-const load = async () => {
-  markUpstreamBillingSortRefresh()
+const load = async (options: AccountLoadOptions = {}) => {
   syncAccountListDerivedParams()
   hasPendingListSync.value = false
   resetAutoRefreshCache()
   pendingTodayStatsRefresh.value = false
   await baseLoad()
-  await refreshTodayStatsBatch()
+  if (options.refreshTodayStats !== false) await refreshTodayStatsBatch()
 }
 
 const reload = async () => {
-  markUpstreamBillingSortRefresh()
   syncAccountListDerivedParams()
   hasPendingListSync.value = false
   resetAutoRefreshCache()
@@ -1194,18 +1224,147 @@ const reload = async () => {
   await refreshTodayStatsBatch()
 }
 
-const refreshUpstreamBillingSortedList = async (force = false) => {
-  if (sortState.sort_by !== 'upstream_billing_rate') return
-
-  const minute = Math.floor(upstreamBillingNow.value / 60_000)
-  if (!force && lastUpstreamBillingSortRefreshMinute === minute) return
-  lastUpstreamBillingSortRefreshMinute = minute
-  try {
-    await reload()
-  } catch (error) {
-    console.error('Failed to refresh upstream billing sort:', error)
+const buildUpstreamBillingRateFilters = () => {
+  const rawParams = toRaw(params) as Record<string, unknown>
+  return {
+    platform: typeof rawParams.platform === 'string' ? rawParams.platform : '',
+    type: typeof rawParams.type === 'string' ? rawParams.type : '',
+    status: typeof rawParams.status === 'string' ? rawParams.status : '',
+    group: typeof rawParams.group === 'string' ? rawParams.group : '',
+    search: typeof rawParams.search === 'string' ? rawParams.search : '',
+    privacy_mode: typeof rawParams.privacy_mode === 'string' ? rawParams.privacy_mode : '',
+    sort_by: sortState.sort_by,
+    sort_order: sortState.sort_order
   }
 }
+
+const sameAccountIDOrder = (left: number[], right: number[]) =>
+  left.length === right.length && left.every((id, index) => id === right[index])
+
+const upstreamBillingRateContextKey = () => JSON.stringify({
+  page: pagination.page,
+  pageSize: pagination.page_size,
+  filters: buildUpstreamBillingRateFilters()
+})
+
+const applyUpstreamBillingRateSnapshots = async (
+  result: NonNullable<Awaited<ReturnType<typeof adminAPI.accounts.getUpstreamBillingRatesWithEtag>>['data']>
+) => {
+  const nextIDs = result.items.map(item => item.account_id)
+  const currentIDs = accounts.value.map(account => account.id)
+
+  // A compact response cannot fill a row that crossed a page boundary. In
+  // that case reconcile once with the full list; otherwise update rows locally.
+  if (result.total !== pagination.total || !sameAccountIDOrder(nextIDs, currentIDs)) {
+    try {
+      await load({ refreshTodayStats: false })
+    } catch (error) {
+      console.error('Failed to reconcile upstream billing sort:', error)
+    }
+    return
+  }
+
+  const itemsByID = new Map(result.items.map(item => [item.account_id, item]))
+  let changed = false
+  const nextAccounts = accounts.value.map(account => {
+    const item = itemsByID.get(account.id)
+    if (!item) return account
+    const nextSnapshot = item.snapshot ?? null
+    const previousSnapshot = account.extra?.upstream_billing_probe ?? null
+    if (JSON.stringify(previousSnapshot) === JSON.stringify(nextSnapshot)) return account
+
+    const nextExtra = { ...(account.extra ?? {}) }
+    if (nextSnapshot) nextExtra.upstream_billing_probe = nextSnapshot
+    else delete nextExtra.upstream_billing_probe
+    const nextAccount = {
+      ...account,
+      ...(typeof nextSnapshot?.synced_rate_multiplier === 'number'
+        ? { rate_multiplier: nextSnapshot.synced_rate_multiplier }
+        : {}),
+      extra: nextExtra
+    }
+    syncAccountRefs(nextAccount)
+    changed = true
+    return nextAccount
+  })
+
+  if (changed) {
+    accounts.value = nextAccounts
+    upstreamBillingNow.value = Date.now()
+  }
+}
+
+const refreshUpstreamBillingRates = async (force = false) => {
+  if (upstreamBillingRateRefreshing.value || loading.value || accounts.value.length === 0) return
+  if (!force && (
+    probingUpstreamBilling.size > 0 ||
+    isAnyModalOpen.value ||
+    menu.show ||
+    showAccountToolsDropdown.value ||
+    showAutoRefreshDropdown.value ||
+    (typeof document !== 'undefined' && document.hidden)
+  )) return
+
+  // Keep mixed-version deployments usable while an older frontend chunk is
+  // talking to an older API module that has not exported the compact reader.
+  // Manual probes still reconcile through the established full-list path.
+  const compactLoader = adminAPI.accounts.getUpstreamBillingRatesWithEtag
+  if (typeof compactLoader !== 'function') {
+    if (force && !loading.value) {
+      try {
+        await load({ refreshTodayStats: false })
+      } catch (fallbackError) {
+        console.error('Failed to reconcile upstream billing rates:', fallbackError)
+      }
+    }
+    return
+  }
+
+  const controller = new AbortController()
+  upstreamBillingRateAbortController = controller
+  upstreamBillingRateRefreshing.value = true
+  try {
+    syncAccountListDerivedParams()
+    const requestGeneration = upstreamBillingRateGeneration
+    const requestContextKey = upstreamBillingRateContextKey()
+    const result = await compactLoader(
+      pagination.page,
+      pagination.page_size,
+      buildUpstreamBillingRateFilters(),
+      { etag: force ? null : upstreamBillingRateETag.value, signal: controller.signal }
+    )
+    if (loading.value || requestGeneration !== upstreamBillingRateGeneration || requestContextKey !== upstreamBillingRateContextKey()) return
+    if (result.etag) upstreamBillingRateETag.value = result.etag
+    if (!result.notModified && result.data) await applyUpstreamBillingRateSnapshots(result.data)
+  } catch (error) {
+    const refreshError = error as { name?: string; code?: string }
+    const cancelled = refreshError.name === 'AbortError' || refreshError.name === 'CanceledError' || refreshError.code === 'ERR_CANCELED'
+    if (!cancelled) {
+      console.error('Failed to refresh upstream billing rates:', error)
+      // Older backends (and deployments upgraded one side at a time) do not
+      // expose the compact snapshot endpoint yet. A manual probe must still
+      // reconcile the row in that case; periodic refreshes remain compact and
+      // simply log the failure without triggering a full-table reload.
+      if (force && !loading.value) {
+        try {
+          await load({ refreshTodayStats: false })
+        } catch (fallbackError) {
+          console.error('Failed to reconcile upstream billing rates:', fallbackError)
+        }
+      }
+    }
+  } finally {
+    if (upstreamBillingRateAbortController === controller) upstreamBillingRateAbortController = null
+    upstreamBillingRateRefreshing.value = false
+  }
+}
+
+const refreshUpstreamBillingSortedList = async (force = false) => {
+  if (!force && sortState.sort_by !== 'upstream_billing_rate') return
+  await refreshUpstreamBillingRates(force)
+}
+
+useIntervalFn(() => { void refreshUpstreamBillingRates() }, 5 * 60_000, { immediate: false })
 
 const debouncedReload = () => {
   clearSelection()
@@ -1297,12 +1456,6 @@ watch(accounts, (rows) => {
   healthProbeFailurePool.value = [...persistedFailures.values()].sort((a, b) => a.account_id - b.account_id)
 })
 
-watch(upstreamBillingNow, () => {
-  if (sortState.sort_by !== 'upstream_billing_rate' || loading.value) return
-  if (typeof document !== 'undefined' && document.hidden) return
-  void refreshUpstreamBillingSortedList()
-})
-
 const isAnyModalOpen = computed(() => {
   return (
     showCreate.value ||
@@ -1366,10 +1519,18 @@ const mergeAccountsIncrementally = (nextRows: Account[]) => {
       changed = true
       return nextRow
     }
-    if (shouldReplaceAutoRefreshRow(currentRow, nextRow)) {
+    // listWithEtag is intentionally usable during rolling upgrades. If an
+    // older backend omits fields (notably status/schedulable/extra), do not
+    // replace the complete row with `undefined` values and render raw i18n
+    // keys such as admin.accounts.status.undefined.
+    const mergedNextRow = mergeDefinedAccountFields(
+      currentRow as unknown as Record<string, unknown>,
+      nextRow as unknown as Partial<Record<string, unknown>>,
+    ) as unknown as Account
+    if (shouldReplaceAutoRefreshRow(currentRow, mergedNextRow)) {
       changed = true
-      syncAccountRefs(nextRow)
-      return nextRow
+      syncAccountRefs(mergedNextRow)
+      return mergedNextRow
     }
     return currentRow
   })
@@ -1412,11 +1573,10 @@ const refreshAccountsIncrementally = async () => {
       autoRefreshETag.value = result.etag
     }
     if (!result.notModified && result.data) {
-      pagination.total = result.data.total || 0
-      pagination.pages = result.data.pages || 0
+      if (typeof result.data.total === 'number') pagination.total = result.data.total
+      if (typeof result.data.pages === 'number') pagination.pages = result.data.pages
       mergeAccountsIncrementally(result.data.items || [])
       hasPendingListSync.value = false
-      markUpstreamBillingSortRefresh()
     }
     upstreamBillingNow.value = Date.now()
 
@@ -1623,11 +1783,16 @@ function getAccountPlanType(row: any): string | undefined {
       usage?.subscription_tier,
       legacyQuota?.subscription_tier,
       extra.subscription_tier,
+      extra.codex_plan_type,
       row.credentials?.plan_type,
       row.parent_plan_type
     )
   }
-  return firstNonBlankString(row.credentials?.plan_type, row.parent_plan_type)
+  return firstNonBlankString(
+    row.credentials?.plan_type,
+    row.parent_plan_type,
+    row.extra?.codex_plan_type
+  )
 }
 
 function getOpenAIAuthMode(row: any): string | undefined {
@@ -1944,18 +2109,44 @@ const handleBulkHealthProbe = async () => {
   const accountIDs = [...selIds.value]
   if (accountIDs.length === 0 || healthProbeRunning.value || inventoryRunning.value) return
   healthProbeRunning.value = true
+  healthProbePartial.value = null
   let completed = false
   try {
     const result = { results: [] as AccountHealthProbeResult[], healthy: 0, failed: 0, skipped: 0 }
+    let requestFailedAccounts = 0
+    let requestFailedBatches = 0
+    let firstRequestFailure = ''
     for (const batch of chunkAccountIDs(accountIDs)) {
-      const batchResult = await adminAPI.accounts.batchHealthProbe(batch)
-      result.results.push(...batchResult.results)
-      result.healthy += batchResult.healthy
-      result.failed += batchResult.failed
-      result.skipped += batchResult.skipped
+      try {
+        const batchResult = await adminAPI.accounts.batchHealthProbe(batch)
+        result.results.push(...batchResult.results)
+        result.healthy += batchResult.healthy
+        result.failed += batchResult.failed
+        result.skipped += batchResult.skipped
+        // Reconcile each successful chunk immediately so a later transport
+        // failure cannot hide already persisted health results.
+        mergeHealthProbeFailurePool(batchResult.results)
+      } catch (error) {
+        requestFailedAccounts += batch.length
+        requestFailedBatches += 1
+        if (!firstRequestFailure) {
+          firstRequestFailure = extractApiErrorMessage(error, t('admin.accounts.healthProbe.failed'))
+        }
+      }
     }
-    mergeHealthProbeFailurePool(result.results)
-    if (result.failed > 0) {
+    if (requestFailedAccounts > 0) {
+      healthProbePartial.value = {
+        completedAccounts: accountIDs.length - requestFailedAccounts,
+        requestFailedAccounts,
+        requestFailedBatches,
+        reason: firstRequestFailure
+      }
+      appStore.showError(t('admin.accounts.healthProbe.partial', {
+        completed: accountIDs.length - requestFailedAccounts,
+        failed: requestFailedAccounts,
+        batches: requestFailedBatches
+      }))
+    } else if (result.failed > 0) {
       appStore.showError(t('admin.accounts.healthProbe.completedWithFailures', {
         healthy: result.healthy,
         failed: result.failed,
@@ -1994,21 +2185,41 @@ const handleBulkInventory = async () => {
       healthy: 0,
       failed: 0,
       skipped: 0,
-      quota_fetched: 0
+      quota_fetched: 0,
+      request_failed_accounts: 0,
+      request_failed_batches: 0,
+      request_failed_reason: ''
     }
     for (const batch of chunkAccountIDs(accountIDs)) {
-      const batchResult = await adminAPI.accounts.batchInventory(batch)
-      result.results.push(...batchResult.results)
-      result.healthy += batchResult.healthy
-      result.failed += batchResult.failed
-      result.skipped += batchResult.skipped
-      result.quota_fetched += batchResult.quota_fetched
+      try {
+        const batchResult = await adminAPI.accounts.batchInventory(batch)
+        result.results.push(...batchResult.results)
+        result.healthy += batchResult.healthy
+        result.failed += batchResult.failed
+        result.skipped += batchResult.skipped
+        result.quota_fetched += batchResult.quota_fetched
+        mergeHealthProbeFailurePool(batchResult.results)
+      } catch (error) {
+        result.request_failed_accounts = (result.request_failed_accounts ?? 0) + batch.length
+        result.request_failed_batches = (result.request_failed_batches ?? 0) + 1
+        if (!result.request_failed_reason) {
+          result.request_failed_reason = extractApiErrorMessage(error, t('admin.accounts.inventory.requestFailed'))
+        }
+      }
     }
     inventoryResponse.value = result
     showInventory.value = true
-    mergeHealthProbeFailurePool(result.results)
 
-    if (result.failed > 0) {
+    if ((result.request_failed_accounts ?? 0) > 0) {
+      appStore.showError(t('admin.accounts.inventory.partial', {
+        healthy: result.healthy,
+        failed: result.failed,
+        skipped: result.skipped,
+        quota: result.quota_fetched,
+        requestFailed: result.request_failed_accounts,
+        batches: result.request_failed_batches
+      }))
+    } else if (result.failed > 0) {
       appStore.showError(t('admin.accounts.inventory.completedWithFailures', {
         healthy: result.healthy,
         failed: result.failed,
@@ -2340,19 +2551,17 @@ const patchAccountInList = (updatedAccount: Account) => {
 const patchUpstreamBillingSnapshot = (accountID: number, snapshot: UpstreamBillingProbeSnapshot) => {
   const account = accounts.value.find(item => item.id === accountID)
   if (!account) return
-  markUpstreamBillingSortRefresh()
   upstreamBillingNow.value = Date.now()
   patchAccountInList({
     ...account,
+    ...(typeof snapshot.synced_rate_multiplier === 'number'
+      ? { rate_multiplier: snapshot.synced_rate_multiplier }
+      : {}),
     extra: { ...account.extra, upstream_billing_probe: snapshot }
   })
 }
 const refreshAccountsAfterUpstreamBillingProbe = async () => {
-  try {
-    await load()
-  } catch (error) {
-    console.error('Failed to refresh accounts after upstream billing probe:', error)
-  }
+  await refreshUpstreamBillingSortedList(true)
 }
 const handleProbeUpstreamBilling = async (account: Account) => {
   if (probingUpstreamBilling.has(account.id)) return
@@ -2672,6 +2881,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  upstreamBillingRateAbortController?.abort()
   if (usageBatchFlushTimer !== null) {
     clearTimeout(usageBatchFlushTimer)
     usageBatchFlushTimer = null

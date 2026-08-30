@@ -244,6 +244,10 @@ type ccStreamScanState struct {
 	FirstTokenMs *int
 	// SawDone 表示上游发出了 [DONE] 哨兵。
 	SawDone bool
+	// SawFinishReason 表示至少一个有效 chunk 带有非空 finish_reason。
+	// 某些兼容上游在最后一个 chunk 后直接 EOF，不发送 [DONE]；这仍是
+	// 一个可接受的终止信号，而 EOF 没有这两个信号才表示截断。
+	SawFinishReason bool
 	// Err 为 scanner 读错误（客户端 context 取消不属于此类，会原样带出）。
 	// 非 nil 时调用方必须跳过 finalize 并返回 usage-incomplete 错误，避免
 	// 把上游截断伪装成正常收尾。
@@ -265,25 +269,33 @@ func (s *OpenAIGatewayService) scanCCStream(
 	var st ccStreamScanState
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		payload, ok := extractOpenAISSEDataLine(line)
-		if !ok {
-			continue
+	// SSE permits one event to contain multiple `data:` lines.  Accumulate a
+	// frame and join those lines with the protocol-mandated newline before
+	// decoding; parsing each line independently drops pretty-printed JSON and
+	// long tool-call argument frames.  Bound the aggregate as well as each line
+	// so a peer that never emits the terminating blank line cannot grow memory
+	// without limit.
+	dataLines := make([]string, 0, 2)
+	var dataBytes int64
+	frameEventType := ""
+	stop := false
+	processPayload := func(raw string) {
+		if stop {
+			return
 		}
-		payload = strings.TrimSpace(payload)
+		payload := strings.TrimSpace(raw)
 		if payload == "" {
-			continue
+			return
 		}
 		if payload == "[DONE]" {
 			st.SawDone = true
-			break
+			stop = true
+			return
 		}
-		// 观察上游 CC chunk 回显的 model / service_tier（计费以回显为准）。
-		// CC chunk 无 type 字段，按 untyped payload 观察（上游约束：只有终止
-		// 事件与无类型 body 报告实际处理档位）。
+		// Observe the untyped Chat Completions payload (the observer uses the
+		// event type only for Responses-native streams).
 		if observer := upstreamResponseModelObserverFromContext(c); observer != nil {
-			observer.ObserveOpenAI([]byte(payload), "")
+			observer.ObserveOpenAI([]byte(payload), frameEventType)
 		}
 
 		if u := extractCCStreamUsage(payload); u != nil {
@@ -296,7 +308,13 @@ func (s *OpenAIGatewayService) scanCCStream(
 				zap.Error(err),
 				zap.String("request_id", requestID),
 			)
-			continue
+			return
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != "" {
+				st.SawFinishReason = true
+				break
+			}
 		}
 		if st.FirstTokenMs == nil && !isOpenAIChatUsageOnlyStreamChunk(payload) && chatChunkStartsResponsesOutput(&chunk) {
 			ms := int(time.Since(startTime).Milliseconds())
@@ -304,15 +322,71 @@ func (s *OpenAIGatewayService) scanCCStream(
 		}
 		emit(&chunk)
 	}
-
-	if err := scanner.Err(); err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			logger.L().Warn(logPrefix+": stream read error",
-				zap.Error(err),
-				zap.String("request_id", requestID),
-			)
+	flushFrame := func() {
+		if len(dataLines) == 0 {
+			frameEventType = ""
+			return
 		}
-		st.Err = err
+		joined := strings.Join(dataLines, "\n")
+		if json.Valid([]byte(joined)) || len(dataLines) == 1 {
+			processPayload(joined)
+		} else {
+			// A few legacy providers incorrectly emit independent JSON documents
+			// without blank separators. Preserve the previous best-effort behavior
+			// for that shape rather than losing every chunk in the frame.
+			for _, line := range dataLines {
+				processPayload(line)
+				if stop {
+					break
+				}
+			}
+		}
+		clearOpenAIPendingSSELines(&dataLines, &dataBytes)
+		frameEventType = ""
+	}
+	for scanner.Scan() {
+		if stop {
+			break
+		}
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if line == "" {
+			flushFrame()
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if eventType, ok := extractOpenAISSEEventLine(line); ok {
+			frameEventType = eventType
+			continue
+		}
+		if payload, ok := extractOpenAISSEDataLine(line); ok {
+			if err := appendOpenAIPendingSSELine(&dataLines, &dataBytes, payload, openAIFirstOutputStageMaxBytes); err != nil {
+				st.Err = err
+				break
+			}
+		}
+	}
+
+	if st.Err == nil && !stop {
+		// The final SSE event may be EOF-terminated without a blank line.
+		flushFrame()
+	}
+	if st.Err == nil {
+		if err := scanner.Err(); err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				logger.L().Warn(logPrefix+": stream read error",
+					zap.Error(err),
+					zap.String("request_id", requestID),
+				)
+			}
+			st.Err = err
+		}
+	} else if err := scanner.Err(); err != nil {
+		// Prefer the concrete buffer-limit error while retaining the scanner
+		// failure in logs for diagnostics.
+		logger.L().Warn(logPrefix+": stream scanner stopped after frame limit",
+			zap.Error(err), zap.String("request_id", requestID))
 	}
 	return st
 }

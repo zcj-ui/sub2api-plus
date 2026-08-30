@@ -457,7 +457,42 @@ describe('AccountUsageCell', () => {
     expect(wrapper.text()).toContain('5h|18|900')
   })
 
-  it('OpenAI OAuth 在无 codex 快照时会回退显示 usage 接口窗口', async () => {
+	it('OpenAI OAuth free 月度窗口按 upstream window_seconds 显示 30d', async () => {
+		getUsage.mockResolvedValue({
+			plan_type: 'free',
+			five_hour: {
+				utilization: 99,
+				resets_at: '2099-03-01T00:00:00Z',
+				remaining_seconds: 100,
+				window_seconds: 18000
+			},
+			seven_day: {
+				utilization: 12,
+				resets_at: '2099-04-01T00:00:00Z',
+				remaining_seconds: 864000,
+				window_seconds: 2592000
+			}
+		})
+		const wrapper = mount(AccountUsageCell, {
+			props: { account: makeAccount({ id: 2020, platform: 'openai', type: 'oauth', extra: {} }) },
+			global: {
+				stubs: {
+					UsageProgressBar: {
+						props: ['label', 'utilization', 'resetsAt', 'windowStats', 'color'],
+						template: '<div class="usage-bar">{{ label }}|{{ utilization }}</div>'
+					},
+					AccountQuotaInfo: true,
+					OpenAIQuotaResetCell: { template: '<div />' }
+				}
+			}
+		})
+		await flushPromises()
+		expect(wrapper.text()).toContain('30d|12')
+		expect(wrapper.text()).not.toContain('5h|99')
+		wrapper.unmount()
+	})
+
+	it('OpenAI OAuth 在无 codex 快照时会回退显示 usage 接口窗口', async () => {
 	getUsage.mockResolvedValue({
 	  five_hour: {
 	    utilization: 0,

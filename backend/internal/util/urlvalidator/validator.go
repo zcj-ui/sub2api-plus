@@ -42,7 +42,7 @@ func ValidateHTTPURL(raw string, allowInsecureHTTP bool, opts ValidationOptions)
 	}
 
 	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	if host == "" {
+	if host == "" || strings.Contains(host, "%") {
 		return "", errors.New("invalid host")
 	}
 	if !opts.AllowPrivate && isBlockedHost(host) {
@@ -87,7 +87,7 @@ func ValidateURLFormat(raw string, allowInsecureHTTP bool) (string, error) {
 	}
 
 	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" {
+	if host == "" || strings.Contains(host, "%") {
 		return "", errors.New("invalid host")
 	}
 
@@ -117,12 +117,71 @@ func ValidateResolvedIP(host string) error {
 	}
 
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if IsBlockedIP(ip) {
 			return fmt.Errorf("resolved ip %s is not allowed", ip.String())
 		}
 	}
 	return nil
+}
+
+// IsBlockedIP reports whether an address is unsuitable as an outbound target
+// for URL/SSRF validation.  net.IP's convenience predicates intentionally do
+// not classify every non-routable special-use range (for example CGNAT,
+// benchmarking and documentation networks), so keep those ranges explicit.
+func IsBlockedIP(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	v4 := ip.To4()
+	if v4 != nil {
+		// 0/8, multicast/reserved 224/4 and the limited broadcast address.
+		if v4[0] == 0 || v4[0] >= 224 {
+			return true
+		}
+		// RFC 6598 carrier-grade NAT 100.64.0.0/10.
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+			return true
+		}
+		// RFC 2544 benchmarking 198.18.0.0/15.
+		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+			return true
+		}
+		// RFC 5737/3849 documentation ranges and RFC 6890 special-use blocks.
+		if (v4[0] == 192 && v4[1] == 0 && (v4[2] == 0 || v4[2] == 2)) ||
+			(v4[0] == 198 && v4[1] == 51 && v4[2] == 100) ||
+			(v4[0] == 203 && v4[1] == 0 && v4[2] == 113) ||
+			(v4[0] == 192 && v4[1] == 88 && v4[2] == 99) {
+			return true
+		}
+		return false
+	}
+	// IPv6 documentation (2001:db8::/32) and ORCHID (2001:10::/28) are not
+	// usable public service destinations even though they are global-unicast.
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 {
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
+		// Teredo (2001:0000::/32).
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3]&0xf0 == 0x10 {
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3]&0xf0 == 0x20 {
+		// ORCHIDv2 (2001:20::/28).
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x02 && ip[4] == 0x00 && ip[5] == 0x00 {
+		// Benchmarking (2001:2::/48).
+		return true
+	}
+	if len(ip) == net.IPv6len && ip[0] == 0x3f && ip[1] == 0xff && ip[2]&0xf0 == 0x00 {
+		// Documentation (3fff::/20).
+		return true
+	}
+	return false
 }
 
 func normalizeAllowlist(values []string) []string {
@@ -167,7 +226,7 @@ func isBlockedHost(host string) bool {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		if IsBlockedIP(ip) {
 			return true
 		}
 	}

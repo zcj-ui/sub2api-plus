@@ -565,6 +565,24 @@ type RateLimit429CooldownSettings struct {
 	CooldownSeconds int `json:"cooldown_seconds"`
 }
 
+// OpenAI403CooldownSettings controls the account-level policy applied to
+// structured 403 responses from OpenAI.  It deliberately does not govern
+// Claude/CC or other provider-specific 403 handlers.
+type OpenAI403CooldownSettings struct {
+	// Enabled controls whether a structured OpenAI 403 contributes to the
+	// account counter and temporary/permanent account penalties.  When false,
+	// the request still fails over, but the account is left untouched.
+	Enabled bool `json:"enabled"`
+	// CooldownMinutes is the temporary scheduling pause after a sub-threshold
+	// 403 (1-1440 minutes).
+	CooldownMinutes int `json:"cooldown_minutes"`
+	// DisableThreshold is the number of 403s in WindowMinutes that transitions
+	// the account to an error state (1-100).
+	DisableThreshold int `json:"disable_threshold"`
+	// WindowMinutes is the rolling counter window (1-1440 minutes).
+	WindowMinutes int `json:"window_minutes"`
+}
+
 // OpenAIImagesOAuthUnavailableCooldownSettings controls how long an OpenAI
 // OAuth account's image-generation capability is paused after the upstream
 // explicitly reports that the image tool is unavailable.  This setting is
@@ -609,6 +627,17 @@ func DefaultRateLimit429CooldownSettings() *RateLimit429CooldownSettings {
 	return &RateLimit429CooldownSettings{
 		Enabled:         true,
 		CooldownSeconds: 5,
+	}
+}
+
+// DefaultOpenAI403CooldownSettings preserves the historical OpenAI 403
+// behavior for installations that have no persisted setting yet.
+func DefaultOpenAI403CooldownSettings() *OpenAI403CooldownSettings {
+	return &OpenAI403CooldownSettings{
+		Enabled:          true,
+		CooldownMinutes:  openAI403CooldownMinutesDefault,
+		DisableThreshold: openAI403DisableThreshold,
+		WindowMinutes:    openAI403CounterWindowMinutes,
 	}
 }
 
@@ -684,7 +713,8 @@ func DefaultBetaPolicySettings() *BetaPolicySettings {
 // 本策略复用 BetaPolicyAction*/BetaPolicyScope* 常量语义，只是匹配键从
 // anthropic-beta header 换成 body 的 service_tier 字段。
 const (
-	OpenAIFastTierAny      = "all"      // 匹配任意已识别的 service_tier
+	OpenAIFastTierAny      = "all"      // 匹配任意显式 service_tier（不匹配省略）
+	OpenAIFastTierMissing  = "missing"  // 仅匹配省略 service_tier 的请求
 	OpenAIFastTierPriority = "priority" // 仅匹配 fast（priority）
 	OpenAIFastTierFlex     = "flex"     // 仅匹配 flex
 
@@ -695,7 +725,7 @@ const (
 
 // OpenAIFastPolicyRule 单条 OpenAI fast/flex 策略规则
 type OpenAIFastPolicyRule struct {
-	ServiceTier          string   `json:"service_tier"`                     // "priority" | "flex" | "auto" | "default" | "scale" | "all"
+	ServiceTier          string   `json:"service_tier"`                     // "priority" | "flex" | "auto" | "default" | "scale" | "missing" | "all"
 	Action               string   `json:"action"`                           // "pass" | "filter" | "block" | "force_priority"
 	Scope                string   `json:"scope"`                            // "all" | "oauth" | "apikey" | "bedrock"
 	UserIDs              []int64  `json:"user_ids,omitempty"`               // 空=所有 Sub2API 用户；非空=仅指定 API Key 所属用户

@@ -115,7 +115,10 @@ const mountView = () => mount(AccountsView, {
       AccountTableActions: { template: '<div><slot name="beforeCreate" /><slot name="after" /></div>' },
       AccountTableFilters: true,
       AccountBulkActionsBar: BulkActionsStub,
-      AccountInventoryModal: { props: ['show'], template: '<div v-if="show" data-test="inventory-modal" />' },
+      AccountInventoryModal: {
+        props: ['show', 'response'],
+        template: '<div v-if="show" data-test="inventory-modal"><span data-test="request-failed">{{ response?.request_failed_accounts ?? 0 }}</span><span data-test="result-count">{{ response?.results?.length ?? 0 }}</span></div>'
+      },
       AccountActionMenu: true,
       ImportDataModal: true,
       ReAuthAccountModal: true,
@@ -182,6 +185,42 @@ describe('admin AccountsView selected-account inventory', () => {
     expect(batchHealthProbe).toHaveBeenCalledWith([1])
     expect(wrapper.get('[data-testid="account-health-failure-pool"]').text()).toContain('old-2')
     expect(wrapper.get('[data-testid="account-health-failure-pool"]').text()).not.toContain('old-1')
+  })
+
+  it('keeps completed health-probe results when a later batch request fails', async () => {
+    const accounts = Array.from({ length: 201 }, (_, index) => account(index + 1))
+    listAccounts.mockResolvedValue(page(accounts))
+    batchHealthProbe
+      .mockResolvedValueOnce({
+        healthy: 200,
+        failed: 0,
+        skipped: 0,
+        results: accounts.slice(0, 200).map(item => ({
+          account_id: item.id,
+          name: item.name,
+          platform: 'openai',
+          type: 'oauth',
+          healthy: true,
+          dead: false,
+          attempts: 1,
+          mode: 'openai_oauth_quota'
+        }))
+      })
+      .mockRejectedValueOnce(new Error('second probe batch unavailable'))
+
+    const wrapper = mountView()
+    await flushPromises()
+    ;(wrapper.vm as unknown as { setSelectedIds: (ids: number[]) => void }).setSelectedIds(
+      accounts.map(item => item.id)
+    )
+    await flushPromises()
+    await wrapper.get('[data-test="health"]').trigger('click')
+    await flushPromises()
+
+    expect(batchHealthProbe).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-testid="account-health-partial"]').text()).toContain('admin.accounts.healthProbe.partial')
+    expect(wrapper.get('[data-testid="account-health-partial"]').text()).toContain('second probe batch unavailable')
+    expect(showError).toHaveBeenCalledWith('admin.accounts.healthProbe.partial')
   })
 
   it('keeps a successful inventory result when the following account-list refresh fails', async () => {
@@ -253,5 +292,44 @@ describe('admin AccountsView selected-account inventory', () => {
     expect(batchInventory.mock.calls[0]?.[0]).toHaveLength(200)
     expect(batchInventory.mock.calls[1]?.[0]).toEqual([201, 202, 203, 204, 205])
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.inventory.completed')
+  })
+
+  it('keeps completed inventory results when a later batch request fails', async () => {
+    const accounts = Array.from({ length: 201 }, (_, index) => account(index + 1))
+    listAccounts.mockResolvedValue(page(accounts))
+    batchInventory
+      .mockResolvedValueOnce({
+        healthy: 200,
+        failed: 0,
+        skipped: 0,
+        quota_fetched: 200,
+        results: accounts.slice(0, 200).map(item => ({
+          account_id: item.id,
+          name: item.name,
+          platform: 'openai',
+          type: 'oauth',
+          healthy: true,
+          dead: false,
+          attempts: 1,
+          mode: 'openai_oauth_quota',
+          quota: { fetched_at: 1 }
+        }))
+      })
+      .mockRejectedValueOnce(new Error('second batch unavailable'))
+
+    const wrapper = mountView()
+    await flushPromises()
+    ;(wrapper.vm as unknown as { setSelectedIds: (ids: number[]) => void }).setSelectedIds(
+      accounts.map(item => item.id)
+    )
+    await flushPromises()
+    await wrapper.get('[data-test="inventory"]').trigger('click')
+    await flushPromises()
+
+    expect(batchInventory).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-test="inventory-modal"]').exists()).toBe(true)
+    expect(wrapper.get('[data-test="request-failed"]').text()).toBe('1')
+    expect(wrapper.get('[data-test="result-count"]').text()).toBe('200')
+    expect(showError).toHaveBeenCalledWith('admin.accounts.inventory.partial')
   })
 })

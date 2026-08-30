@@ -1820,7 +1820,7 @@
                 type="checkbox"
                 class="rounded border-gray-300 text-primary-600 focus:ring-primary-500 dark:border-dark-500"
                 :data-testid="`openai-endpoint-capability-${option.value}`"
-                :checked="openAIEndpointCapabilities.includes(option.value)"
+                :checked="option.value === 'prompt_cache_retention' ? openAIPromptCacheRetentionSupported : openAIEndpointCapabilities.includes(option.value)"
                 @change="toggleOpenAIEndpointCapability(option.value, $event)"
               />
               <span class="text-gray-700 dark:text-gray-200">{{ option.label }}</span>
@@ -2178,6 +2178,28 @@
             <Select v-model="editPlanType" :options="planTypeOptions" />
           </div>
         </div>
+      </div>
+
+      <!-- OpenAI OAuth account-level User-Agent override -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <label class="input-label mb-0" for="edit-openai-user-agent-input">
+          {{ t('admin.accounts.openai.customUserAgent') }}
+        </label>
+        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          {{ t('admin.accounts.openai.customUserAgentDesc') }}
+        </p>
+        <input
+          id="edit-openai-user-agent-input"
+          v-model="editUserAgent"
+          type="text"
+          maxlength="512"
+          class="input mt-2"
+          data-testid="edit-openai-user-agent-input"
+          :placeholder="t('admin.accounts.openai.customUserAgentPlaceholder')"
+        />
       </div>
 
       <div
@@ -2951,8 +2973,10 @@ import {
   applyHeaderOverride,
   applyInterceptWarmup,
   applyPlanType,
+  applyUserAgent,
   buildPlanTypeOptions,
   readPlanType,
+  readUserAgent,
   isCustomGrokBaseUrl,
   isHeaderOverrideCapable,
   splitHeaderOverridesObject,
@@ -3337,9 +3361,12 @@ const openaiFlattenNamespacesEnabled = ref(false)
 const openAILongContextBillingEnabled = ref(false)
 // OpenAI 订阅档位（Plus/Pro/Free）手动覆盖值,存于 credentials.plan_type;'' 表示清空/自动识别
 const editPlanType = ref<string>('')
+// Optional per-account Codex User-Agent fingerprint; empty clears override.
+const editUserAgent = ref<string>('')
 const openAICompactMode = ref<OpenAICompactMode>('auto')
 const openAIResponsesMode = ref<OpenAIResponsesMode>('auto')
 const openAIEndpointCapabilities = ref<OpenAIEndpointCapability[]>(['chat_completions', 'embeddings'])
+const openAIPromptCacheRetentionSupported = ref(false)
 const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const codexCLIOnlyEnabled = ref(false)
@@ -3501,7 +3528,8 @@ const openAITextEndpointCapabilityLabel = computed(() => {
 })
 const openAIEndpointCapabilityOptions = computed<{ value: OpenAIEndpointCapability; label: string }[]>(() => [
   { value: 'chat_completions', label: openAITextEndpointCapabilityLabel.value },
-  { value: 'embeddings', label: t('admin.accounts.openai.capabilityEmbeddings') }
+  { value: 'embeddings', label: t('admin.accounts.openai.capabilityEmbeddings') },
+  { value: 'prompt_cache_retention', label: t('admin.accounts.openai.capabilityPromptCacheRetention') }
 ])
 const openAITextGenerationCapabilityEnabled = computed(() =>
   openAIEndpointCapabilities.value.includes('chat_completions')
@@ -3510,30 +3538,39 @@ const openAITextGenerationCapabilityEnabled = computed(() =>
 const normalizeOpenAIEndpointCapabilities = (values: OpenAIEndpointCapability[]) => {
   const allowed: OpenAIEndpointCapability[] = ['chat_completions', 'embeddings']
   const selected = allowed.filter((value) => values.includes(value))
-  return selected.length > 0 ? selected : allowed
+  return selected.length > 0 ? selected : allowed.slice(0, 2)
 }
 
 const readOpenAIEndpointCapabilities = (credentials?: Record<string, unknown>): OpenAIEndpointCapability[] => {
   const raw = credentials?.openai_capabilities
   if (Array.isArray(raw)) {
-    return normalizeOpenAIEndpointCapabilities(
+    const capabilities = normalizeOpenAIEndpointCapabilities(
       raw.filter((value): value is OpenAIEndpointCapability =>
         value === 'chat_completions' || value === 'embeddings'
       )
     )
+    openAIPromptCacheRetentionSupported.value = raw.includes('prompt_cache_retention')
+    return capabilities
   }
   if (raw !== null && typeof raw === 'object') {
     const capabilityMap = raw as Record<string, unknown>
-    return normalizeOpenAIEndpointCapabilities(
+    const capabilities = normalizeOpenAIEndpointCapabilities(
       openAIEndpointCapabilityOptions.value
         .map((option) => option.value)
-        .filter((value) => capabilityMap[value] === true)
+        .filter((value) => value !== 'prompt_cache_retention' && capabilityMap[value] === true)
     )
+    openAIPromptCacheRetentionSupported.value = capabilityMap.prompt_cache_retention === true
+    return capabilities
   }
+  openAIPromptCacheRetentionSupported.value = false
   return ['chat_completions', 'embeddings']
 }
 
 const toggleOpenAIEndpointCapability = (capability: OpenAIEndpointCapability, event?: Event) => {
+  if (capability === 'prompt_cache_retention') {
+    openAIPromptCacheRetentionSupported.value = !openAIPromptCacheRetentionSupported.value
+    return
+  }
   if (openAIEndpointCapabilities.value.includes(capability)) {
     if (openAIEndpointCapabilities.value.length <= 1) {
       const input = event?.target as HTMLInputElement | null
@@ -3556,11 +3593,13 @@ const toggleOpenAIEndpointCapability = (capability: OpenAIEndpointCapability, ev
 
 const applyOpenAIEndpointCapabilities = (credentials: Record<string, unknown>) => {
   const capabilities = normalizeOpenAIEndpointCapabilities(openAIEndpointCapabilities.value)
-  if (capabilities.length === 2) {
+  if (capabilities.length === 2 && !openAIPromptCacheRetentionSupported.value) {
     delete credentials.openai_capabilities
     return
   }
-  credentials.openai_capabilities = capabilities
+  credentials.openai_capabilities = openAIPromptCacheRetentionSupported.value
+    ? [...capabilities, 'prompt_cache_retention']
+    : capabilities
 }
 const normalizeOpenAIResponsesMode = (mode: unknown): OpenAIResponsesMode => {
   if (mode === 'force_responses' || mode === 'force_chat_completions') {
@@ -3821,9 +3860,11 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   openaiFlattenNamespacesEnabled.value = false
   openAILongContextBillingEnabled.value = false
   editPlanType.value = ''
+  editUserAgent.value = ''
   openAICompactMode.value = 'auto'
   openAIResponsesMode.value = 'auto'
   openAIEndpointCapabilities.value = ['chat_completions', 'embeddings']
+  openAIPromptCacheRetentionSupported.value = false
   openAICompactModelMappings.value = []
   openaiOAuthResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_OFF
   openaiAPIKeyResponsesWebSocketV2Mode.value = OPENAI_WS_MODE_OFF
@@ -3845,6 +3886,9 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     // plan_type 手动覆盖仅 OAuth 有实际调度语义(IsOpenAIChatGPTSubscription 要求 oauth),故只对 oauth 回填
     editPlanType.value = newAccount.type === 'oauth'
       ? readPlanType(newAccount.credentials as Record<string, unknown> | undefined)
+      : ''
+    editUserAgent.value = newAccount.type === 'oauth'
+      ? readUserAgent(newAccount.credentials as Record<string, unknown> | undefined)
       : ''
     openAICompactMode.value = (extra?.openai_compact_mode as OpenAICompactMode) || 'auto'
     if (newAccount.type === 'apikey') {
@@ -5098,7 +5142,8 @@ const handleSubmit = async () => {
     if (props.account.platform === 'openai' && props.account.type === 'oauth' && !isSparkShadow.value) {
       const currentCredentials = (updatePayload.credentials as Record<string, unknown>) ||
         ((props.account.credentials as Record<string, unknown>) || {})
-      updatePayload.credentials = applyPlanType({ ...currentCredentials }, editPlanType.value)
+      const nextCredentials = applyPlanType({ ...currentCredentials }, editPlanType.value)
+      updatePayload.credentials = applyUserAgent(nextCredentials, editUserAgent.value)
     }
 
     // Antigravity: persist model mapping to credentials (applies to all antigravity types)

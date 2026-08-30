@@ -77,10 +77,16 @@ type ChannelMonitorV2Filter struct {
 	Range     string
 	Platforms []string
 	GroupIDs  []int64
-	Models    []string
-	Start     time.Time
-	End       time.Time
-	Bucket    time.Duration
+	// AllowedGroupIDs is the server-derived group scope for a non-admin viewer.
+	// RestrictGroups distinguishes an authenticated viewer with no allowed
+	// groups from the unrestricted admin/configuration scope represented by an
+	// empty slice.
+	AllowedGroupIDs []int64
+	RestrictGroups  bool
+	Models          []string
+	Start           time.Time
+	End             time.Time
+	Bucket          time.Duration
 }
 
 type ChannelMonitorV2Metric struct {

@@ -29,8 +29,11 @@ the application's responsibility.
 
 ## Trusted client IPs
 
-`security.trust_forwarded_ip_for_api_key_acl` is enabled by default for upgrade
-compatibility. While enabled, raw forwarding headers take over client-IP
+New installations default `security.trust_forwarded_ip_for_api_key_acl` to
+`false`, so Gin's explicit `server.trusted_proxies` chain is authoritative.
+Completed migration choices remain unchanged; pre-migration installations still
+run the one-time compatibility migration described below. While enabled, raw
+forwarding headers take over client-IP
 resolution for logs and security-sensitive paths. Custom headers from
 `security.forwarded_client_ip_headers` are checked in configured order before
 the built-in `CF-Connecting-IP`, `X-Real-IP`, and `X-Forwarded-For` fallback.
@@ -51,8 +54,8 @@ trusts no forwarded client IPs.
 
 On the first upgrade to this mode, a legacy `false` value is changed to `true`
 only when `server.trusted_proxies` was not explicitly configured; explicit
-proxy policies remain in secure mode. New installations persist the configured
-custom header list during database initialization. Existing installations
+proxy policies remain in secure mode. New installations persist `false` and the
+configured custom header list during database initialization. Existing installations
 backfill a missing database value from the YAML configuration. A hidden
 migration marker prevents later administrator changes from being overwritten.
 If settings cannot be read or the persisted custom-header list is malformed,

@@ -81,8 +81,8 @@ func TestLockAndMergeAccountProbeExtraUsesCurrentDatabaseSnapshot(t *testing.T) 
 
 			mock.ExpectQuery(`(?s)`+regexp.QuoteMeta("SELECT")+`.*`+regexp.QuoteMeta("FOR NO KEY UPDATE")).
 				WithArgs(int64(27), service.PlatformOpenAI, service.AccountTypeAPIKey, `{"api_key":"sk-test"}`, nil).
-				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
-					AddRow(tt.identityUnchanged, false, true, tt.databaseEnabled, nil, tt.databaseSnapshot, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
+				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "plan_type", "spend_control_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
+					AddRow(tt.identityUnchanged, false, true, tt.databaseEnabled, nil, tt.databaseSnapshot, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 
 			account := &service.Account{
 				ID:          27,
@@ -172,8 +172,8 @@ func TestLockAndMergeAccountProbeExtraNeverInfersProbeFromRateSync(t *testing.T)
 
 			mock.ExpectQuery(`(?s)`+regexp.QuoteMeta("SELECT")+`.*`+regexp.QuoteMeta("FOR NO KEY UPDATE")).
 				WithArgs(int64(31), service.PlatformOpenAI, service.AccountTypeAPIKey, `{"api_key":"sk-test"}`, nil).
-				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
-					AddRow(true, false, true, tt.databaseEnabled, tt.databaseRateSync, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
+				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "plan_type", "spend_control_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
+					AddRow(true, false, true, tt.databaseEnabled, tt.databaseRateSync, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 
 			account := &service.Account{
 				ID:          31,
@@ -211,8 +211,8 @@ func TestLockAndMergeAccountProbeExtraProtectsOllamaManagedFields(t *testing.T) 
 
 			mock.ExpectQuery(`(?s)`+regexp.QuoteMeta("SELECT")+`.*`+regexp.QuoteMeta("FOR NO KEY UPDATE")).
 				WithArgs(int64(29), service.PlatformAnthropic, service.AccountTypeAPIKey, `{"api_key":"key","base_url":"https://ollama.com"}`, nil).
-				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
-					AddRow(identityUnchanged, identityUnchanged, true, nil, nil, nil, []byte(`"local-ciphertext"`), []byte(`true`), []byte(`{"status":"ok"}`), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
+				WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "plan_type", "spend_control_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
+					AddRow(identityUnchanged, identityUnchanged, true, nil, nil, nil, []byte(`"local-ciphertext"`), []byte(`true`), []byte(`{"status":"ok"}`), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 
 			account := &service.Account{
 				ID: 29, Platform: service.PlatformAnthropic, Type: service.AccountTypeAPIKey,
@@ -280,6 +280,29 @@ func TestUpdateExtraNilProbeRemovesKeyInsteadOfWritingJSONNull(t *testing.T) {
 	repo := newAccountRepositoryWithSQL(client, db, nil)
 
 	err = repo.UpdateExtra(context.Background(), 27, map[string]any{service.UpstreamBillingProbeExtraKey: nil})
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestUpdateExtraCodexSnapshotUsesMonotonicObservationGuard(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	client := dbent.NewClient(dbent.Driver(entsql.OpenDB(dialect.Postgres, db)))
+	t.Cleanup(func() { _ = client.Close() })
+
+	const observedAt = int64(1771236000123456789)
+	mock.ExpectExec(`(?s)UPDATE accounts SET extra = CASE WHEN .*codex_usage_observed_at_unix_nano.* <= \$3::numeric THEN .* ELSE .* END, updated_at = NOW\(\) WHERE id = \$2`).
+		WithArgs(sqlmock.AnyArg(), int64(29), observedAt, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	repo := newAccountRepositoryWithSQL(client, db, nil)
+
+	err = repo.UpdateExtra(context.Background(), 29, map[string]any{
+		"codex_5h_used_percent":                            95.0,
+		service.OpenAIQuotaUsageUpdatedAtExtraKey:          "2026-02-16T10:00:00Z",
+		service.OpenAICodexUsageObservedAtUnixNanoExtraKey: observedAt,
+	})
 
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -448,8 +471,8 @@ func TestUpdateWithAccountBillingSettingsRollsBackWhenOutboxFails(t *testing.T) 
 	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)`+regexp.QuoteMeta("SELECT")+`.*`+regexp.QuoteMeta("FOR NO KEY UPDATE")).
 		WithArgs(int64(27), service.PlatformOpenAI, service.AccountTypeAPIKey, `{"api_key":"sk-test"}`, nil).
-		WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
-			AddRow(true, false, true, []byte(`true`), []byte(`true`), []byte(`{"status":"ok"}`), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"identity_unchanged", "ollama_group_unchanged", "ollama_proxy_unchanged", "enabled", "rate_sync_enabled", "snapshot", "ollama_session", "ollama_auto", "ollama_snapshot", "health_probe", "credit_snapshot", "plan_type", "spend_control_snapshot", "reset_credit_snapshot", "usage_updated_at", "used_5h", "reset_5h", "window_5h", "reset_5h_at", "used_7d", "reset_7d", "window_7d", "reset_7d_at"}).
+			AddRow(true, false, true, []byte(`true`), []byte(`true`), []byte(`{"status":"ok"}`), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 	mock.ExpectExec(`(?s)UPDATE .*accounts.*SET.*WHERE .*id.*`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(`(?s)SELECT .* FROM "accounts" WHERE "id" = \$1`).

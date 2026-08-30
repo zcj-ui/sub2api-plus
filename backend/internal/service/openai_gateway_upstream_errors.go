@@ -264,6 +264,9 @@ func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode i
 	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
 		return false
 	}
+	if isOpenAIShortInputPolicyError(statusCode, upstreamBody) {
+		return true
+	}
 	if isOpenAIHTTPUpstreamAccessStateError(statusCode, upstreamMsg, upstreamBody) {
 		return true
 	}
@@ -281,6 +284,75 @@ func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode i
 const OpenAIRequestBodyTooLargeClientMessage = "Request payload is too large"
 
 const openAIRequestBodyTooLargeReason = GatewayFailureReason("openai_request_body_too_large")
+
+const (
+	openAIShortInputPolicyReason        = GatewayFailureReason("openai_short_input_policy")
+	openAIShortInputPolicyClientMessage = "Upstream does not support this request; please retry"
+	openAIPreOutputBufferLimitReason    = GatewayFailureReason("openai_pre_output_buffer_limit")
+	openAIPreOutputBufferClientMessage  = "Upstream response exceeded the pre-output buffer limit; please retry"
+)
+
+// newOpenAIPreOutputBufferFailoverError reports a bounded-buffer rejection as
+// request-scoped.  It must not call the normal stream terminal side-effect
+// helper: this is a memory/protocol guard, not evidence that the selected
+// account is unhealthy.  The handler may switch accounts without incrementing
+// account failure counters or creating a cooldown.
+func newOpenAIPreOutputBufferFailoverError(c *gin.Context, account *Account, passthrough bool, requestID string, headers http.Header) *UpstreamFailoverError {
+	accountID := int64(0)
+	accountName := ""
+	platform := PlatformOpenAI
+	if account != nil {
+		accountID = account.ID
+		accountName = account.Name
+		platform = account.Platform
+	}
+	if c != nil {
+		setOpsUpstreamError(c, http.StatusServiceUnavailable, openAIPreOutputBufferClientMessage, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			ProxyID:            opsUpstreamProxyID(account),
+			ProxyName:          opsUpstreamProxyName(account),
+			Platform:           platform,
+			UpstreamStatusCode: http.StatusServiceUnavailable,
+			UpstreamRequestID:  strings.TrimSpace(requestID),
+			Passthrough:        passthrough,
+			Kind:               "pre_output_buffer_limit",
+			Message:            openAIPreOutputBufferClientMessage,
+			AccountID:          accountID,
+			AccountName:        accountName,
+		})
+	}
+	var responseHeaders http.Header
+	if headers != nil {
+		responseHeaders = headers.Clone()
+	}
+	return &UpstreamFailoverError{
+		StatusCode:             http.StatusServiceUnavailable,
+		ResponseHeaders:        responseHeaders,
+		RetryableOnSameAccount: false,
+		RequestScopedTransient: true,
+		Scope:                  GatewayFailureScopeRequest,
+		Reason:                 openAIPreOutputBufferLimitReason,
+		NextAccountAction:      NextAccountRetry,
+		ClientStatusCode:       http.StatusServiceUnavailable,
+		ClientMessage:          openAIPreOutputBufferClientMessage,
+	}
+}
+
+// isOpenAIShortInputPolicyError recognizes the structured policy response
+// emitted by ChatGPT/Codex for short-input requests.  The code is authoritative;
+// free-form messages are deliberately ignored because they can echo user input
+// and must not trigger an account failover.
+func isOpenAIShortInputPolicyError(statusCode int, upstreamBody []byte) bool {
+	if statusCode != http.StatusBadRequest || len(upstreamBody) == 0 || !gjson.ValidBytes(upstreamBody) {
+		return false
+	}
+	for _, path := range []string{"error.code", "response.error.code", "code"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(upstreamBody, path).String()), "short_input_rejected") {
+			return true
+		}
+	}
+	return false
+}
 
 func isOpenAIRequestBodyTooLargeError(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
 	return statusCode == http.StatusRequestEntityTooLarge && !isOpenAIContextWindowError(upstreamMsg, upstreamBody)
@@ -309,6 +381,15 @@ func newOpenAIUpstreamFailoverError(
 		failoverErr.NextAccountAction = NextAccountRetry
 		failoverErr.ClientStatusCode = http.StatusRequestEntityTooLarge
 		failoverErr.ClientMessage = OpenAIRequestBodyTooLargeClientMessage
+	}
+	if isOpenAIShortInputPolicyError(statusCode, responseBody) {
+		failoverErr.RetryableOnSameAccount = false
+		failoverErr.RequestScopedTransient = false
+		failoverErr.Scope = GatewayFailureScopeAccount
+		failoverErr.Reason = openAIShortInputPolicyReason
+		failoverErr.NextAccountAction = NextAccountRetry
+		failoverErr.ClientStatusCode = http.StatusBadGateway
+		failoverErr.ClientMessage = openAIShortInputPolicyClientMessage
 	}
 	if isOpenAIHTTPUpstreamAccessStateError(statusCode, upstreamMsg, responseBody) {
 		failoverErr.RetryableOnSameAccount = false

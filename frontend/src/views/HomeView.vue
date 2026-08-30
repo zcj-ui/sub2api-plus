@@ -4,12 +4,15 @@
     <!-- iframe mode -->
     <iframe
       v-if="isHomeContentUrl"
-      :src="homeContent.trim()"
+      :src="homeContentUrl"
       class="h-screen w-full border-0"
+      sandbox="allow-scripts allow-forms allow-modals allow-popups allow-presentation"
+      referrerpolicy="no-referrer"
+      loading="lazy"
       allowfullscreen
     ></iframe>
-    <!-- HTML mode - SECURITY: homeContent is admin-only setting, XSS risk is acceptable -->
-    <div v-else v-html="homeContent"></div>
+    <!-- HTML mode is sanitized to a presentation-only allow-list. -->
+    <div v-else v-html="sanitizedHomeContent"></div>
   </div>
 
   <!-- Compact Home Page -->
@@ -500,6 +503,8 @@ import { useAuthStore, useAppStore } from '@/stores'
 import LocaleSwitcher from '@/components/common/LocaleSwitcher.vue'
 import Icon from '@/components/icons/Icon.vue'
 import { sanitizeUrl } from '@/utils/url'
+import { sanitizeIframeUrl } from '@/utils/url'
+import { sanitizeHomeHtml } from '@/utils/sanitize'
 import { FeatureFlags, isFeatureFlagEnabled } from '@/utils/featureFlags'
 
 const { t } = useI18n()
@@ -514,13 +519,14 @@ const siteSubtitle = computed(() => appStore.cachedPublicSettings?.site_subtitle
 const docUrl = computed(() => sanitizeUrl(appStore.cachedPublicSettings?.doc_url || appStore.docUrl || ''))
 const homeContent = computed(() => appStore.cachedPublicSettings?.home_content || '')
 const hasHomeContent = computed(() => homeContent.value.trim().length > 0)
+const sanitizedHomeContent = computed(() => sanitizeHomeHtml(homeContent.value))
+const homeContentUrl = computed(() => sanitizeIframeUrl(homeContent.value))
 const compactHomeEnabled = computed(() => appStore.cachedPublicSettings?.compact_home_enabled === true)
 const modelPlazaEnabled = computed(() => isFeatureFlagEnabled(FeatureFlags.modelPlaza))
 
 // Check if homeContent is a URL (for iframe display)
 const isHomeContentUrl = computed(() => {
-  const content = homeContent.value.trim()
-  return content.startsWith('http://') || content.startsWith('https://')
+  return homeContentUrl.value.length > 0
 })
 
 // Theme

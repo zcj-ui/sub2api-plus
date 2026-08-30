@@ -87,6 +87,7 @@ func TestBuildCompatCompactResponse_SingleCompactionItem(t *testing.T) {
 	require.Equal(t, "gpt-5.6-sol", out.Model)
 	require.Positive(t, out.CreatedAt)
 	require.Equal(t, "completed", out.Status)
+	require.True(t, strings.HasPrefix(out.ID, "resp_"), "Chat Completions IDs must be converted to a Responses-compatible id")
 	require.Len(t, out.Output, 1, "Codex 要求 output 里恰好一个 compaction item")
 	require.Equal(t, "compaction", out.Output[0].Type)
 	require.True(t, strings.HasPrefix(out.Output[0].ID, "cmp_"))

@@ -1326,6 +1326,31 @@ func TestGrokCredentialRuntimeRollbackOwnership(t *testing.T) {
 		}
 		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 	})
+
+	t.Run("rollback restores reason and installation marker", func(t *testing.T) {
+		svc := &OpenAIGatewayService{}
+		account := expiredGrokOAuthAccountForCredentialTest(735)
+		initialUntil := time.Now().Add(2 * time.Minute)
+		initialInstalled := time.Now().Add(-time.Minute).UTC()
+		initialObserved := time.Now().Add(-2 * time.Minute).UTC()
+		svc.openaiAccountRuntimeBlockUntil.Store(account.ID, initialUntil)
+		svc.openaiAccountRuntimeBlockReason.Store(account.ID, "prior")
+		svc.openaiAccountRuntimeBlockInstalledAt.Store(account.ID, initialInstalled)
+		svc.openaiAccountRuntimeBlockObservedUpdatedAt.Store(account.ID, initialObserved)
+
+		rollback := svc.blockGrokCredentialRuntime(account, initialUntil.Add(time.Minute), "tentative")
+		rollback()
+
+		reason, reasonOK := svc.openaiAccountRuntimeBlockReason.Load(account.ID)
+		installed, installedOK := svc.openaiAccountRuntimeBlockInstalledAt.Load(account.ID)
+		observed, observedOK := svc.openaiAccountRuntimeBlockObservedUpdatedAt.Load(account.ID)
+		require.True(t, reasonOK)
+		require.Equal(t, "prior", reason)
+		require.True(t, installedOK)
+		require.Equal(t, initialInstalled, installed)
+		require.True(t, observedOK)
+		require.Equal(t, initialObserved, observed)
+	})
 }
 
 func TestGetRequestCredentialAPIKeyBypassesOAuthFailureMapping(t *testing.T) {

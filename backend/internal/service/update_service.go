@@ -361,15 +361,21 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	if downloadURL == "" {
 		return infraerrors.Clone(ErrUpdateAssetNotAvailable)
 	}
-
 	// SECURITY: Validate download URL is from trusted domain
 	if err := validateDownloadURL(downloadURL); err != nil {
 		return infraerrors.Clone(ErrUpdateAssetInvalid).WithCause(err)
 	}
-	if checksumURL != "" {
-		if err := validateDownloadURL(checksumURL); err != nil {
-			return infraerrors.Clone(ErrUpdateAssetInvalid).WithCause(err)
-		}
+	// A self-update replaces the running executable and therefore must never
+	// proceed without an independent checksum asset. Older releases that did
+	// not publish checksums are intentionally rejected instead of silently
+	// downgrading integrity verification.
+	if strings.TrimSpace(checksumURL) == "" {
+		return infraerrors.Clone(ErrUpdateChecksumVerificationFailed).WithCause(
+			fmt.Errorf("release does not provide checksums.txt"),
+		)
+	}
+	if err := validateDownloadURL(checksumURL); err != nil {
+		return infraerrors.Clone(ErrUpdateAssetInvalid).WithCause(err)
 	}
 
 	// Get current executable path
@@ -399,10 +405,8 @@ func (s *UpdateService) applyReleaseAssets(ctx context.Context, releaseAssets []
 	}
 
 	// Verify checksum if available
-	if checksumURL != "" {
-		if err := s.verifyChecksum(ctx, archivePath, checksumURL); err != nil {
-			return err
-		}
+	if err := s.verifyChecksum(ctx, archivePath, checksumURL); err != nil {
+		return err
 	}
 
 	// Extract binary from archive

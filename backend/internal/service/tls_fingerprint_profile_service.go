@@ -175,7 +175,7 @@ func (s *TLSFingerprintProfileService) getRandomProfile() *tlsfingerprint.Profil
 //  2. 启用 + 绑定了 profile_id → 从缓存查找对应 profile
 //  3. 启用 + 未绑定或找不到 → 返回空 Profile（使用代码内置默认值）
 func (s *TLSFingerprintProfileService) ResolveTLSProfile(account *Account) *tlsfingerprint.Profile {
-	if account == nil || !account.IsTLSFingerprintEnabled() {
+	if s == nil || account == nil || !account.IsTLSFingerprintEnabled() {
 		return nil
 	}
 	id := account.GetTLSFingerprintProfileID()

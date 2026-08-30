@@ -1,11 +1,14 @@
+import { sanitizeIframeUrl } from './url'
+
 /**
  * Shared URL builder for iframe-embedded pages.
- * Used by PurchaseSubscriptionView and CustomPageView to build consistent URLs
- * with user_id, token, theme, lang, ui_mode, src_host, and src parameters.
+ * Used by embedded views to build consistent URLs with user_id, theme, lang,
+ * ui_mode and source context. Authentication tokens are deliberately not
+ * propagated: query strings are observable by the destination server, browser
+ * history, proxies and analytics systems.
  */
 
 const EMBEDDED_USER_ID_QUERY_KEY = 'user_id'
-const EMBEDDED_AUTH_TOKEN_QUERY_KEY = 'token'
 const EMBEDDED_THEME_QUERY_KEY = 'theme'
 const EMBEDDED_LANG_QUERY_KEY = 'lang'
 const EMBEDDED_UI_MODE_QUERY_KEY = 'ui_mode'
@@ -16,18 +19,18 @@ const EMBEDDED_SRC_QUERY_KEY = 'src_url'
 export function buildEmbeddedUrl(
   baseUrl: string,
   userId?: number,
-  authToken?: string | null,
+  // Kept for positional compatibility with older callers. It is intentionally
+  // ignored; bearer tokens must never be placed in an iframe URL.
+  _authToken?: string | null,
   theme: 'light' | 'dark' = 'light',
   lang?: string,
 ): string {
-  if (!baseUrl) return baseUrl
+  const safeBaseUrl = sanitizeIframeUrl(baseUrl)
+  if (!safeBaseUrl) return ''
   try {
-    const url = new URL(baseUrl)
+    const url = new URL(safeBaseUrl)
     if (userId) {
       url.searchParams.set(EMBEDDED_USER_ID_QUERY_KEY, String(userId))
-    }
-    if (authToken) {
-      url.searchParams.set(EMBEDDED_AUTH_TOKEN_QUERY_KEY, authToken)
     }
     url.searchParams.set(EMBEDDED_THEME_QUERY_KEY, theme)
     if (lang) {
@@ -36,12 +39,23 @@ export function buildEmbeddedUrl(
     url.searchParams.set(EMBEDDED_UI_MODE_QUERY_KEY, EMBEDDED_UI_MODE_VALUE)
     // Source tracking: let the embedded page know where it's being loaded from
     if (typeof window !== 'undefined') {
-      url.searchParams.set(EMBEDDED_SRC_HOST_QUERY_KEY, window.location.origin)
-      url.searchParams.set(EMBEDDED_SRC_QUERY_KEY, window.location.href)
+      try {
+        const source = new URL(window.location.href)
+        // Never forward query strings or fragments: OAuth/API tokens have
+        // historically appeared there in some deployments.
+        source.search = ''
+        source.hash = ''
+        if (source.origin !== 'null') {
+          url.searchParams.set(EMBEDDED_SRC_HOST_QUERY_KEY, source.origin)
+          url.searchParams.set(EMBEDDED_SRC_QUERY_KEY, `${source.origin}${source.pathname}`)
+        }
+      } catch {
+        // Source context is optional; keep the validated destination usable.
+      }
     }
     return url.toString()
   } catch {
-    return baseUrl
+    return ''
   }
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/tlsfingerprint"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -176,7 +177,7 @@ func TestOpenAIResponsesRequiredCapability(t *testing.T) {
 func TestResolveOpenAIMessagesMetadataSession_DoesNotDerivePromptCacheKey(t *testing.T) {
 	body := []byte(`{"model":"claude-sonnet-4-5","metadata":{"user_id":"claude-code-session"},"messages":[{"role":"user","content":"hello"}]}`)
 
-	sessionHash, promptCacheKey := resolveOpenAIMessagesMetadataSession("", "", "claude-sonnet-4-5", body)
+	sessionHash, promptCacheKey := resolveOpenAIMessagesMetadataSession(nil, service.PlatformOpenAI, "", "", "claude-sonnet-4-5", body)
 
 	require.NotEmpty(t, sessionHash)
 	require.Empty(t, promptCacheKey)
@@ -185,10 +186,75 @@ func TestResolveOpenAIMessagesMetadataSession_DoesNotDerivePromptCacheKey(t *tes
 func TestResolveOpenAIMessagesMetadataSession_PreservesExplicitPromptCacheKey(t *testing.T) {
 	body := []byte(`{"metadata":{"user_id":"claude-code-session"}}`)
 
-	sessionHash, promptCacheKey := resolveOpenAIMessagesMetadataSession("", "explicit-cache", "claude-sonnet-4-5", body)
+	sessionHash, promptCacheKey := resolveOpenAIMessagesMetadataSession(nil, service.PlatformOpenAI, "", "explicit-cache", "claude-sonnet-4-5", body)
 
 	require.NotEmpty(t, sessionHash)
 	require.Equal(t, "explicit-cache", promptCacheKey)
+}
+
+func TestResolveOpenAIMessagesMetadataSession_ClaudeCodeHeaderOverridesContentFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("X-Claude-Code-Session-Id", "claude-session-001")
+
+	body1 := []byte(`{"model":"gpt-5.6-sol","system":"parent","messages":[{"role":"user","content":"parent task"}]}`)
+	body2 := []byte(`{"model":"gpt-5.6-sol","system":"subagent","messages":[{"role":"user","content":"child task"}]}`)
+	contentHash1 := (&service.OpenAIGatewayService{}).GenerateSessionHash(c, body1)
+	contentHash2 := (&service.OpenAIGatewayService{}).GenerateSessionHash(c, body2)
+	require.NotEqual(t, contentHash1, contentHash2)
+
+	hash1, cacheKey1 := resolveOpenAIMessagesMetadataSession(c, service.PlatformOpenAI, contentHash1, "", "gpt-5.6-sol", body1)
+	hash2, cacheKey2 := resolveOpenAIMessagesMetadataSession(c, service.PlatformOpenAI, contentHash2, "", "gpt-5.6-sol", body2)
+	require.Equal(t, service.DeriveSessionHashFromSeed("claude-session-001"), hash1)
+	require.Equal(t, hash1, hash2)
+	require.Empty(t, cacheKey1)
+	require.Empty(t, cacheKey2)
+}
+
+func TestResolveOpenAIMessagesMetadataSession_OpenAISignalWinsOverClaudeHeader(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("X-Claude-Code-Session-Id", "claude-session-001")
+	c.Request.Header.Set("session-id", "openai-session-001")
+
+	hash, cacheKey := resolveOpenAIMessagesMetadataSession(c, service.PlatformOpenAI, "content-hash", "", "gpt-5.6-sol", []byte(`{"metadata":{"user_id":"opaque"}}`))
+	require.Equal(t, "content-hash", hash)
+	require.Empty(t, cacheKey)
+}
+
+func TestResolveOpenAIMessagesMetadataSession_BlankClaudeHeaderKeepsContentFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("X-Claude-Code-Session-Id", "   ")
+
+	hash, cacheKey := resolveOpenAIMessagesMetadataSession(c, service.PlatformOpenAI, "content-hash", "", "gpt-5.6-sol", []byte(`{"metadata":{"user_id":"opaque"}}`))
+	require.Equal(t, "content-hash", hash)
+	require.Empty(t, cacheKey)
+}
+
+func TestResolveOpenAIMessagesMetadataSession_DoesNotChangeNativeClaudeRouting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("X-Claude-Code-Session-Id", "claude-session-001")
+
+	hash, cacheKey := resolveOpenAIMessagesMetadataSession(
+		c,
+		service.PlatformAnthropic,
+		"content-hash",
+		"",
+		"claude-sonnet-4-5",
+		[]byte(`{"metadata":{"user_id":"opaque"}}`),
+	)
+	require.Equal(t, "content-hash", hash, "native Claude/CC routing must keep its established session hash")
+	require.Empty(t, cacheKey)
 }
 
 func TestOpenAIHandleStreamingAwareError_NonStreaming(t *testing.T) {
@@ -1971,6 +2037,10 @@ func (u *openAIHTTPPassthroughFailoverUpstream) Do(_ *http.Request, _ string, ac
 	}, nil
 }
 
+func (u *openAIHTTPPassthroughFailoverUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
 func (u *openAIHTTPPassthroughFailoverUpstream) calls() []int64 {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -2002,6 +2072,10 @@ func (u *openAIHTTPPassthroughAuthFailoverUpstream) Do(_ *http.Request, _ string
 	}, nil
 }
 
+func (u *openAIHTTPPassthroughAuthFailoverUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
+}
+
 func (u *openAIHTTPPassthroughAuthFailoverUpstream) calls() []int64 {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -2022,6 +2096,10 @@ type openAIWSCurrentTurnModelSwitchUpstream struct {
 	accountIDs           []int64
 	bodies               [][]byte
 	firstAccountCalls    int
+}
+
+func (u *openAIWSCurrentTurnModelSwitchUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
 func (u *openAIWSCurrentTurnModelSwitchUpstream) Do(req *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
@@ -2103,6 +2181,10 @@ func (u *openAIHTTPPassthroughSSERateLimitUpstream) Do(_ *http.Request, _ string
 		},
 		Body: io.NopCloser(strings.NewReader(body)),
 	}, nil
+}
+
+func (u *openAIHTTPPassthroughSSERateLimitUpstream) DoWithTLS(req *http.Request, proxyURL string, accountID int64, accountConcurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxyURL, accountID, accountConcurrency)
 }
 
 func (u *openAIHTTPPassthroughSSERateLimitUpstream) calls() []int64 {

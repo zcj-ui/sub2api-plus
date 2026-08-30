@@ -18,6 +18,8 @@ import (
 // installMutex prevents concurrent installation attempts (TOCTOU protection)
 var installMutex sync.Mutex
 
+const setupMaxBodyBytes int64 = 1 << 20
+
 // RegisterRoutes registers setup wizard routes
 func RegisterRoutes(r *gin.Engine) {
 	setup := r.Group("/setup")
@@ -27,7 +29,7 @@ func RegisterRoutes(r *gin.Engine) {
 
 		// All modification endpoints are protected by setupGuard
 		protected := setup.Group("")
-		protected.Use(setupGuard())
+		protected.Use(setupGuard(), setupBodyLimit())
 		{
 			protected.POST("/test-db", testDatabase)
 			protected.POST("/test-redis", testRedis)
@@ -57,6 +59,19 @@ func setupGuard() gin.HandlerFunc {
 			response.Error(c, http.StatusForbidden, "Setup is not allowed: system is already installed")
 			c.Abort()
 			return
+		}
+		c.Next()
+	}
+}
+
+// setupBodyLimit bounds the small JSON wizard requests before they reach
+// binding/validation.  The setup server is reachable before normal gateway
+// limits are loaded, so an explicit cap is needed to prevent a slow or oversized
+// body from occupying the process and install lock indefinitely.
+func setupBodyLimit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c != nil && c.Request != nil && c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, setupMaxBodyBytes)
 		}
 		c.Next()
 	}
@@ -238,16 +253,6 @@ type InstallRequest struct {
 
 // install performs the installation
 func install(c *gin.Context) {
-	// TOCTOU Protection: Acquire mutex to prevent concurrent installation
-	installMutex.Lock()
-	defer installMutex.Unlock()
-
-	// Double-check after acquiring lock
-	if !NeedsSetup() {
-		response.Error(c, http.StatusForbidden, "Setup is not allowed: system is already installed")
-		return
-	}
-
 	var req InstallRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
@@ -334,6 +339,16 @@ func install(c *gin.Context) {
 	// Validate server mode
 	if req.Server.Mode != "release" && req.Server.Mode != "debug" {
 		response.Error(c, http.StatusBadRequest, "Invalid server mode (must be 'release' or 'debug')")
+		return
+	}
+
+	// TOCTOU protection covers only the final state transition. Parsing and
+	// validating the bounded request body before taking the mutex prevents a
+	// client that never finishes its body from blocking other setup requests.
+	installMutex.Lock()
+	defer installMutex.Unlock()
+	if !NeedsSetup() {
+		response.Error(c, http.StatusForbidden, "Setup is not allowed: system is already installed")
 		return
 	}
 

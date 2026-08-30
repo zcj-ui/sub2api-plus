@@ -107,6 +107,9 @@
           <iframe
             :src="embeddedUrl"
             class="custom-embed-frame"
+            sandbox="allow-scripts allow-forms allow-modals allow-popups allow-presentation"
+            referrerpolicy="no-referrer"
+            loading="lazy"
             allowfullscreen
           ></iframe>
         </div>
@@ -178,6 +181,8 @@ const embeddedUrl = computed(() => {
   return buildEmbeddedUrl(
     menuItem.value.url,
     authStore.user?.id,
+    // The third positional argument is retained for compatibility by the
+    // helper, but no bearer token is ever sent to an embedded origin.
     null,
     pageTheme.value,
     locale.value,
@@ -264,10 +269,10 @@ async function fetchAndRenderMarkdown(slug: string) {
     )
 
     const html = marked.parse(raw) as string
-    const sanitized = DOMPurify.sanitize(html, {
-      ADD_TAGS: ['iframe'],
-      ADD_ATTR: ['allowfullscreen', 'frameborder', 'src'],
-    })
+    // Markdown pages are rendered in the application origin.  Do not widen
+    // DOMPurify with arbitrary iframe tags; external content belongs in the
+    // dedicated sandboxed URL mode above.
+    const sanitized = DOMPurify.sanitize(html)
 
     // Inject IDs into headings and build TOC
     const toc: TocItem[] = []

@@ -135,7 +135,15 @@ func (s *GatewayService) ForwardCountTokens(ctx context.Context, c *gin.Context,
 
 	// 获取代理URL（自定义 base URL 模式下，proxy 通过 buildCustomRelayURL 作为查询参数传递）
 	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
+	if account.IsOpenAI() && account.ProxyID != nil {
+		if _, proxyErr := resolveConfiguredProxyURL(account); proxyErr != nil {
+			s.countTokensError(c, http.StatusBadGateway, "upstream_error", "Configured account proxy is unavailable")
+			return proxyErr
+		}
+		if !account.IsCustomBaseURLEnabled() || account.GetCustomBaseURL() == "" {
+			proxyURL = account.Proxy.URL()
+		}
+	} else if account.ProxyID != nil && account.Proxy != nil {
 		if !account.IsCustomBaseURLEnabled() || account.GetCustomBaseURL() == "" {
 			proxyURL = account.Proxy.URL()
 		}
@@ -262,7 +270,13 @@ func (s *GatewayService) forwardCountTokensAnthropicAPIKeyPassthrough(ctx contex
 	}
 
 	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
+	if account.IsOpenAI() && account.ProxyID != nil {
+		proxyURL, err = resolveConfiguredProxyURL(account)
+		if err != nil {
+			s.countTokensError(c, http.StatusBadGateway, "upstream_error", "Configured account proxy is unavailable")
+			return err
+		}
+	} else if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
 	}
 

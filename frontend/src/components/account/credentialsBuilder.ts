@@ -428,16 +428,44 @@ export interface PlanTypeOption {
  * （canonical 值 chatgptpro 显示为 Pro，team 显示为 Team）。未知值原样返回。
  */
 export function planTypeDisplayLabel(value: string): string {
-  switch (value.trim().toLowerCase()) {
+  switch (value.trim().toLowerCase().replace(/[\s_-]+/g, '')) {
+    case 'go':
+      return 'Go'
     case 'plus':
       return 'Plus'
     case 'pro':
     case 'chatgptpro':
       return 'Pro'
+    case 'prolite':
+    case 'selfservebusinessprolite':
+      return 'Pro Lite'
+    case 'selfservebusinessusagebased':
+    case 'business':
+      return 'Business'
+    case 'enterprise':
+    case 'enterprisecbpusagebased':
+    case 'enterprisecbpautomation':
+    case 'ent26':
+      return 'Enterprise'
     case 'free':
       return 'Free'
     case 'team':
       return 'Team'
+    case 'edu':
+    case 'education':
+      return 'Education'
+    case 'eduplus':
+      return 'Education Plus'
+    case 'edupro':
+      return 'Education Pro'
+    case 'k12':
+      return 'K-12'
+    case 'freeworkspace':
+      return 'Free Workspace'
+    case 'quorum':
+      return 'Quorum'
+    case 'guest':
+      return 'Guest'
     default:
       return value
   }
@@ -453,7 +481,7 @@ export function readPlanType(credentials: Record<string, unknown> | undefined | 
 }
 
 /**
- * 构建 plan_type 下拉选项：清空 + Plus/Pro/Free 预设。
+ * 构建 plan_type 下拉选项：清空 + 官方 ChatGPT/Codex 套餐预设。
  * 若当前值是某预设的别名（如 chatgptpro↔Pro），用当前的 canonical 值占据该
  * 标签位（保留 canonical，显示友好标签，避免重复项）；若是完全预设外的值
  * （如 team 或异常值），追加为一项，避免编辑时下拉丢失原值。
@@ -462,9 +490,21 @@ export function buildPlanTypeOptions(current: string, clearLabel: string): PlanT
   const cur = (current || '').trim()
   const curLabel = cur ? planTypeDisplayLabel(cur) : ''
   const presets: PlanTypeOption[] = [
+    { value: 'go', label: 'Go' },
     { value: 'plus', label: 'Plus' },
     { value: 'pro', label: 'Pro' },
-    { value: 'free', label: 'Free' }
+    { value: 'prolite', label: 'Pro Lite' },
+    { value: 'team', label: 'Team' },
+    { value: 'business', label: 'Business' },
+    { value: 'enterprise', label: 'Enterprise' },
+    { value: 'edu', label: 'Education' },
+    { value: 'edu_plus', label: 'Education Plus' },
+    { value: 'edu_pro', label: 'Education Pro' },
+    { value: 'k12', label: 'K-12' },
+    { value: 'free', label: 'Free' },
+    { value: 'free_workspace', label: 'Free Workspace' },
+    { value: 'quorum', label: 'Quorum' },
+    { value: 'guest', label: 'Guest' }
   ]
   const opts: PlanTypeOption[] = [{ value: '', label: clearLabel }]
   for (const p of presets) {
@@ -495,5 +535,25 @@ export function applyPlanType(
   } else {
     delete credentials.plan_type
   }
+  return credentials
+}
+
+/** Read an account-level OpenAI OAuth User-Agent override. */
+export function readUserAgent(credentials: Record<string, unknown> | undefined | null): string {
+  const value = credentials?.user_agent
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Persist an account-level User-Agent override. Empty input explicitly clears
+ * the key so outbound identity falls back to the global Codex setting.
+ */
+export function applyUserAgent(
+  credentials: Record<string, unknown>,
+  userAgent: string
+): Record<string, unknown> {
+  const normalized = (userAgent || '').trim()
+  if (normalized) credentials.user_agent = normalized
+  else delete credentials.user_agent
   return credentials
 }

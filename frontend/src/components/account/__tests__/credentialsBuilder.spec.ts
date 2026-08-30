@@ -7,6 +7,7 @@ import {
   applyHeaderOverride,
   applyInterceptWarmup,
   applyPlanType,
+  applyUserAgent,
   buildHeaderOverridesObject,
   buildPlanTypeOptions,
   isCustomGrokBaseUrl,
@@ -15,6 +16,7 @@ import {
   parseHeaderOverridesJson,
   planTypeDisplayLabel,
   readPlanType,
+  readUserAgent,
   serializeHeaderOverrideRows,
   splitHeaderOverridesObject,
   validateHeaderOverrideRows
@@ -405,6 +407,9 @@ describe('plan_type helpers', () => {
       expect(planTypeDisplayLabel('chatgptpro')).toBe('Pro')
       expect(planTypeDisplayLabel('free')).toBe('Free')
       expect(planTypeDisplayLabel('team')).toBe('Team')
+      expect(planTypeDisplayLabel('k12')).toBe('K-12')
+      expect(planTypeDisplayLabel('self_serve_business_usage_based')).toBe('Business')
+      expect(planTypeDisplayLabel('self_serve_business_prolite')).toBe('Pro Lite')
       expect(planTypeDisplayLabel('CHATGPTPRO')).toBe('Pro')
     })
     it('returns unknown values verbatim', () => {
@@ -428,25 +433,23 @@ describe('plan_type helpers', () => {
   describe('buildPlanTypeOptions', () => {
     const clear = 'Clear'
     it('returns clear + presets when current is empty', () => {
-      expect(buildPlanTypeOptions('', clear)).toEqual([
-        { value: '', label: clear },
-        { value: 'plus', label: 'Plus' },
-        { value: 'pro', label: 'Pro' },
-        { value: 'free', label: 'Free' }
-      ])
+      const opts = buildPlanTypeOptions('', clear)
+      expect(opts[0]).toEqual({ value: '', label: clear })
+      for (const value of ['go', 'plus', 'pro', 'prolite', 'team', 'business', 'enterprise', 'edu', 'edu_plus', 'edu_pro', 'k12', 'free']) {
+        expect(opts.some(o => o.value === value)).toBe(true)
+      }
     })
     it('keeps canonical chatgptpro under a single friendly "Pro" option (no duplicate)', () => {
       const opts = buildPlanTypeOptions('chatgptpro', clear)
       const pros = opts.filter(o => o.label === 'Pro')
       expect(pros).toHaveLength(1)
       expect(pros[0].value).toBe('chatgptpro')
-      expect(opts.map(o => o.value)).toEqual(['', 'plus', 'chatgptpro', 'free'])
+      expect(opts.filter(o => o.value === 'chatgptpro')).toHaveLength(1)
     })
     it('appends an unknown-but-labeled value (team) as its own option', () => {
       const opts = buildPlanTypeOptions('team', clear)
       expect(opts.find(o => o.value === 'team')).toEqual({ value: 'team', label: 'Team' })
-      // presets untouched
-      expect(opts.map(o => o.value)).toEqual(['', 'plus', 'pro', 'free', 'team'])
+      expect(opts.filter(o => o.value === 'team')).toHaveLength(1)
     })
     it('appends a fully custom value with a raw label', () => {
       const opts = buildPlanTypeOptions('weird_x', clear)
@@ -455,7 +458,7 @@ describe('plan_type helpers', () => {
     it('does not duplicate an exact preset value', () => {
       const opts = buildPlanTypeOptions('pro', clear)
       expect(opts.filter(o => o.value === 'pro')).toHaveLength(1)
-      expect(opts.map(o => o.value)).toEqual(['', 'plus', 'pro', 'free'])
+      expect(opts.filter(o => o.value === 'pro')).toHaveLength(1)
     })
   })
 
@@ -478,5 +481,27 @@ describe('plan_type helpers', () => {
       expect(out).toEqual({ email: 'a@b.c' })
       expect('plan_type' in out).toBe(false)
     })
+  })
+})
+
+describe('OpenAI OAuth User-Agent helpers', () => {
+  it('reads only string overrides', () => {
+    expect(readUserAgent({ user_agent: ' codex-tui/0.146.0 ' })).toBe(' codex-tui/0.146.0 ')
+    expect(readUserAgent({ user_agent: 42 })).toBe('')
+    expect(readUserAgent(undefined)).toBe('')
+  })
+
+  it('trims and writes a non-empty override', () => {
+    const credentials: Record<string, unknown> = { email: 'user@example.test' }
+    expect(applyUserAgent(credentials, '  codex-tui/0.146.0 (Linux; x86_64) bash  ')).toEqual({
+      email: 'user@example.test',
+      user_agent: 'codex-tui/0.146.0 (Linux; x86_64) bash'
+    })
+  })
+
+  it('deletes the override when cleared', () => {
+    const credentials: Record<string, unknown> = { user_agent: 'old', email: 'user@example.test' }
+    applyUserAgent(credentials, '   ')
+    expect(credentials).toEqual({ email: 'user@example.test' })
   })
 })

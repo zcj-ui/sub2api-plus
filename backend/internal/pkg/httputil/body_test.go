@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -140,4 +142,64 @@ func TestReadRequestBodyWithPrealloc_RespectsIdentityEncoding(t *testing.T) {
 	if string(got) != samplePayload {
 		t.Fatalf("body mismatch: got %q", got)
 	}
+}
+
+func TestDecompressRequestBodyWithLimitRejectsExpansion(t *testing.T) {
+	var compressed bytes.Buffer
+	gw := gzip.NewWriter(&compressed)
+	if _, err := gw.Write([]byte(strings.Repeat("x", 64))); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	_, err := decompressRequestBodyWithLimit("gzip", bytes.NewReader(compressed.Bytes()), 32)
+	var maxErr *http.MaxBytesError
+	if !errors.As(err, &maxErr) {
+		t.Fatalf("expected MaxBytesError, got %T %v", err, err)
+	}
+	if maxErr.Limit != 32 {
+		t.Fatalf("limit mismatch: got %d want 32", maxErr.Limit)
+	}
+}
+
+func TestReadRequestBodyWithPreallocCompressedStreamDoesNotBufferRawBody(t *testing.T) {
+	var compressed bytes.Buffer
+	gw := gzip.NewWriter(&compressed)
+	if _, err := gw.Write([]byte(samplePayload)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	consumed := 0
+	reader := &countingReader{reader: bytes.NewReader(compressed.Bytes()), consumed: &consumed}
+	req := newRequestWithBody(t, nil, "gzip")
+	req.Body = io.NopCloser(reader)
+	req.ContentLength = -1
+	got, err := ReadRequestBodyWithPrealloc(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(got) != samplePayload {
+		t.Fatalf("body mismatch: got %q", got)
+	}
+	if consumed != compressed.Len() {
+		t.Fatalf("compressed stream was not fully consumed: got %d want %d", consumed, compressed.Len())
+	}
+}
+
+type countingReader struct {
+	reader   io.Reader
+	consumed *int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if r.consumed != nil {
+		*r.consumed += n
+	}
+	return n, err
 }

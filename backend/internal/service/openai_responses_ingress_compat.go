@@ -36,7 +36,11 @@ func normalizeOpenAIResponsesLegacyIngress(body []byte) ([]byte, bool, error) {
 			if !hasNativeInput {
 				request["input"] = legacy.input
 				applyLegacyResponsesTopLevelFields(request, legacy)
-				delete(request, "previous_response_id")
+				// Keep previous_response_id visible to the scheduler.  A legacy
+				// messages payload may be a plain follow-up rather than a complete
+				// tool-history replay; deleting the id here silently turns it into a
+				// fresh context.  The handler later decides whether the selected
+				// account can preserve or safely rebuild the continuation.
 			}
 		}
 		// messages is not a Responses field. When native input is present but the

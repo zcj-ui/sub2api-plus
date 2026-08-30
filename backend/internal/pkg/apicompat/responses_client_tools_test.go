@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -714,4 +715,136 @@ func TestResponsesClientToolStreamRestorer_RestoresAllTerminalEvents(t *testing.
 			require.False(t, gjson.GetBytes(restored[0], "response.output.0.arguments").Exists())
 		})
 	}
+}
+
+func TestAdaptResponsesClientTools_NamespaceCustomChildRoundTripNonStreaming(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{map[string]any{
+			"type": "namespace", "name": "functions",
+			"tools": []any{map[string]any{
+				"type": "custom", "name": "exec", "description": "Run commands",
+				"format": map[string]any{"type": "text"},
+			}},
+		}},
+		"input": []any{
+			map[string]any{"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "exec", "namespace": "functions", "input": "pwd"},
+		},
+	}
+
+	mapping, changed, err := AdaptResponsesClientTools(req)
+	require.NoError(t, err)
+	require.True(t, changed)
+	entry, ok := mapping.NamespaceTools["functions__exec"]
+	require.True(t, ok)
+	require.True(t, entry.Custom)
+	require.True(t, mapping.CustomTools["functions__exec"])
+
+	tools := requireResponsesClientToolValue[[]any](t, req["tools"])
+	require.Len(t, tools, 1)
+	flat := requireResponsesClientToolValue[map[string]any](t, tools[0])
+	require.Equal(t, "function", flat["type"])
+	require.Equal(t, "functions__exec", flat["name"])
+	assert.JSONEq(t, customToolInputSchema, rawObjectString(flat["parameters"]))
+
+	input := requireResponsesClientToolValue[[]any](t, req["input"])
+	require.Len(t, input, 1)
+	call := requireResponsesClientToolValue[map[string]any](t, input[0])
+	require.Equal(t, "function_call", call["type"])
+	require.Equal(t, "functions__exec", call["name"])
+	require.NotContains(t, call, "namespace")
+	assert.JSONEq(t, `{"input":"pwd"}`, requireResponsesClientToolValue[string](t, call["arguments"]))
+
+	payload := []byte(`{"id":"resp","output":[{"type":"function_call","id":"fc_1","call_id":"call_2","name":"functions__exec","arguments":"{\"input\":\"dir\"}"}]}`)
+	restored, restoredChanged, err := RestoreResponsesClientToolPayload(payload, mapping)
+	require.NoError(t, err)
+	require.True(t, restoredChanged)
+	require.JSONEq(t, `{"id":"resp","output":[{"type":"custom_tool_call","id":"ctc_1","call_id":"call_2","name":"exec","namespace":"functions","input":"dir"}]}`, string(restored))
+}
+
+func TestAdaptResponsesClientToolsWithInheritedMapping_NamespaceCustomHistory(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{"type": "custom_tool_call", "id": "ctc_2", "call_id": "call_2", "name": "exec", "namespace": "functions", "input": "pwd"},
+		},
+	}
+	inherited := ResponsesClientToolMapping{
+		CustomTools: map[string]bool{"functions__exec": true},
+		NamespaceTools: map[string]ResponsesNamespaceName{
+			"functions__exec": {Namespace: "functions", Name: "exec", Custom: true},
+		},
+	}
+
+	mapping, changed, err := AdaptResponsesClientToolsWithInheritedMapping(req, inherited)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, inherited, mapping)
+	input := requireResponsesClientToolValue[[]any](t, req["input"])
+	call := requireResponsesClientToolValue[map[string]any](t, input[0])
+	require.Equal(t, "function_call", call["type"])
+	require.Equal(t, "functions__exec", call["name"])
+	require.NotContains(t, call, "namespace")
+	assert.JSONEq(t, `{"input":"pwd"}`, requireResponsesClientToolValue[string](t, call["arguments"]))
+
+	// The real WS continuation also supplies the lowered declaration snapshot.
+	// It must be reconstructed as a namespace custom child, not as a top-level
+	// custom tool, before the ordinary adapter runs again.
+	declarationReq := map[string]any{"input": []any{}}
+	declarationMapping, declarationChanged, err := AdaptResponsesClientToolsWithInheritedMapping(
+		declarationReq,
+		inherited,
+		[]any{map[string]any{
+			"type": "function", "name": "functions__exec",
+			"parameters": json.RawMessage(customToolInputSchema),
+		}},
+	)
+	require.NoError(t, err)
+	require.True(t, declarationChanged)
+	identity, ok := declarationMapping.NamespaceTools["functions__exec"]
+	require.True(t, ok)
+	require.True(t, identity.Custom)
+	declarations := requireResponsesClientToolValue[[]any](t, declarationReq["tools"])
+	require.Len(t, declarations, 1)
+	declaration := requireResponsesClientToolValue[map[string]any](t, declarations[0])
+	require.Equal(t, "function", declaration["type"])
+	require.Equal(t, "functions__exec", declaration["name"])
+}
+
+func TestResponsesClientToolStreamRestorer_NamespaceCustomChildLifecycle(t *testing.T) {
+	restorer := NewResponsesClientToolStreamRestorer(ResponsesClientToolMapping{
+		CustomTools: map[string]bool{"functions__exec": true},
+		NamespaceTools: map[string]ResponsesNamespaceName{
+			"functions__exec": {Namespace: "functions", Name: "exec", Custom: true},
+		},
+	})
+
+	added, changed, err := restorer.RestoreEvent([]byte(`{"type":"response.output_item.added","sequence_number":4,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"functions__exec","arguments":"","status":"in_progress"}}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Len(t, added, 1)
+	require.Equal(t, "custom_tool_call", gjson.GetBytes(added[0], "item.type").String())
+	require.Equal(t, "exec", gjson.GetBytes(added[0], "item.name").String())
+	require.Equal(t, "functions", gjson.GetBytes(added[0], "item.namespace").String())
+	require.Equal(t, "ctc_1", gjson.GetBytes(added[0], "item.id").String())
+
+	delta, changed, err := restorer.RestoreEvent([]byte(`{"type":"response.function_call_arguments.delta","sequence_number":5,"output_index":0,"item_id":"fc_1","name":"functions__exec","delta":"{\"input\":\"pwd\"}"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Empty(t, delta, "custom arguments remain buffered until done")
+
+	done, changed, err := restorer.RestoreEvent([]byte(`{"type":"response.function_call_arguments.done","sequence_number":6,"output_index":0,"item_id":"fc_1","call_id":"call_1","name":"functions__exec","arguments":"{\"input\":\"pwd\"}"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Len(t, done, 2)
+	require.Equal(t, "response.custom_tool_call_input.done", gjson.GetBytes(done[1], "type").String())
+	require.Equal(t, "exec", gjson.GetBytes(done[1], "name").String())
+	require.Equal(t, "pwd", gjson.GetBytes(done[1], "input").String())
+
+	closed, changed, err := restorer.RestoreEvent([]byte(`{"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"functions__exec","arguments":"{\"input\":\"pwd\"}","status":"completed"}}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Len(t, closed, 1)
+	require.Equal(t, "custom_tool_call", gjson.GetBytes(closed[0], "item.type").String())
+	require.Equal(t, "exec", gjson.GetBytes(closed[0], "item.name").String())
+	require.Equal(t, "functions", gjson.GetBytes(closed[0], "item.namespace").String())
+	require.Equal(t, "pwd", gjson.GetBytes(closed[0], "item.input").String())
 }

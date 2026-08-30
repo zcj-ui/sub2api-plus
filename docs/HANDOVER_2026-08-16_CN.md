@@ -1,8 +1,10 @@
-# Sub2API Plus 交接文档
+# Sub2API Plus 交接文档（历史记录，已脱敏）
 
 > 日期：2026-08-16
-> 适用版本：v0.2.2（提交 `91755673e`，main/dev 同步）
+> 适用版本：历史 v0.2.2（本文只保留设计背景；当前版本与分支以仓库元数据为准）
 > 上游：Wei-Shaw/sub2api（LGPL-3.0-or-later，保留原协议与署名，见 NOTICE）
+
+> **发布前提示：** 本文曾包含部署交接信息，现已移除真实服务器地址、远程资产标识、备份路径、账号和密钥线索。公开仓库只允许使用 `TARGET_HOST`、`ASSET_ID`、`BACKUP_DIR` 等占位符；真实运维信息应放在受控的私有工单或密码库中。
 
 ---
 
@@ -25,7 +27,7 @@
 - **v0.2.1**：OpenAI/Codex 兼容性修复批次（对齐上游 #5668 等 10 个 PR/Issue）。
 - GHCR 镜像（已验证在线）：`ghcr.io/zcj-ui/sub2api-plus` 的 `latest`、`0.2.2`、`dev` 及不可变 dev 版本标签。
 - 一键脚本：`curl -sSL https://raw.githubusercontent.com/zcj-ui/sub2api-plus/main/deploy/install.sh | sudo bash`
-- **服务器（107.150.53.139）当前运行 v0.2.1，尚未升级 v0.2.2**（面板"系统更新"点击即可，无数据库迁移）。
+- **历史部署状态：** 目标服务器当时运行 v0.2.1，尚未升级 v0.2.2；真实主机与版本请通过受控运维记录核对，本文不保存该信息。
 
 ## 3. 主要工作内容（按域）
 
@@ -81,7 +83,7 @@
 
 ### 3.10 Antigravity/反代上游兼容（v0.2.1 前后）
 - `upstream` 账户支持 New API 类反代：URL 规范化（根/`/v1`/完整路径/query 保留）、双鉴权头、模型映射、头覆写、429/401/403/5xx 正确 failover。
-- Chat Completions/Responses/Gemini Native 路径打通；实测 `sub2 → ai.aiking.one` 全链路 SSE 成功。
+- Chat Completions/Responses/Gemini Native 路径打通；已用受控测试上游完成全链路 SSE 验证。
 - 上游错误脱敏（非官方 host/私有 IP 不外泄）。
 
 ### 3.11 测试与质量
@@ -102,14 +104,14 @@
 
 | 项 | 值 |
 |---|---|
-| Termark 资产 | 名称"美国物理"，ID `769QthsdMjJJXTmi`，107.150.53.139 |
+| 远程资产 | `ASSET_ID`（真实名称、ID、IP 不进入公开文档） |
 | 部署形态 | 二进制 + systemd（`sub2api.service`，运行用户 `sub2api`），端口 8080，Nginx 反代 |
 | 目录 | `/opt/sub2api`（属主 root:sub2api 0775，运行用户可写以支持在线更新） |
 | 数据库 | 本机 PostgreSQL（库 sub2api）+ Redis 127.0.0.1:6379 db3 |
-| 备份 | `/root/sub2api-backups/20260815-104327`（19 文件 SHA256 校验，含 pg 转储+RDB+旧二进制+配置）；停服快照子目录 `pre-cutover-*` |
-| 回滚二进制 | `/opt/sub2api/sub2api.rollback.*`；systemd 无自动重启回滚 |
-| 当前版本 | **v0.2.1（4b581b73），待升级 v0.2.2** |
-| 部署方法 | CI 产物（linux_amd64 归档）→ termark 上传 → 停服补快照 → 原子替换 → 健康检查（`/health` 200 + 数据计数核对） |
+| 备份 | `BACKUP_DIR`（真实路径、文件名和校验清单仅存受控运维记录） |
+| 回滚二进制 | `INSTALL_DIR/sub2api.rollback.*`；systemd 无自动重启回滚 |
+| 当前版本 | 以受控部署记录和 `/health` 响应为准；本文不声明线上版本 |
+| 部署方法 | CI 产物（linux_amd64 归档）→ 受控传输 → 停服补快照 → 原子替换 → 健康检查（`/health` 200 + 数据计数核对） |
 
 操作约束：只用 termark（不直接 ssh/scp）；部署前必做新备份；账户/代理数据绝不改。
 
@@ -130,15 +132,16 @@
 
 ## 8. 待办与已知事项
 
-- [ ] **服务器升级 v0.2.2**（面板点击或 termark 部署；调度修复需此版本生效）。
+- [ ] **按受控运维记录升级目标服务器**（部署主机、资产 ID、备份目录不得写入公开仓库）。
 - [ ] "临时回退官方客户端"功能：用户已要求延后（备份确认+强制下载流程的设计草稿曾做过又剥离）。
 - [ ] cockpit 式指纹增强（`prompt_cache_key`/`conversation_id` 派生）可选后续。
 - [ ] xlsx 两条 High 无上游修复，例外 2026-10-06 到期需复核。
-- [ ] 上游同步：官方自 #5668 后仅版本号提交，无功能更新；#5649（分组用量）刻意未纳入。
+- [ ] 上游同步：当前已抓取官方 `upstream/main` 至 `b5827cfd54`；后续继续按
+  OpenAI/Codex 兼容范围审查新 Issue/PR。Claude/CC wire 行为和大范围账单 schema 改动仍单独评估。
 
 ## 9. 本机工具链备忘
 
-- Go：`C:\Users\z2088\AppData\Local\codex-go\go1.26.5-complete\go\bin\go.exe`
+- Go：`1.27.0`（使用本机受控工具链路径，不在公开文档写入用户目录）
 - 缓存（勿放 C 盘）：`GOCACHE=F:\sub2api\.gocache`、`GOMODCACHE=F:\sub2api\.gomodcache`、`GOTMPDIR=F:\sub2api\tmp`
 - 前端：`F:\sub2api\frontend\node_modules\.bin\`（vitest/vue-tsc，从 frontend 目录运行）
 - GitHub API 匿名读足够；写操作令牌来自 git credential manager（`git credential fill`，勿打印勿落盘）

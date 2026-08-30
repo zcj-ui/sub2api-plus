@@ -5,6 +5,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,7 @@ func TestForwardResponses_ForceChatCompletionsRoutesNonStreamingToChatCompletion
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
+	SetOpenAIHTTPResponseOwner(c, 501, 601)
 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
@@ -55,6 +57,16 @@ func TestForwardResponses_ForceChatCompletionsRoutesNonStreamingToChatCompletion
 	require.Equal(t, 2, result.Usage.OutputTokens)
 	require.Equal(t, 1, result.Usage.CacheReadInputTokens)
 	require.False(t, result.Stream)
+	require.NotEmpty(t, result.ResponseID)
+	account := forceChatResponsesFallbackAccount()
+	accountID, err := svc.getOpenAIWSStateStore().GetResponseAccount(context.Background(), 0, result.ResponseID)
+	require.NoError(t, err)
+	require.Equal(t, account.ID, accountID)
+	ownerUserID, ownerAPIKeyID, found, err := svc.getOpenAIWSStateStore().GetHTTPResponseOwner(context.Background(), 0, result.ResponseID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(501), ownerUserID)
+	require.Equal(t, int64(601), ownerAPIKeyID)
 }
 
 // Scenario: 第三方无推理模型不收到兼容档位。
@@ -178,6 +190,86 @@ func TestForwardResponses_ForceChatCompletionsRoutesStreamingToChatCompletions(t
 	require.Equal(t, 3, result.Usage.OutputTokens)
 	require.True(t, result.Stream)
 	require.NotNil(t, result.FirstTokenMs)
+	require.True(t, strings.HasPrefix(result.ResponseID, "resp_"))
+	require.Contains(t, rec.Body.String(), `"id":"`+result.ResponseID+`"`)
+}
+
+func TestForwardResponses_ChatFallbackRejectsCleanEOFWithoutTerminalChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_truncated_fallback"}},
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"id":"chatcmpl_partial","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}`,
+			"",
+		}, "\n"))),
+	}}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+
+	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr), "clean EOF without a terminal chunk must be failover-classified")
+	require.NotNil(t, result)
+	require.True(t, strings.HasPrefix(result.ResponseID, "resp_"))
+	require.NotContains(t, rec.Body.String(), "event: response.completed")
+}
+
+func TestForwardResponses_ChatFallbackAcceptsEOFAfterFinishReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(`data: {"id":"chatcmpl_eof_terminal","object":"chat.completion.chunk","model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n")),
+	}}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+
+	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Contains(t, rec.Body.String(), "event: response.completed")
+}
+
+func TestForwardResponses_ChatFallbackJoinsMultilineSSEData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// SSE allows a single event to contain multiple data lines. The joined
+	// payload below is one valid JSON Chat Completions chunk, but each line is
+	// intentionally not valid JSON on its own.
+	upstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_multiline","object":"chat.completion.chunk",`,
+		`data: "model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"multi"},`,
+		`data: "finish_reason":"stop"}]}`,
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+
+	result, err := svc.Forward(context.Background(), c, forceChatResponsesFallbackAccount(), body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Contains(t, rec.Body.String(), `"delta":"multi"`)
+	require.Contains(t, rec.Body.String(), "event: response.completed")
 }
 
 func TestForwardResponses_ChatFallbackRejectsInvalidToolArgumentsAtOutputLimit(t *testing.T) {

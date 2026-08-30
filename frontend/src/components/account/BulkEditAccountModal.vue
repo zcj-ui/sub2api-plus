@@ -17,8 +17,27 @@
               d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
             />
           </svg>
-          {{ t('admin.accounts.bulkEdit.selectionInfo', { count: targetMode === 'filtered' ? targetPreviewCount : accountIds.length }) }}
+          {{ t(targetMode === 'filtered' ? 'admin.accounts.bulkEdit.filteredSelectionInfo' : 'admin.accounts.bulkEdit.selectionInfo', { count: targetMode === 'filtered' ? targetPreviewCount : accountIds.length }) }}
         </p>
+      </div>
+
+      <div
+        v-if="targetMode === 'filtered'"
+        class="rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-700 dark:bg-amber-900/20"
+        data-testid="bulk-edit-filtered-warning"
+      >
+        <p class="text-sm font-medium text-amber-800 dark:text-amber-200">
+          {{ t('admin.accounts.bulkEdit.filteredScopeWarning', { count: targetPreviewCount }) }}
+        </p>
+        <label class="mt-3 flex items-start gap-2 text-sm text-amber-800 dark:text-amber-200">
+          <input
+            v-model="filteredScopeConfirmed"
+            type="checkbox"
+            data-testid="bulk-edit-filtered-confirm"
+            class="mt-0.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+          />
+          <span>{{ t('admin.accounts.bulkEdit.filteredScopeConfirm') }}</span>
+        </label>
       </div>
 
       <!-- Mixed platform warning -->
@@ -993,6 +1012,35 @@
         </div>
       </div>
 
+      <!-- OpenAI OAuth account-level User-Agent override -->
+      <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <div class="mb-3 flex items-center justify-between gap-4">
+          <div class="flex-1 pr-4">
+            <label class="input-label mb-0" for="bulk-edit-openai-user-agent-enabled">
+              {{ t('admin.accounts.openai.customUserAgent') }}
+            </label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.openai.customUserAgentDesc') }}
+            </p>
+          </div>
+          <input
+            id="bulk-edit-openai-user-agent-enabled"
+            v-model="enableOpenAIUserAgent"
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+        <input
+          v-model="openAIUserAgent"
+          type="text"
+          maxlength="512"
+          class="input"
+          data-testid="bulk-edit-openai-user-agent-input"
+          :disabled="!enableOpenAIUserAgent"
+          :placeholder="t('admin.accounts.openai.customUserAgentPlaceholder')"
+        />
+      </div>
+
       <!-- 奸商模式（严格仅 OpenAI OAuth） -->
       <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
@@ -1127,7 +1175,7 @@
                 :disabled="!enableOpenAIEndpointCapabilities"
                 class="rounded border-gray-300 text-primary-600 focus:ring-primary-500 dark:border-dark-500"
                 :data-testid="`bulk-edit-openai-endpoint-capability-${option.value}`"
-                :checked="openAIEndpointCapabilities.includes(option.value)"
+                :checked="option.value === 'prompt_cache_retention' ? openAIPromptCacheRetentionSupported : openAIEndpointCapabilities.includes(option.value)"
                 @change="toggleOpenAIEndpointCapability(option.value, $event)"
               />
               <span class="text-gray-700 dark:text-gray-200">{{ option.label }}</span>
@@ -1530,6 +1578,7 @@
 
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
+import { applyUserAgent } from '@/components/account/credentialsBuilder'
 import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 import { adminAPI } from '@/api/admin'
@@ -1734,6 +1783,7 @@ const enableCodexCLIOnly = ref(false)
 const enableCodexCLIOnlyAppServer = ref(false)
 const enableCodexFingerprintMode = ref(false)
 const enableCodex429Guard = ref(false)
+const enableOpenAIUserAgent = ref(false)
 const enableAllowOverages = ref(false)
 const enableOpenAICompactMode = ref(false)
 const enableOpenAICompactModelMapping = ref(false)
@@ -1744,6 +1794,7 @@ const submitting = ref(false)
 const showMixedChannelWarning = ref(false)
 const mixedChannelWarningMessage = ref('')
 const pendingUpdatesForConfirm = ref<Record<string, unknown> | null>(null)
+const filteredScopeConfirmed = ref(false)
 const baseUrl = ref('')
 const modelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const allowedModels = ref<string[]>([])
@@ -1768,6 +1819,7 @@ const openAIEndpointCapabilities = ref<OpenAIEndpointCapability[]>([
   'chat_completions',
   'embeddings'
 ])
+const openAIPromptCacheRetentionSupported = ref(false)
 const openAIResponsesMode = ref<OpenAIResponsesMode>('auto')
 const openaiOAuthResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
 const openaiAPIKeyResponsesWebSocketV2Mode = ref<OpenAIWSMode>(OPENAI_WS_MODE_OFF)
@@ -1777,6 +1829,7 @@ const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
 const codex429GuardEnabled = ref(false)
+const openAIUserAgent = ref('')
 const allowOveragesEnabled = ref(false)
 
 const handleBulkAllowOveragesChange = (enabled: boolean) => {
@@ -1865,7 +1918,8 @@ const openAIEndpointCapabilityOptions = computed<
   Array<{ value: OpenAIEndpointCapability; label: string }>
 >(() => [
   { value: 'chat_completions', label: openAITextEndpointCapabilityLabel.value },
-  { value: 'embeddings', label: t('admin.accounts.openai.capabilityEmbeddings') }
+  { value: 'embeddings', label: t('admin.accounts.openai.capabilityEmbeddings') },
+  { value: 'prompt_cache_retention', label: t('admin.accounts.openai.capabilityPromptCacheRetention') }
 ])
 const openAITextGenerationCapabilityEnabled = computed(() =>
   openAIEndpointCapabilities.value.includes('chat_completions')
@@ -1877,13 +1931,17 @@ const openAIResponsesModeApplicable = computed(
 const normalizeOpenAIEndpointCapabilities = (values: OpenAIEndpointCapability[]) => {
   const allowed: OpenAIEndpointCapability[] = ['chat_completions', 'embeddings']
   const selected = allowed.filter((value) => values.includes(value))
-  return selected.length > 0 ? selected : allowed
+  return selected.length > 0 ? selected : allowed.slice(0, 2)
 }
 
 const toggleOpenAIEndpointCapability = (
   capability: OpenAIEndpointCapability,
   event?: Event
 ) => {
+  if (capability === 'prompt_cache_retention') {
+    openAIPromptCacheRetentionSupported.value = !openAIPromptCacheRetentionSupported.value
+    return
+  }
   if (openAIEndpointCapabilities.value.includes(capability)) {
     if (openAIEndpointCapabilities.value.length <= 1) {
       const input = event?.target as HTMLInputElement | null
@@ -2075,9 +2133,10 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
 
   if (applyOpenAIEndpointCapabilities) {
     credentials.openai_capabilities =
-      openAIEndpointCapabilities.value.length === 2
+      openAIEndpointCapabilities.value.length === 2 &&
+      !openAIPromptCacheRetentionSupported.value
         ? null
-        : [...openAIEndpointCapabilities.value]
+        : [...openAIEndpointCapabilities.value, ...(openAIPromptCacheRetentionSupported.value ? ['prompt_cache_retention'] : [])]
     credentialsChanged = true
   }
 
@@ -2174,6 +2233,12 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     extra.codex_fingerprint_mode = codexFingerprintMode.value
   }
 
+  if (enableOpenAIUserAgent.value && allOpenAIOAuthOnly.value) {
+    if (openAIUserAgent.value.trim()) applyUserAgent(credentials, openAIUserAgent.value)
+    else credentials.user_agent = null
+    credentialsChanged = true
+  }
+
   if (enableCodex429Guard.value && allOpenAIOAuthOnly.value) {
     const extra = ensureExtra()
     extra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
@@ -2246,6 +2311,7 @@ const handleClose = () => {
   mixedChannelWarningMessage.value = ''
   pendingUpdatesForConfirm.value = null
   mixedChannelConfirmed.value = false
+  filteredScopeConfirmed.value = false
   emit('close')
 }
 
@@ -2274,6 +2340,10 @@ const preCheckMixedChannelRisk = async (built: Record<string, unknown>): Promise
 const handleSubmit = async () => {
   if (targetMode.value === 'selected' && props.accountIds.length === 0) {
     appStore.showError(t('admin.accounts.bulkEdit.noSelection'))
+    return
+  }
+  if (targetMode.value === 'filtered' && !filteredScopeConfirmed.value) {
+    appStore.showError(t('admin.accounts.bulkEdit.filteredScopeConfirmRequired'))
     return
   }
 
@@ -2457,6 +2527,8 @@ watch(
       codexFingerprintMode.value = 'off'
       enableCodex429Guard.value = false
       codex429GuardEnabled.value = false
+      enableOpenAIUserAgent.value = false
+      openAIUserAgent.value = ''
       enableAllowOverages.value = false
       allowOveragesEnabled.value = false
       enableOpenAICompactMode.value = false
@@ -2469,6 +2541,7 @@ watch(
       openaiFlattenNamespacesEnabled.value = false
       openAILongContextBillingEnabled.value = false
       openAIEndpointCapabilities.value = ['chat_completions', 'embeddings']
+      openAIPromptCacheRetentionSupported.value = false
       openAIResponsesMode.value = 'auto'
       modelRestrictionMode.value = 'whitelist'
       allowedModels.value = []
@@ -2503,7 +2576,12 @@ watch(
       mixedChannelWarningMessage.value = ''
       pendingUpdatesForConfirm.value = null
       mixedChannelConfirmed.value = false
+      filteredScopeConfirmed.value = false
     }
   }
 )
+
+watch(targetMode, () => {
+  filteredScopeConfirmed.value = false
+})
 </script>

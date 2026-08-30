@@ -544,7 +544,7 @@ func TestOAuthService_RefreshAccountToken_WithProxy(t *testing.T) {
 
 	client := &mockClaudeOAuthClient{
 		refreshTokenFunc: func(ctx context.Context, refreshToken, proxyURL string) (*oauth.TokenResponse, error) {
-				if proxyURL != "socks5h://user:pass@socks.example.com:1080" {
+			if proxyURL != "socks5h://user:pass@socks.example.com:1080" {
 				t.Errorf("proxyURL 不匹配: got=%q", proxyURL)
 			}
 			return &oauth.TokenResponse{

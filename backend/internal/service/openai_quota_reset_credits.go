@@ -3,9 +3,16 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
+
+// The reset-credit endpoint normally returns only a handful of records.  A
+// hard cap prevents an upstream/relay response from turning the parser into an
+// unbounded allocation or from presenting more consumable candidates than the
+// automatic reset workflow can safely reason about.
+const openAIQuotaMaxResetCreditEntries = 64
 
 type openAIRateLimitResetCreditDetailPayload struct {
 	ID                   string `json:"id,omitempty"`
@@ -48,6 +55,16 @@ type openAIAutoResetCreditCandidate struct {
 }
 
 func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCreditDetails, error) {
+	// Bound the raw payload before trimming.  An oversized whitespace-only body
+	// would otherwise collapse to an empty slice and bypass the limit while
+	// still consuming the full allocation from the upstream response.
+	if int64(len(body)) > openAIQuotaMaxResponseBodyBytes {
+		return openAIRateLimitResetCreditDetails{}, fmt.Errorf(
+			"%w: limit=%d",
+			ErrOpenAIQuotaResponseBodyTooLarge,
+			openAIQuotaMaxResponseBodyBytes,
+		)
+	}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
 		return openAIRateLimitResetCreditDetails{}, nil
@@ -85,6 +102,13 @@ func parseOpenAIRateLimitResetCreditDetails(body []byte) (openAIRateLimitResetCr
 				ApplicableAvailableCount: applicableAvailableCount,
 			}, err
 		}
+	}
+	if len(rawCredits) > openAIQuotaMaxResetCreditEntries {
+		return openAIRateLimitResetCreditDetails{
+			AvailableCount:           availableCount,
+			ApplicableAvailableCount: applicableAvailableCount,
+			CreditListPresent:        creditListPresent,
+		}, fmt.Errorf("%w: max=%d", ErrOpenAIQuotaResetCreditEntriesTooMany, openAIQuotaMaxResetCreditEntries)
 	}
 
 	credits := make([]OpenAIRateLimitResetCreditDetail, 0, len(rawCredits))

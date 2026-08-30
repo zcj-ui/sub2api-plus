@@ -12,6 +12,7 @@ const (
 	modelRateLimitsKey                 = "model_rate_limits"
 	antigravityGeminiModelRateLimitKey = "antigravity:gemini"
 	openAIImageGenerationRateLimitKey  = "openai:image_generation"
+	openAICodexSparkRateLimitReason    = "openai_codex_spark_rate_limit"
 	// anthropicFableRateLimitKey 是 Anthropic 7d_oi（Fable 专属 7d 窗口）限流的
 	// 家族级 scope：命中后所有 Fable 变体（含 [1m] 等后缀）都不再调度到该账号。
 	anthropicFableRateLimitKey = "claude-fable-5"
@@ -67,6 +68,15 @@ func (a *Account) modelRateLimitKeysForRequest(ctx context.Context, requestedMod
 	}
 
 	modelKey := a.GetMappedModel(requestedModel)
+	// Legacy /responses/compact may apply a dedicated compact_model_mapping.
+	// Model-level cooldowns are stored against the actual upstream model, so use
+	// the same mapping chain as compact dispatch instead of accidentally checking
+	// only the ordinary alias.
+	if a.Platform == PlatformOpenAI && openAICompactSchedulingFromContext(ctx) {
+		if compactModel := resolveOpenAIAccountUpstreamModelForRequest(a, requestedModel, true); strings.TrimSpace(compactModel) != "" {
+			modelKey = compactModel
+		}
+	}
 	if a.Platform == PlatformAntigravity {
 		modelKey = resolveFinalAntigravityModelKey(ctx, a, requestedModel)
 	}

@@ -3,9 +3,10 @@ import { flushPromises, mount } from '@vue/test-utils'
 import OpenAIQuotaResetCell from '../OpenAIQuotaResetCell.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import type { Account } from '@/types'
-import { refreshOpenAIQuota, resetOpenAIQuota } from '@/api/admin/accounts'
+import { getById, refreshOpenAIQuota, resetOpenAIQuota } from '@/api/admin/accounts'
 
 vi.mock('@/api/admin/accounts', () => ({
+  getById: vi.fn(),
   refreshOpenAIQuota: vi.fn(),
   resetOpenAIQuota: vi.fn(),
 }))
@@ -62,6 +63,7 @@ const resetButton = (wrapper: ReturnType<typeof mount>) =>
 beforeEach(() => {
   vi.mocked(refreshOpenAIQuota).mockReset()
   vi.mocked(resetOpenAIQuota).mockReset()
+  vi.mocked(getById).mockReset()
 })
 
 describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
@@ -88,6 +90,44 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
     wrapper.unmount()
   })
 
+  it('显示 Team/K12 workspace spend-control 快照', () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_spend_control_snapshot: {
+          reached: false,
+          individual_limit: {
+            limit: '1000',
+            used: '250',
+            remaining_percent: 75,
+          },
+        },
+      },
+    })
+
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+    const spend = wrapper.find('[data-testid="codex-spend-control"]')
+    expect(spend.exists()).toBe(true)
+    expect(spend.text()).toContain('250 / 1000')
+    expect(spend.text()).toContain('(25%)')
+    wrapper.unmount()
+  })
+
+  it('没有 individual_limit 时仍显示 spend-control 已达到提示', () => {
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_spend_control_snapshot: { reached: true },
+      },
+    })
+
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+    const spend = wrapper.find('[data-testid="codex-spend-control"]')
+    expect(spend.exists()).toBe(true)
+    expect(spend.text()).toContain('admin.accounts.openaiQuotaReset.spendControlReached')
+    wrapper.unmount()
+  })
+
   it('查询后用最新 wham credits 替换缓存余额', async () => {
     vi.mocked(refreshOpenAIQuota).mockResolvedValue({
       credits: {
@@ -101,6 +141,18 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
       cache_persisted: true,
     })
     const account = makeAccount({ parent_account_id: null })
+    const refreshedAccount = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_credit_snapshot: {
+          balance: '25.5000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+        },
+      },
+    })
+    vi.mocked(getById).mockResolvedValue(refreshedAccount)
     const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
 
     await wrapper.findAll('button')[0].trigger('click')
@@ -109,6 +161,146 @@ describe('OpenAIQuotaResetCell — 外审 F6:影子禁用重置', () => {
     const balance = wrapper.find('[data-testid="codex-credit-balance"]')
     expect(balance.text()).toContain('25.5000000000 Credit')
     expect(balance.text()).toContain('≈ $1.02')
+    expect(getById).toHaveBeenCalledWith(1)
+    expect(wrapper.emitted('account-updated')).toEqual([[refreshedAccount]])
+    wrapper.unmount()
+  })
+
+  it('部分缓存写入失败时仍同步父级账号，并保留实时查询结果', async () => {
+    vi.mocked(refreshOpenAIQuota).mockResolvedValue({
+      credits: { balance: '12.5000000000', has_credits: true, unlimited: false, overage_limit_reached: false },
+      rate_limit_reset_credits: { available_count: 0, credits: [] },
+      fetched_at: 1770000000,
+      cache_persisted: false,
+    })
+    const refreshedAccount = makeAccount({ parent_account_id: null })
+    vi.mocked(getById).mockResolvedValue(refreshedAccount)
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account: makeAccount({ parent_account_id: null }) } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').text()).toContain('12.5000000000 Credit')
+    expect(getById).toHaveBeenCalledWith(1)
+    expect(wrapper.emitted('account-updated')).toEqual([[refreshedAccount]])
+    wrapper.unmount()
+  })
+
+  it('实时查询明确返回 credits:null 时不回退旧的 Credit 快照', async () => {
+    vi.mocked(refreshOpenAIQuota).mockResolvedValue({
+      credits: null,
+      rate_limit_reset_credits: { available_count: 0, credits: [] },
+      spend_control: null,
+      fetched_at: 1770000000,
+      cache_persisted: true,
+    })
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_credit_snapshot: {
+          balance: '1000.0000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+        },
+      },
+    })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('实时查询明确返回 spend_control:null 时不回退旧的工作区快照', async () => {
+    vi.mocked(refreshOpenAIQuota).mockResolvedValue({
+      credits: null,
+      spend_control: null,
+      rate_limit_reset_credits: { available_count: 0, credits: [] },
+      fetched_at: 1770000000,
+      cache_persisted: true,
+    })
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_spend_control_snapshot: {
+          reached: false,
+          individual_limit: { limit: '1000', used: '250', remaining_percent: 75 },
+        },
+      },
+    })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+
+    await wrapper.findAll('button')[0].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="codex-spend-control"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('父行刷新同一账户时不会用旧 cachedData 复活 live null 结果', async () => {
+    vi.mocked(refreshOpenAIQuota)
+      .mockResolvedValueOnce({
+        credits: {
+          balance: '100.0000000000',
+          has_credits: true,
+          unlimited: false,
+          overage_limit_reached: false,
+        },
+        rate_limit_reset_credits: {
+          available_count: 1,
+          credits: [{ expires_at: FUTURE_EXPIRY_EARLY }],
+        },
+        fetched_at: 1770000000,
+        cache_persisted: true,
+      })
+      .mockResolvedValueOnce({
+        credits: null,
+        spend_control: null,
+        rate_limit_reset_credits: { available_count: 0, credits: [] },
+        fetched_at: 1770000001,
+        cache_persisted: false,
+      })
+
+    const account = makeAccount({
+      parent_account_id: null,
+      extra: {
+        codex_reset_credit_snapshot: {
+          available_count: 1,
+          credits: [{ expires_at: FUTURE_EXPIRY_EARLY }],
+        },
+      },
+    })
+    const wrapper = mount(OpenAIQuotaResetCell, { props: { account } })
+    const queryButton = () => wrapper.findAll('button')[0]
+
+    await queryButton().trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').text()).toContain('100.0000000000 Credit')
+
+    await queryButton().trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').exists()).toBe(false)
+
+    // Simulate the parent list receiving a newer account row. The extra
+    // watcher must not replace the authoritative live-null result with the
+    // first query's cachedData.
+    await wrapper.setProps({
+      account: {
+        ...account,
+        extra: {
+          ...account.extra,
+          codex_reset_credit_snapshot: {
+            available_count: 0,
+            credits: [],
+          },
+        },
+      },
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="codex-credit-balance"]').exists()).toBe(false)
     wrapper.unmount()
   })
 

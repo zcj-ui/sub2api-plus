@@ -81,6 +81,26 @@
     </div>
 
     <div
+      v-if="spendControlDisplay || spendControlReached"
+      data-testid="codex-spend-control"
+      class="flex flex-wrap items-center gap-1 text-[10px] tabular-nums"
+      :title="t('admin.accounts.openaiQuotaReset.spendControlHint')"
+    >
+      <span class="font-medium text-indigo-700 dark:text-indigo-300">
+        {{ t('admin.accounts.openaiQuotaReset.spendControl') }} {{ spendControlDisplay }}
+      </span>
+      <span v-if="spendControlPercent !== ''" class="text-gray-500 dark:text-gray-400">
+        ({{ spendControlPercent }}%)
+      </span>
+      <span
+        v-if="spendControlReached"
+        class="font-medium text-red-600 dark:text-red-400"
+      >
+        {{ t('admin.accounts.openaiQuotaReset.spendControlReached') }}
+      </span>
+    </div>
+
+    <div
       v-if="autoResetState"
       class="flex flex-wrap items-center gap-1 text-[10px]"
       data-testid="auto-reset-credit-state"
@@ -181,10 +201,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { Account } from '@/types'
 import {
+  getById,
   refreshOpenAIQuota,
   resetOpenAIQuota,
   type OpenAIQuotaUsage,
@@ -210,10 +231,19 @@ const resetting = ref(false)
 const error = ref<string | null>(null)
 const data = ref<OpenAIQuotaUsage | null>(null)
 const cachedData = ref<OpenAIQuotaUsage | null>(null)
+// `data` also stores the locally rehydrated reset-credit snapshot, so its
+// presence does not prove that `/wham/usage` has been queried. Keep an
+// explicit marker so a successful live response with `credits: null` or
+// `spend_control: null` can clear an older persisted display.
+const liveQuotaResponseReceived = ref(false)
 const resetMessage = ref<string | null>(null)
 const resetWarning = ref<string | null>(null)
 const showResetConfirm = ref(false)
 const showResetCreditDetails = ref(false)
+let componentActive = true
+onUnmounted(() => {
+  componentActive = false
+})
 
 type AutoResetCreditState = NonNullable<NonNullable<Account['extra']>['codex_auto_reset_credit_state']>
 const validAutoResetStatuses = new Set(['checking', 'available', 'resetting', 'success', 'no_credit', 'failed'])
@@ -317,11 +347,18 @@ const applicableResetCount = computed(() => {
     : credits.available_count
 })
 const cachedCreditSnapshot = computed(() => props.account.extra?.codex_credit_snapshot)
-const creditSnapshot = computed(() =>
-  isShadow.value ? null : (data.value?.credits ?? cachedCreditSnapshot.value ?? null)
-)
+const creditSnapshot = computed(() => {
+  if (isShadow.value) return null
+  // Once a live response has arrived, its nullable field is authoritative:
+  // do not resurrect a stale account snapshot with `??`.
+  if (liveQuotaResponseReceived.value) return data.value?.credits ?? null
+  return data.value?.credits ?? cachedCreditSnapshot.value ?? null
+})
 const creditBalanceDisplay = computed(() => {
   const balance = creditSnapshot.value?.balance
+  if (typeof balance === 'number') {
+    return Number.isFinite(balance) ? String(balance) : ''
+  }
   return typeof balance === 'string' && balance.trim() !== '' ? balance.trim() : ''
 })
 const creditUsdReference = computed(() => {
@@ -330,6 +367,37 @@ const creditUsdReference = computed(() => {
   return Number.isFinite(balance) ? (balance / 25).toFixed(2) : ''
 })
 const creditUnlimited = computed(() => creditSnapshot.value?.unlimited === true)
+
+const spendControl = computed(() => {
+  if (liveQuotaResponseReceived.value) {
+    const live = data.value?.spend_control
+    return live && typeof live === 'object' ? live : null
+  }
+  const cachedDataSpendControl = cachedData.value?.spend_control
+  if (cachedDataSpendControl && typeof cachedDataSpendControl === 'object') return cachedDataSpendControl
+  const cached = props.account.extra?.codex_spend_control_snapshot
+  return cached && typeof cached === 'object' ? cached : null
+})
+const spendControlLimit = computed(() => spendControl.value?.individual_limit ?? null)
+const spendControlDisplay = computed(() => {
+  const limit = spendControlLimit.value
+  if (!limit || typeof limit !== 'object') return ''
+  const used = typeof limit.used === 'string' ? limit.used.trim() : ''
+  const total = typeof limit.limit === 'string' ? limit.limit.trim() : ''
+  if (used && total) return `${used} / ${total}`
+  if (total) return total
+  if (used) return used
+  return ''
+})
+const spendControlPercent = computed(() => {
+  const limit = spendControlLimit.value
+  if (!limit || typeof limit !== 'object') return ''
+  const value = typeof limit.used_percent === 'number'
+    ? limit.used_percent
+    : (typeof limit.remaining_percent === 'number' ? 100 - limit.remaining_percent : NaN)
+  return Number.isFinite(value) ? Math.max(0, Math.min(100, value)).toFixed(0) : ''
+})
+const spendControlReached = computed(() => spendControl.value?.reached === true)
 // Prefer the live payload and fall back to the persisted snapshot only when the
 // live state is unknown, so the count and the expirations never come from two
 // different generations of the same data.
@@ -430,21 +498,37 @@ const toggleResetCreditDetails = () => {
 
 const handleQuery = async () => {
   if (loading.value) return
+  const accountID = props.account.id
   loading.value = true
   error.value = null
   resetMessage.value = null
   resetWarning.value = null
   showResetCreditDetails.value = false
   try {
-    const result = await refreshOpenAIQuota(props.account.id)
+    const result = await refreshOpenAIQuota(accountID)
+    if (!componentActive || props.account.id !== accountID) return
     // The upstream read succeeded even when the snapshot write was rejected, so
     // the live count is always adopted. Only the persisted view is left alone,
     // which keeps the displayed expirations consistent with what is stored.
     data.value = result
+    liveQuotaResponseReceived.value = true
     if (result.cache_persisted) {
       cachedData.value = result
     } else {
       resetWarning.value = t('admin.accounts.openaiQuotaReset.refreshCachePersistFailed')
+    }
+    // /wham/usage persists the canonical window/plan/credit snapshot in a
+    // separate step from reset-credit details.  Even a partial cache result
+    // can therefore contain fresh window data; refresh the parent row after
+    // every successful upstream query and keep the live result visible when
+    // this best-effort row refresh fails.
+    try {
+      const refreshedAccount = await getById(accountID)
+      if (componentActive && props.account.id === accountID && refreshedAccount) {
+        emit('account-updated', refreshedAccount)
+      }
+    } catch (refreshError) {
+      console.warn('Failed to refresh OpenAI account snapshot after quota query:', refreshError)
     }
   } catch (e) {
     error.value = extractErrorMessage(e)
@@ -479,11 +563,16 @@ const confirmReset = async () => {
     if (result.cache_refreshed && result.quota) {
       data.value = result.quota
       cachedData.value = result.quota
+      liveQuotaResponseReceived.value = true
     } else {
       // A credit was consumed but the post-reset count could not be read back.
       // Whatever we still hold is one generation stale, so report the count as
       // unknown instead of letting a second consumption start from stale data.
       data.value = null
+      // A successful reset invalidates the previous generation even when the
+      // follow-up quota read is unavailable. Keep stale account snapshots
+      // hidden until a fresh query is made.
+      liveQuotaResponseReceived.value = true
     }
     if (result.account) emit('account-updated', result.account)
 
@@ -511,6 +600,7 @@ watch(
     // Account row may be reused across paginated lists; reset local state.
     cachedData.value = readCachedResetCredits(props.account)
     data.value = cachedData.value
+    liveQuotaResponseReceived.value = false
     error.value = null
     resetMessage.value = null
     resetWarning.value = null
@@ -534,7 +624,10 @@ watch(
   ],
   () => {
     cachedData.value = readCachedResetCredits(props.account)
-    if (!loading.value && !resetting.value) {
+    // A live quota response (including an explicit nullable field) remains
+    // authoritative for this row. Do not replace it with an older persisted
+    // snapshot when the parent list refreshes the same account ID.
+    if (!loading.value && !resetting.value && !liveQuotaResponseReceived.value) {
       data.value = cachedData.value
     }
   },

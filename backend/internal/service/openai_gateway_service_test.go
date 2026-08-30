@@ -115,6 +115,24 @@ func (r stubOpenAIAccountRepo) ListSchedulableUngroupedByPlatform(ctx context.Co
 	return r.ListSchedulableByPlatform(ctx, platform)
 }
 
+// ListModelAvailabilityCandidates is used by the compact scheduler's
+// persistent-pool path.  The embedded interface is intentionally nil in this
+// lightweight fixture, so provide the same platform-only behavior as the
+// older list methods instead of dispatching through a nil promoted method.
+func (r stubOpenAIAccountRepo) ListModelAvailabilityCandidates(_ context.Context, _ *int64, platforms []string, _ bool) ([]Account, error) {
+	allowed := make(map[string]struct{}, len(platforms))
+	for _, platform := range platforms {
+		allowed[platform] = struct{}{}
+	}
+	result := make([]Account, 0, len(r.accounts))
+	for _, account := range r.accounts {
+		if _, ok := allowed[account.Platform]; ok {
+			result = append(result, account)
+		}
+	}
+	return result, nil
+}
+
 func TestOpenAIGatewayService_ForwardAsAnthropic_CapacityShedReturnsRequestScopedFailoverWithoutCommit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

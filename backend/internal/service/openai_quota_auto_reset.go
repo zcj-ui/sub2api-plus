@@ -565,7 +565,10 @@ func buildOpenAIAutoResetUsageUpdates(usage *OpenAIQuotaUsage, now time.Time) ma
 			return
 		}
 		used := window.UsedPercent
-		resetAfter := int(window.ResetAfterSeconds)
+		// Reuse the bounded parser used by the ordinary quota cache.  A forged
+		// reset-after value must not wrap when converted to time.Duration later
+		// in the snapshot builder.
+		resetAfter := openAIQuotaWindowResetAfterSeconds(window, now)
 		windowMinutes := int(window.LimitWindowSeconds / 60)
 		if primary {
 			snapshot.PrimaryUsedPercent = &used
@@ -583,11 +586,19 @@ func buildOpenAIAutoResetUsageUpdates(usage *OpenAIQuotaUsage, now time.Time) ma
 }
 
 func (s *OpenAIQuotaAutoResetService) persistFreshUsage(ctx context.Context, accountID int64, usage *OpenAIQuotaUsage, now time.Time) error {
+	if usage == nil {
+		return nil
+	}
 	updates := buildOpenAIAutoResetUsageUpdates(usage, now)
 	if len(updates) > 0 {
 		if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
 			return err
 		}
+	}
+	// Workspace/Team/Edu/K12 plans may omit the reset-credit envelope entirely;
+	// their usage/window snapshot is still valid and already persisted above.
+	if usage.RateLimitResetCredits == nil {
+		return nil
 	}
 	return s.quota.CacheResetCreditsSnapshot(ctx, accountID, usage.RateLimitResetCredits)
 }
@@ -637,14 +648,28 @@ func openAIAutoResetCycleSeed(usage *OpenAIQuotaUsage) string {
 	if usage == nil || usage.RateLimit == nil {
 		return "5h:0|7d:0"
 	}
+	// Preserve the existing cycle-key contract when a caller omits FetchedAt:
+	// deriving a relative reset from the wall clock in that case would make the
+	// key change on every read and could repeatedly trigger the auto-reset worker.
+	base := usage.FetchedAt
+	nowUnix := time.Now().Unix()
 	var fiveHour, sevenDay int64
 	for _, window := range []*OpenAIRateLimitWindow{usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow} {
 		if window == nil {
 			continue
 		}
 		resetAt := window.ResetAt
+		if resetAt > 0 {
+			// Do not let an implausibly distant absolute timestamp become part of
+			// the cycle key. Prefer the bounded relative value when available.
+			if resetAt > nowUnix && resetAt-nowUnix > maxCodexResetAfterSeconds {
+				resetAt = 0
+			}
+		}
 		if resetAt <= 0 {
-			resetAt = usage.FetchedAt + window.ResetAfterSeconds
+			if base > 0 && window.ResetAfterSeconds >= 0 && window.ResetAfterSeconds <= maxCodexResetAfterSeconds && base <= (int64(1<<63-1)-window.ResetAfterSeconds) {
+				resetAt = base + window.ResetAfterSeconds
+			}
 		}
 		if window.LimitWindowSeconds <= 6*60*60 {
 			fiveHour = resetAt

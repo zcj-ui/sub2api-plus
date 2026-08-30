@@ -1063,6 +1063,18 @@ export interface UpstreamBillingProbeResult {
   error?: string
 }
 
+export interface UpstreamBillingRateSnapshotItem {
+  account_id: number
+  snapshot?: UpstreamBillingProbeSnapshot | null
+}
+
+export interface UpstreamBillingRatesResponse {
+  items: UpstreamBillingRateSnapshotItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export type OllamaCloudUsageStatus = 'ok' | 'unauthorized' | 'failed'
 
 export interface OllamaCloudUsageWindow {
@@ -1139,11 +1151,24 @@ export interface Account {
       credits?: { expires_at?: string }[]
     }
     codex_credit_snapshot?: {
-      balance?: string
+      balance?: string | number
       has_credits?: boolean
       unlimited?: boolean
       overage_limit_reached?: boolean
       updated_at?: string
+    }
+    codex_spend_control_snapshot?: {
+      reached?: boolean
+      individual_limit?: {
+        source?: string
+        limit?: string
+        used?: string
+        remaining?: string
+        used_percent?: number
+        remaining_percent?: number
+        reset_after_seconds?: number
+        reset_at?: number
+      } | null
     }
     openai_codex_429_guard_enabled?: boolean
     account_health_probe?: {
@@ -1291,6 +1316,8 @@ export interface UsageProgress {
   utilization: number // Percentage (0-100+, 100 = 100%)
   resets_at: string | null
   remaining_seconds: number
+  /** Upstream rolling-window length, when available (e.g. 2592000 for free monthly). */
+  window_seconds?: number
   window_stats?: WindowStats | null // 窗口期统计（从窗口开始到当前的使用量）
   used_requests?: number
   limit_requests?: number
@@ -1348,6 +1375,7 @@ export interface GrokBillingSummary {
 export interface AccountUsageInfo {
   source?: 'passive' | 'active'
   updated_at: string | null
+  plan_type?: string
   five_hour: UsageProgress | null
   seven_day: UsageProgress | null
   seven_day_sonnet: UsageProgress | null
@@ -1425,7 +1453,7 @@ export interface CodexUsageSnapshot {
 
 export type OpenAICompactMode = 'auto' | 'force_on' | 'force_off'
 export type OpenAIResponsesMode = 'auto' | 'force_responses' | 'force_chat_completions'
-export type OpenAIEndpointCapability = 'chat_completions' | 'embeddings'
+export type OpenAIEndpointCapability = 'chat_completions' | 'embeddings' | 'prompt_cache_retention'
 
 export interface OpenAICompactState {
   openai_compact_mode?: OpenAICompactMode

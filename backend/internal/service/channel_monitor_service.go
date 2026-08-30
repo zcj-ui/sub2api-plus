@@ -432,6 +432,10 @@ func (s *ChannelMonitorService) Update(ctx context.Context, id int64, p ChannelM
 	if err != nil {
 		return nil, err
 	}
+	var previousAccountID int64
+	if existing.AccountID != nil {
+		previousAccountID = *existing.AccountID
+	}
 	if err := applyMonitorUpdate(existing, p); err != nil {
 		return nil, err
 	}
@@ -463,6 +467,15 @@ func (s *ChannelMonitorService) Update(ctx context.Context, id int64, p ChannelM
 		// Schedule 内部根据 Enabled 自动选择 Unschedule 或重建任务，
 		// IntervalSeconds 变化也会被自然吸收（旧 task 取消 + 新 task 用新 interval）。
 		s.scheduler.Schedule(existing)
+	}
+	// A monitor reassignment or mode change must not leave the old account's
+	// snapshot visible to the next query.  Invalidate both sides; the helper is
+	// nil-safe for tests/legacy wiring without a quota fetcher.
+	if s.quotaFetcher != nil {
+		s.quotaFetcher.Invalidate(previousAccountID)
+		if existing.AccountID != nil {
+			s.quotaFetcher.Invalidate(*existing.AccountID)
+		}
 	}
 	return existing, nil
 }
@@ -565,11 +578,18 @@ func (s *ChannelMonitorService) applyAPIKeyUpdate(existing *ChannelMonitor, raw 
 
 // Delete 删除监控（历史通过外键 CASCADE 自动清理）。
 func (s *ChannelMonitorService) Delete(ctx context.Context, id int64) error {
+	var accountID int64
+	if existing, getErr := s.repo.GetByID(ctx, id); getErr == nil && existing != nil && existing.AccountID != nil {
+		accountID = *existing.AccountID
+	}
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return fmt.Errorf("delete channel monitor: %w", err)
 	}
 	if s.scheduler != nil {
 		s.scheduler.Unschedule(id)
+	}
+	if s.quotaFetcher != nil {
+		s.quotaFetcher.Invalidate(accountID)
 	}
 	return nil
 }

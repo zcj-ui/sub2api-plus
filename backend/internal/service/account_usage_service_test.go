@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAccountUsageServiceProbeOpenAICodexSnapshotFailsClosedForConfiguredProxy(t *testing.T) {
@@ -93,6 +95,38 @@ func TestShouldRefreshOpenAICodexSnapshot(t *testing.T) {
 		},
 	}, usage, now) {
 		t.Fatal("expected stale ws snapshot to trigger refresh")
+	}
+	futureAt := now.Add(2 * time.Minute).Format(time.RFC3339)
+	if !shouldRefreshOpenAICodexSnapshot(&Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			"codex_usage_updated_at": futureAt,
+		},
+	}, usage, now) {
+		// A future timestamp is treated as stale; the refresh path must remain
+		// available after clock skew or imported data.
+		t.Fatal("expected future snapshot timestamp to trigger refresh")
+	}
+
+	weeklyOnly := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Extra: map[string]any{
+			OpenAIQuotaUsed5hPercentExtraKey:   nil,
+			OpenAIQuotaReset5hSecondsExtraKey:  nil,
+			OpenAIQuotaWindow5hMinutesExtraKey: nil,
+			OpenAIQuotaUsed7dPercentExtraKey:   22.0,
+			OpenAIQuotaWindow7dMinutesExtraKey: 10080,
+			"codex_usage_updated_at":           now.Format(time.RFC3339),
+			openaiQuotaCreditBalanceKey:        map[string]any{"balance": "0", "updated_at": now.Format(time.RFC3339)},
+		},
+	}
+	if shouldRefreshOpenAICodexSnapshot(weeklyOnly, &UsageInfo{
+		FiveHour: nil,
+		SevenDay: &UsageProgress{Utilization: 22, WindowSeconds: 7 * 24 * 60 * 60},
+	}, now) {
+		t.Fatal("weekly-only snapshot with a fresh 7d window should not be probed as incomplete")
 	}
 }
 
@@ -298,6 +332,26 @@ func TestAccountUsageService_OpenAIProbeAdmissionIsAtomic(t *testing.T) {
 	}
 }
 
+func TestAccountUsageService_ProbeAdmissionTreatsFutureTimestampAsStale(t *testing.T) {
+	cache := NewUsageCache()
+	svc := &AccountUsageService{cache: cache}
+	accountID := int64(714)
+	future := time.Now().Add(5 * time.Minute)
+	cache.openAIProbeCache.Store(accountID, future)
+
+	require.True(t, svc.shouldProbeOpenAICodexSnapshot(accountID, time.Now()), "future reservation must not suppress a probe")
+}
+
+func TestAccountUsageService_GrokProbeAdmissionTreatsFutureTimestampAsStale(t *testing.T) {
+	cache := NewUsageCache()
+	svc := &AccountUsageService{cache: cache}
+	accountID := int64(715)
+	future := time.Now().Add(5 * time.Minute)
+	cache.grokProbeCache.Store(accountID, future)
+
+	require.True(t, svc.shouldProbeGrokBilling(accountID, time.Now(), false), "future reservation must not suppress a Grok probe")
+}
+
 func TestAccountUsageService_GetOpenAIUsage_DoesNotPromoteCodexExtraToRateLimit(t *testing.T) {
 	t.Parallel()
 
@@ -370,6 +424,21 @@ func TestBuildCodexUsageProgressFromExtra_ZerosExpiredWindow(t *testing.T) {
 		}
 	})
 
+	t.Run("preserves upstream monthly window length", func(t *testing.T) {
+		extra := map[string]any{
+			"codex_7d_used_percent":   12.0,
+			"codex_7d_window_minutes": 43200, // 30 days
+			"codex_7d_reset_at":       now.Add(10 * 24 * time.Hour).Format(time.RFC3339),
+		}
+		progress := buildCodexUsageProgressFromExtra(extra, "7d", now)
+		if progress == nil {
+			t.Fatal("expected non-nil progress")
+		}
+		if progress.WindowSeconds != 30*24*60*60 {
+			t.Fatalf("expected monthly window seconds, got %d", progress.WindowSeconds)
+		}
+	})
+
 	t.Run("expired 7d window zeroes utilization", func(t *testing.T) {
 		extra := map[string]any{
 			"codex_7d_used_percent": 88.0,
@@ -381,6 +450,16 @@ func TestBuildCodexUsageProgressFromExtra_ZerosExpiredWindow(t *testing.T) {
 		}
 		if progress.Utilization != 0 {
 			t.Fatalf("expected Utilization=0 for expired 7d window, got %v", progress.Utilization)
+		}
+	})
+
+	t.Run("nil tombstone hides removed window", func(t *testing.T) {
+		extra := map[string]any{
+			"codex_5h_used_percent": nil,
+			"codex_5h_reset_at":     nil,
+		}
+		if progress := buildCodexUsageProgressFromExtra(extra, "5h", now); progress != nil {
+			t.Fatalf("nil quota tombstone must not render a zero-utilization window: %+v", progress)
 		}
 	})
 }

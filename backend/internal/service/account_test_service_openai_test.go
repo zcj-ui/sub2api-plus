@@ -29,8 +29,11 @@ type queuedHTTPUpstream struct {
 	tlsFlags  []bool
 }
 
-func (u *queuedHTTPUpstream) Do(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
-	return nil, fmt.Errorf("unexpected Do call")
+func (u *queuedHTTPUpstream) Do(req *http.Request, proxyURL string, accountID int64, concurrency int) (*http.Response, error) {
+	// The production test path uses ordinary Do for API-key accounts and
+	// DoWithTLS for OAuth/Codex profiles.  Record both through one queue so the
+	// fixture validates either transport without changing the account contract.
+	return u.DoWithTLS(req, proxyURL, accountID, concurrency, nil)
 }
 
 func (u *queuedHTTPUpstream) DoWithTLS(req *http.Request, proxyURL string, _ int64, _ int, profile *tlsfingerprint.Profile) (*http.Response, error) {

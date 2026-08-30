@@ -38,7 +38,7 @@ func (a *Account) IsSchedulableForModelWithContext(ctx context.Context, requeste
 	if a == nil {
 		return false
 	}
-	if !a.IsSchedulable() {
+	if !a.IsSchedulable() && !openAIImagesCanBypassThresholdPause(ctx, a) {
 		return false
 	}
 	if a.isModelRateLimitedWithContext(ctx, requestedModel) {
@@ -49,6 +49,56 @@ func (a *Account) IsSchedulableForModelWithContext(ctx context.Context, requeste
 		return false
 	}
 	return true
+}
+
+// IsSchedulableForCompactModelWithContext keeps the legacy
+// /v1/responses/compact request independent from ordinary account-wide quota
+// and 429 windows. Lifecycle, administrator schedulability, health, expiry,
+// overload, temporary blocks, and model-scoped limits still apply. The
+// scheduler performs the separate compact capability check after fresh
+// hydration so an unsupported account is reported distinctly.
+func (a *Account) IsSchedulableForCompactModelWithContext(ctx context.Context, requestedModel string) bool {
+	if a == nil || !a.IsActive() || !a.Schedulable || a.HasFailedHealthProbe() {
+		return false
+	}
+	now := time.Now()
+	if a.AutoPauseOnExpired && a.ExpiresAt != nil && !now.Before(*a.ExpiresAt) {
+		return false
+	}
+	if a.OverloadUntil != nil && now.Before(*a.OverloadUntil) {
+		return false
+	}
+	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
+		return false
+	}
+	return !a.isModelRateLimitedWithContext(ctx, requestedModel)
+}
+
+// openAIImagesCanBypassThresholdPause keeps the dedicated /v1/images/* quota
+// independent from the Codex text-window auto-pause. It deliberately accepts
+// only the threshold reason and rechecks every other account-level gate, so a
+// 401/429/transport/admin error or an expired/overloaded account remains out of
+// the image pool (#6035).
+func openAIImagesCanBypassThresholdPause(ctx context.Context, account *Account) bool {
+	if account == nil || !account.IsOpenAI() || !OpenAIImagesEndpointFromContext(ctx) ||
+		account.TempUnschedulableUntil == nil || !time.Now().Before(*account.TempUnschedulableUntil) ||
+		!IsAccountSchedulingThresholdReason(account.TempUnschedulableReason) {
+		return false
+	}
+	if !account.IsActive() || !account.Schedulable || account.HasFailedHealthProbe() {
+		return false
+	}
+	now := time.Now()
+	if account.AutoPauseOnExpired && account.ExpiresAt != nil && !now.Before(*account.ExpiresAt) {
+		return false
+	}
+	if account.OverloadUntil != nil && now.Before(*account.OverloadUntil) {
+		return false
+	}
+	if account.RateLimitResetAt != nil && now.Before(*account.RateLimitResetAt) {
+		return false
+	}
+	return !(account.IsAPIKeyOrBedrock() && account.IsQuotaExceeded())
 }
 
 // GetRateLimitRemainingTime 获取限流剩余时间（模型级限流）

@@ -104,7 +104,8 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	}
 	upstreamBody = updatedBody
 	// 计费兜底 tier = 最终出站 body（policy filter/force 后）里的 tier；
-	// 最终值由 resolvedOpenAIUpstreamServiceTier 决定（上游回显优先）。
+	// Keep outbound and observed tiers separate; usage-time billing resolves the
+	// effective tier with account protocol context.
 	serviceTier := extractOpenAIServiceTierFromBody(upstreamBody)
 	if account.Platform == PlatformGrok {
 		strippedBody, stripErr := stripRedundantGrokChatViewImageTool(upstreamBody)
@@ -286,16 +287,19 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	clientDisconnected := false
 	clientOutputStarted := false
 	pendingLines := make([]string, 0, 8)
+	var pendingLinesBytes int64
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var terminal openAIRawStreamTerminalState
 
-	writeLine := func(line string) {
+	writeLine := func(line string) error {
 		if clientDisconnected {
-			return
+			return nil
 		}
 		if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
-			pendingLines = append(pendingLines, line)
-			return
+			if err := appendOpenAIPendingSSELine(&pendingLines, &pendingLinesBytes, line, openAIFirstOutputStageMaxBytes); err != nil {
+				return err
+			}
+			return nil
 		}
 		if !clientOutputStarted {
 			writeStreamHeaders()
@@ -306,10 +310,10 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 						zap.Error(werr),
 						zap.String("request_id", requestID),
 					)
-					return
+					return nil
 				}
 			}
-			pendingLines = pendingLines[:0]
+			clearOpenAIPendingSSELines(&pendingLines, &pendingLinesBytes)
 			clientOutputStarted = true
 		}
 		if _, werr := c.Writer.WriteString(line + "\n"); werr != nil {
@@ -319,6 +323,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 				zap.String("request_id", requestID),
 			)
 		}
+		return nil
 	}
 
 	for scanner.Scan() {
@@ -342,7 +347,14 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		line = applyOllamaCloudRawChatCompletionsSSELine(account, line)
 		line = stripEmptyChatToolCallIdentityFromSSELine(line)
 
-		writeLine(line)
+		if err := writeLine(line); err != nil {
+			logger.L().Warn("openai chat_completions raw: pre-output pending buffer exceeded",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+				zap.Int64("max_bytes", openAIFirstOutputStageMaxBytes),
+			)
+			return nil, newOpenAIPreOutputBufferFailoverError(c, account, false, requestID, resp.Header)
+		}
 		if line == "" {
 			if !clientDisconnected && clientOutputStarted {
 				c.Writer.Flush()

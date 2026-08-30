@@ -570,7 +570,17 @@ func TestSettingService_InitializeDefaultSettingsPersistsConfiguredForwardedClie
 	svc := NewSettingService(repo, cfg)
 
 	require.NoError(t, svc.InitializeDefaultSettings(context.Background()))
+	require.Equal(t, "true", repo.values[SettingKeyAPIKeyACLTrustForwardedIP], "an explicit configured compatibility choice must be persisted")
 	require.JSONEq(t, `["X-Cdn-Ip","True-Client-Ip"]`, repo.values[SettingKeyForwardedClientIPHeaders])
+}
+
+func TestSettingService_InitializeDefaultSettingsUsesSecureForwardedIPDefault(t *testing.T) {
+	repo := &forwardedIPMigrationRepoStub{values: map[string]string{}}
+	svc := NewSettingService(repo, &config.Config{})
+
+	require.NoError(t, svc.InitializeDefaultSettings(context.Background()))
+	require.Equal(t, "false", repo.values[SettingKeyAPIKeyACLTrustForwardedIP])
+	require.Equal(t, "true", repo.values[settingKeyForwardedClientIPModeV2])
 }
 
 func TestSettingService_UpdateSettings_APIKeyACLTrustForwardedIPRefreshesConfig(t *testing.T) {

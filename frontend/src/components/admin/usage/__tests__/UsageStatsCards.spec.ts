@@ -64,4 +64,17 @@ describe('UsageStatsCards', () => {
     expect(text).toContain('Cache Read')
     expect(text).toContain('22')
   })
+
+  it('keeps the cache tooltip out of layout while hidden', () => {
+    const wrapper = mount(UsageStatsCards, {
+      props: { stats },
+      global: { stubs: { Icon: true } },
+    })
+
+    const tooltip = wrapper.findAll('span').find((el) => el.classes().includes('group-hover:block'))
+
+    expect(tooltip).toBeDefined()
+    expect(tooltip?.classes()).toContain('hidden')
+    expect(tooltip?.classes()).not.toContain('opacity-0')
+  })
 })

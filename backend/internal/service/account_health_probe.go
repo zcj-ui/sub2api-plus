@@ -20,6 +20,9 @@ const (
 type accountHealthProbeContextKey struct{}
 
 func withAccountHealthProbeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return context.WithValue(ctx, accountHealthProbeContextKey{}, true)
 }
 
@@ -118,7 +121,14 @@ func (s *AccountTestService) InventoryOpenAIAccount(ctx context.Context, account
 	if s != nil && result.Healthy && quota != nil {
 		if cache, ok := s.openAIQuotaService.(openAIInventoryQuotaCacheService); ok {
 			usageErr := cache.CacheUsageSnapshot(ctx, accountID, quota)
-			creditsErr := cache.CacheResetCreditsSnapshot(ctx, accountID, quota.RateLimitResetCredits)
+			// /wham/usage is allowed to omit reset-credit details (for example
+			// when the account has no reset cards or the secondary probe is
+			// temporarily unavailable).  A nil envelope means there is no
+			// reset-credit snapshot to write, not a failed quota persistence.
+			var creditsErr error
+			if quota.RateLimitResetCredits != nil {
+				creditsErr = cache.CacheResetCreditsSnapshot(ctx, accountID, quota.RateLimitResetCredits)
+			}
 			quotaPersisted = usageErr == nil && creditsErr == nil
 			if !quotaPersisted {
 				result.Reason = "quota fetched but its scheduling snapshot could not be persisted"
@@ -161,7 +171,14 @@ func sparkInventoryRateLimit(quota *OpenAIQuotaUsage) *OpenAIRateLimit {
 }
 
 func (s *AccountTestService) probeOpenAIAccountHealth(ctx context.Context, accountID int64) (AccountHealthProbeResult, *OpenAIQuotaUsage) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	result := AccountHealthProbeResult{AccountID: accountID}
+	if accountID <= 0 {
+		result.Reason = "invalid account id"
+		return result, nil
+	}
 	if s == nil || s.accountRepo == nil {
 		result.Reason = "account health service is unavailable"
 		return result, nil
@@ -252,6 +269,12 @@ func (s *AccountTestService) probeOpenAIAccountHealth(ctx context.Context, accou
 		result.Reason = truncate(strings.TrimSpace(lastErr.Error()), 240)
 		snapshot.Status = AccountHealthProbeStatusFailed
 		snapshot.Reason = result.Reason
+	} else if account.Type == AccountTypeOAuth && s.rateLimitService != nil {
+		// A successful /wham/usage probe is an authoritative healthy signal. It
+		// starts a fresh 429-confirmation generation so one old 429 followed by a
+		// healthy inventory check cannot combine with a later transient 429 and
+		// quarantine the account.
+		s.rateLimitService.clearOpenAIOAuth429StreakContext(ctx, account.ID)
 	}
 	result.Snapshot = snapshot
 	if err := s.accountRepo.UpdateExtra(ctx, account.ID, map[string]any{AccountHealthProbeExtraKey: snapshot}); err != nil {

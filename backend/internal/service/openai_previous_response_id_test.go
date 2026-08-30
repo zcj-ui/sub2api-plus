@@ -1,6 +1,11 @@
 package service
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestClassifyOpenAIPreviousResponseIDKind(t *testing.T) {
 	tests := []struct {
@@ -30,5 +35,35 @@ func TestIsOpenAIPreviousResponseIDLikelyMessageID(t *testing.T) {
 	}
 	if IsOpenAIPreviousResponseIDLikelyMessageID("resp_123") {
 		t.Fatal("expected resp_123 not to be identified as message id")
+	}
+}
+
+func TestParseOpenAIPreviousResponseIDField(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		want    string
+		wantErr string
+	}{
+		{name: "missing", body: `{}`, want: ""},
+		{name: "null", body: `{"previous_response_id":null}`, want: ""},
+		{name: "trimmed string", body: `{"previous_response_id":"  resp_abc  "}`, want: "resp_abc"},
+		{name: "number", body: `{"previous_response_id":123}`, wantErr: "string or null"},
+		{name: "object", body: `{"previous_response_id":{}}`, wantErr: "string or null"},
+		{name: "duplicate", body: `{"previous_response_id":"resp_a","previous_response_id":"resp_b"}`, wantErr: "only once"},
+		{name: "control", body: "{\"previous_response_id\":\"resp_abc" + "\n" + "\"}", wantErr: "control"},
+		{name: "oversized", body: `{"previous_response_id":"` + strings.Repeat("x", OpenAIPreviousResponseIDMaxBytes+1) + `"}`, wantErr: "at most"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseOpenAIPreviousResponseIDField([]byte(tt.body))
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
 	}
 }

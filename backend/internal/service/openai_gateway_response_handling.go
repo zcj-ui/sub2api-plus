@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -396,7 +396,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			completeGuardedEvent(true)
 		}
 		if codexFailureTerminal && sawBareError && !sawResponseFailed && bareErrorAccountSideEffectsPending {
-			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header)
+			s.handleOpenAIStreamTerminalAccountSideEffects(c, account, bareErrorPayload, failedMessage, resp.Header, mappedModel)
 			bareErrorAccountSideEffectsPending = false
 		}
 		if codexFailureTerminal && sawBareError && !sawResponseFailed && !clientDisconnected {
@@ -585,7 +585,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 						// Defer account health updates so the pair is applied once.
 						bareErrorAccountSideEffectsPending = true
 					} else {
-						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header)
+						s.handleOpenAIStreamTerminalAccountSideEffects(c, account, dataBytes, failedMessage, resp.Header, mappedModel)
 						bareErrorAccountSideEffectsPending = false
 					}
 				}
@@ -600,7 +600,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 					}
 					if shouldFailover {
 						sawFailedEvent = true
-						streamEarlyErr = s.newOpenAIStreamFailoverError(c, account, false, upstreamRequestID, dataBytes, failedMessage, resp.Header)
+						streamEarlyErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, upstreamRequestID, dataBytes, failedMessage, mappedModel, resp.Header)
 						return
 					}
 					if !cyberHit && !sawBareError {
@@ -644,7 +644,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if imageOutput, ok := extractImageGenerationOutputFromSSEData(dataBytes, streamSeenImages); ok {
 				streamImageOutputs = append(streamImageOutputs, imageOutput)
 			}
-			streamDoneItems.Observe(dataBytes)
+			// Preserve the explicit SSE event name when an upstream sends a
+			// payload without a top-level `type` field.
+			streamDoneItems.ProcessEvent(dataBytes, eventType)
 			if responsesStreamEventMayContributeToOutput(eventType) {
 				var streamEvent apicompat.ResponsesStreamEvent
 				if err := json.Unmarshal(dataBytes, &streamEvent); err == nil {
@@ -1490,6 +1492,9 @@ func (s *OpenAIGatewayService) bindHTTPResponseAccount(ctx context.Context, c *g
 	groupID := getOpenAIGroupIDFromContext(c)
 	ttl := s.openAIWSResponseStickyTTL()
 	logOpenAIWSBindResponseAccountWarn(groupID, account.ID, responseID, store.BindResponseAccount(ctx, groupID, responseID, account.ID, ttl))
+	if c == nil {
+		return
+	}
 	if rawOwner, ok := c.Get(openAIHTTPResponseOwnerContextKey); ok {
 		if owner, ok := rawOwner.(openAIHTTPResponseOwner); ok && owner.userID > 0 && owner.apiKeyID > 0 {
 			if err := s.BindOpenAIHTTPResponseOwner(ctx, groupID, responseID, owner.userID, owner.apiKeyID); err != nil {
@@ -2033,72 +2038,684 @@ func normalizeCompletedImageGenerationStatus(data []byte) ([]byte, bool) {
 	}
 }
 
-// responsesStreamOutputItems remembers the raw item carried by each
-// response.output_item.done event, keyed by output_index.
-//
-// reconstructResponseOutputFromSSE already prefers the raw done items over
-// delta accumulation when it rebuilds a buffered response, because the
-// accumulator models only "one reasoning, one message, N function calls" and
-// therefore cannot preserve item identity, per-item status/phase, ordering, or
-// item types it does not know about. The streaming path had no equivalent
-// because it never sees the whole body at once; this collector gives it one.
+// responsesStreamOutputItems remembers raw output items reported by
+// response.output_item.done.  In addition to output_index it keeps a stable
+// identity index (item id, then call id), bounded memory accounting, and an
+// overflow sentinel.  A stream can contain sparse/reordered indices and some
+// providers omit output_index entirely; retaining both forms prevents terminal
+// output reconstruction from dropping items or emitting null holes.
 type responsesStreamOutputItems struct {
-	items map[int]json.RawMessage
+	byIndex      map[int]*responsesStreamOutputItem
+	withoutIndex []*responsesStreamOutputItem
+	byIdentity   map[string]*responsesStreamOutputItem
+	totalBytes   int
+	overflowed   bool
 }
+
+// responsesDoneOutputItems is the name used by the upstream #5186 patch. Keep
+// the alias so the local responsesStreamOutputItems call sites and tests remain
+// source-compatible while allowing upstream-focused tests to be applied.
+type responsesDoneOutputItems = responsesStreamOutputItems
+
+type responsesStreamOutputItem struct {
+	raw                  json.RawMessage
+	identity             string
+	alternateIdentity    string
+	outputIndex          int
+	withoutIndexPosition int
+	hasOutputIndex       bool
+}
+
+type responsesDoneOutputItem = responsesStreamOutputItem
+
+const (
+	maxResponsesOutputIndex     = 4096
+	maxResponsesDoneOutputItems = 1024
+	maxResponsesDoneOutputBytes = 8 << 20
+)
 
 func newResponsesStreamOutputItems() *responsesStreamOutputItems {
-	return &responsesStreamOutputItems{items: make(map[int]json.RawMessage)}
+	return &responsesStreamOutputItems{
+		byIndex:    make(map[int]*responsesStreamOutputItem),
+		byIdentity: make(map[string]*responsesStreamOutputItem),
+	}
 }
 
-// Observe records the item of a response.output_item.done event verbatim. The
-// raw JSON is kept byte for byte so vendor extensions and future fields survive
-// the rebuild.
-func (r *responsesStreamOutputItems) Observe(data []byte) {
-	if r == nil || len(data) == 0 || !gjson.ValidBytes(data) {
-		return
-	}
-	if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
+func newResponsesDoneOutputItems() *responsesDoneOutputItems {
+	return newResponsesStreamOutputItems()
+}
+
+// ProcessEvent records a response.output_item.done event. The raw item is
+// preserved verbatim so vendor extensions/future fields survive terminal
+// normalization. eventType is supplied by the SSE frame parser because a few
+// upstreams put the event name on `event:` and omit it in the JSON payload.
+func (items *responsesStreamOutputItems) ProcessEvent(data []byte, eventType string) {
+	if items == nil || len(data) == 0 || strings.TrimSpace(eventType) != "response.output_item.done" {
 		return
 	}
 	item := gjson.GetBytes(data, "item")
-	if !item.Exists() || !item.IsObject() {
+	if !item.IsObject() || items.overflowed {
 		return
 	}
-	index := int(gjson.GetBytes(data, "output_index").Int())
-	r.items[index] = json.RawMessage(append([]byte(nil), item.Raw...))
+	primaryIdentity, alternateIdentity := responsesOutputItemIdentitiesResult(item)
+	entry := &responsesStreamOutputItem{
+		raw:               json.RawMessage(append([]byte(nil), item.Raw...)),
+		identity:          primaryIdentity,
+		alternateIdentity: alternateIdentity,
+	}
+	if len(entry.raw) > maxResponsesDoneOutputBytes {
+		items.discardOnOverflow()
+		return
+	}
+
+	indexResult := gjson.GetBytes(data, "output_index")
+	if !indexResult.Exists() || indexResult.Type == gjson.Null {
+		items.removeIdentity(entry.identity)
+		items.removeIdentity(entry.alternateIdentity)
+		if !items.reserve(entry.raw, 0) {
+			return
+		}
+		entry.withoutIndexPosition = len(items.withoutIndex)
+		items.withoutIndex = append(items.withoutIndex, entry)
+		items.indexIdentity(entry)
+		items.totalBytes += len(entry.raw)
+		return
+	}
+	index, ok := validResponsesOutputIndex(indexResult)
+	if !ok {
+		return
+	}
+	items.removeIdentity(entry.identity)
+	items.removeIdentity(entry.alternateIdentity)
+	if previous := items.byIndex[index]; previous != nil {
+		items.remove(previous)
+	}
+	if !items.reserve(entry.raw, 0) {
+		return
+	}
+	entry.outputIndex = index
+	entry.hasOutputIndex = true
+	items.byIndex[index] = entry
+	items.indexIdentity(entry)
+	items.totalBytes += len(entry.raw)
 }
 
-func (r *responsesStreamOutputItems) HasItems() bool {
-	return r != nil && len(r.items) > 0
+// Observe is retained for existing callers/tests that pass a complete event
+// payload with its type embedded in the JSON.
+func (items *responsesStreamOutputItems) Observe(data []byte) {
+	if len(data) == 0 || !gjson.ValidBytes(data) {
+		return
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(data, "type").String())
+	items.ProcessEvent(data, eventType)
+}
+
+func (items *responsesStreamOutputItems) reserve(item json.RawMessage, replacedBytes int) bool {
+	count := len(items.byIndex) + len(items.withoutIndex)
+	if (replacedBytes == 0 && count >= maxResponsesDoneOutputItems) ||
+		items.totalBytes-replacedBytes+len(item) > maxResponsesDoneOutputBytes {
+		items.discardOnOverflow()
+		return false
+	}
+	return true
+}
+
+func (items *responsesStreamOutputItems) discardOnOverflow() {
+	items.byIndex = make(map[int]*responsesStreamOutputItem)
+	items.withoutIndex = nil
+	items.byIdentity = make(map[string]*responsesStreamOutputItem)
+	items.totalBytes = 0
+	items.overflowed = true
+}
+
+func (items *responsesStreamOutputItems) removeIdentity(identity string) {
+	if items == nil || identity == "" {
+		return
+	}
+	if entry := items.byIdentity[identity]; entry != nil {
+		items.remove(entry)
+	}
+}
+
+func (items *responsesStreamOutputItems) indexIdentity(entry *responsesStreamOutputItem) {
+	if items == nil || entry == nil {
+		return
+	}
+	if entry.identity != "" {
+		items.byIdentity[entry.identity] = entry
+	}
+	if entry.alternateIdentity != "" {
+		items.byIdentity[entry.alternateIdentity] = entry
+	}
+}
+
+func (items *responsesStreamOutputItems) remove(entry *responsesStreamOutputItem) {
+	if items == nil || entry == nil {
+		return
+	}
+	if entry.identity != "" && items.byIdentity[entry.identity] == entry {
+		delete(items.byIdentity, entry.identity)
+	}
+	if entry.alternateIdentity != "" && items.byIdentity[entry.alternateIdentity] == entry {
+		delete(items.byIdentity, entry.alternateIdentity)
+	}
+	if entry.hasOutputIndex {
+		if items.byIndex[entry.outputIndex] == entry {
+			delete(items.byIndex, entry.outputIndex)
+		}
+	} else {
+		position := entry.withoutIndexPosition
+		last := len(items.withoutIndex) - 1
+		if position >= 0 && position <= last && items.withoutIndex[position] == entry {
+			if position != last {
+				moved := items.withoutIndex[last]
+				items.withoutIndex[position] = moved
+				moved.withoutIndexPosition = position
+			}
+			items.withoutIndex = items.withoutIndex[:last]
+		}
+	}
+	items.totalBytes -= len(entry.raw)
+}
+
+func validResponsesOutputIndex(result gjson.Result) (int, bool) {
+	if result.Type != gjson.Number {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(result.Raw, 10, strconv.IntSize)
+	if err != nil || value > maxResponsesOutputIndex {
+		return 0, false
+	}
+	return int(value), true
+}
+
+func (items *responsesStreamOutputItems) HasItems() bool {
+	return items != nil && len(items.byIndex)+len(items.withoutIndex) > 0
+}
+
+func (items *responsesStreamOutputItems) HasContent() bool {
+	return items != nil && !items.overflowed && items.HasItems()
 }
 
 // Count reports how many distinct output items the stream reported as done.
-func (r *responsesStreamOutputItems) Count() int {
-	if r == nil {
+func (items *responsesStreamOutputItems) Count() int {
+	if items == nil {
 		return 0
 	}
-	return len(r.items)
+	return len(items.byIndex) + len(items.withoutIndex)
 }
 
-// BuildOutput returns the remembered items ordered by output_index.
-func (r *responsesStreamOutputItems) BuildOutput() ([]byte, bool) {
-	if !r.HasItems() {
+// BuildOutput returns remembered items ordered by output_index, followed by
+// items that had no index. Sparse indices are compacted to avoid null entries.
+func (items *responsesStreamOutputItems) BuildOutput() ([]byte, bool) {
+	if !items.HasContent() {
 		return nil, false
 	}
-	indexes := make([]int, 0, len(r.items))
-	for index := range r.items {
-		indexes = append(indexes, index)
+	merged := make([]json.RawMessage, 0, items.Count())
+	for index := 0; index <= maxResponsesOutputIndex; index++ {
+		if entry := items.byIndex[index]; entry != nil {
+			merged = append(merged, entry.raw)
+		}
 	}
-	sort.Ints(indexes)
-	ordered := make([]json.RawMessage, 0, len(indexes))
-	for _, index := range indexes {
-		ordered = append(ordered, r.items[index])
+	for _, entry := range items.withoutIndex {
+		merged = append(merged, entry.raw)
 	}
-	encoded, err := json.Marshal(ordered)
+	encoded, err := json.Marshal(merged)
 	if err != nil {
 		return nil, false
 	}
 	return encoded, true
+}
+
+// MergeTerminalOutput merges raw output_item.done records into a terminal
+// response. Matching is identity-first and preserves terminal fields; fields
+// present only on the done item (for example id/status/annotations or opaque
+// encrypted_content) are filled in without destroying vendor extensions from
+// the terminal payload. All operations use identity maps rather than repeated
+// scans, keeping the hot path linear in the number of output items.
+func (items *responsesStreamOutputItems) MergeTerminalOutput(output gjson.Result, fallback []byte) ([]byte, bool) {
+	if (items == nil || !items.HasContent()) && len(fallback) == 0 {
+		return nil, false
+	}
+	type positionedOutputItem struct {
+		raw               json.RawMessage
+		identity          string
+		alternateIdentity string
+	}
+	positioned := make(map[int]positionedOutputItem)
+	terminalByIdentity := make(map[string]int)
+	lookupTerminalIdentity := func(primary, alternate string) (int, bool) {
+		if primary != "" {
+			if index, found := terminalByIdentity[primary]; found {
+				return index, true
+			}
+		}
+		if alternate != "" {
+			if index, found := terminalByIdentity[alternate]; found {
+				return index, true
+			}
+		}
+		return 0, false
+	}
+	maxPosition := -1
+	var fallbackItems []json.RawMessage
+	if output.Exists() && output.IsArray() {
+		for index, terminalItem := range output.Array() {
+			raw := json.RawMessage(terminalItem.Raw)
+			identity, alternateIdentity := responsesOutputItemIdentitiesResult(terminalItem)
+			positioned[index] = positionedOutputItem{
+				raw:               raw,
+				identity:          identity,
+				alternateIdentity: alternateIdentity,
+			}
+			if identity != "" {
+				terminalByIdentity[identity] = index
+			}
+			if alternateIdentity != "" {
+				terminalByIdentity[alternateIdentity] = index
+			}
+			maxPosition = index
+		}
+	}
+	if len(fallback) > 0 {
+		_ = json.Unmarshal(fallback, &fallbackItems)
+	}
+	if items == nil || !items.HasContent() {
+		if len(fallbackItems) == 0 {
+			return nil, false
+		}
+		encoded, err := json.Marshal(fallbackItems)
+		return encoded, err == nil
+	}
+
+	// Build a synthetic-key set once so delta-derived fallback items are not
+	// duplicated when a done event already carries the same semantic item.
+	doneSyntheticKeys := make(map[responsesSyntheticItemKey]struct{}, len(items.byIndex)+len(items.withoutIndex))
+	for index := 0; index <= maxResponsesOutputIndex; index++ {
+		entry := items.byIndex[index]
+		if entry == nil {
+			continue
+		}
+		doneItem := entry.raw
+		targetIndex := index
+		if key, ok := responsesSyntheticItemKeyFor(gjson.ParseBytes(entry.raw)); ok {
+			doneSyntheticKeys[key] = struct{}{}
+		}
+		if entry.identity != "" || entry.alternateIdentity != "" {
+			if terminalIndex, found := lookupTerminalIdentity(entry.identity, entry.alternateIdentity); found {
+				targetIndex = terminalIndex
+				doneItem = mergeMissingResponsesOutputItemFields(positioned[terminalIndex].raw, doneItem)
+			} else if existing, exists := positioned[index]; exists {
+				// An unrelated, already-completed terminal item is kept intact.
+				// Replace/repair an index only when the terminal item is visibly
+				// incomplete, or when the terminal output is shorter than the
+				// stream's done-item set and this slot is needed to recover a
+				// missing item. This avoids dropping vendor fields merely because
+				// two providers generated different ids.
+				if !responsesTerminalOutputItemNeedsRepair(existing.raw) && len(positioned) >= items.Count() {
+					continue
+				}
+				doneItem = mergeResponsesTerminalOutputItemRepair(existing.raw, doneItem)
+			}
+		} else if existing, exists := positioned[index]; exists {
+			if !responsesTerminalOutputItemNeedsRepair(existing.raw) && len(positioned) >= items.Count() {
+				continue
+			}
+			doneItem = mergeResponsesTerminalOutputItemRepair(existing.raw, doneItem)
+		}
+		if previous, exists := positioned[targetIndex]; exists {
+			if previous.identity != "" && terminalByIdentity[previous.identity] == targetIndex && previous.identity != entry.identity {
+				delete(terminalByIdentity, previous.identity)
+			}
+			if previous.alternateIdentity != "" && terminalByIdentity[previous.alternateIdentity] == targetIndex && previous.alternateIdentity != entry.alternateIdentity {
+				delete(terminalByIdentity, previous.alternateIdentity)
+			}
+		}
+		positioned[targetIndex] = positionedOutputItem{
+			raw:               doneItem,
+			identity:          entry.identity,
+			alternateIdentity: entry.alternateIdentity,
+		}
+		if entry.identity != "" {
+			terminalByIdentity[entry.identity] = targetIndex
+		}
+		if entry.alternateIdentity != "" {
+			terminalByIdentity[entry.alternateIdentity] = targetIndex
+		}
+		if targetIndex > maxPosition {
+			maxPosition = targetIndex
+		}
+	}
+	consumedWithoutIndex := make(map[*responsesStreamOutputItem]struct{}, len(items.withoutIndex))
+	for _, entry := range items.withoutIndex {
+		if key, ok := responsesSyntheticItemKeyFor(gjson.ParseBytes(entry.raw)); ok {
+			doneSyntheticKeys[key] = struct{}{}
+		}
+		if entry.identity != "" || entry.alternateIdentity != "" {
+			if terminalIndex, found := lookupTerminalIdentity(entry.identity, entry.alternateIdentity); found {
+				previous := positioned[terminalIndex]
+				if previous.identity != "" && terminalByIdentity[previous.identity] == terminalIndex && previous.identity != entry.identity {
+					delete(terminalByIdentity, previous.identity)
+				}
+				if previous.alternateIdentity != "" && terminalByIdentity[previous.alternateIdentity] == terminalIndex && previous.alternateIdentity != entry.alternateIdentity {
+					delete(terminalByIdentity, previous.alternateIdentity)
+				}
+				positioned[terminalIndex] = positionedOutputItem{
+					// Without an output_index the identity is the only stable
+					// ordering key; the latest done item is authoritative. Keep
+					// terminal-only extension fields while allowing lifecycle fields
+					// (status/arguments/etc.) from the done event to win.
+					raw:               mergeResponsesOutputItemDoneAuthoritative(positioned[terminalIndex].raw, entry.raw),
+					identity:          entry.identity,
+					alternateIdentity: entry.alternateIdentity,
+				}
+				if entry.identity != "" {
+					terminalByIdentity[entry.identity] = terminalIndex
+				}
+				if entry.alternateIdentity != "" {
+					terminalByIdentity[entry.alternateIdentity] = terminalIndex
+				}
+				consumedWithoutIndex[entry] = struct{}{}
+				continue
+			}
+		}
+	}
+	nextFallbackPosition := 0
+	for _, fallbackItem := range fallbackItems {
+		fallbackParsed := gjson.ParseBytes(fallbackItem)
+		if key, ok := responsesSyntheticItemKeyFor(fallbackParsed); ok {
+			if _, represented := doneSyntheticKeys[key]; represented {
+				continue
+			}
+		}
+		for {
+			if _, occupied := positioned[nextFallbackPosition]; !occupied {
+				break
+			}
+			nextFallbackPosition++
+		}
+		fallbackIdentity, fallbackAlternateIdentity := responsesOutputItemIdentitiesResult(fallbackParsed)
+		positioned[nextFallbackPosition] = positionedOutputItem{
+			raw:               fallbackItem,
+			identity:          fallbackIdentity,
+			alternateIdentity: fallbackAlternateIdentity,
+		}
+		if nextFallbackPosition > maxPosition {
+			maxPosition = nextFallbackPosition
+		}
+		nextFallbackPosition++
+	}
+
+	merged := make([]json.RawMessage, 0, len(positioned)+len(items.withoutIndex))
+	mergedByIdentity := make(map[string]int, 2*(len(positioned)+len(items.withoutIndex)))
+	mergedPrimary := make([]string, 0, len(positioned)+len(items.withoutIndex))
+	appendItem := func(item positionedOutputItem) {
+		// Prefer an exact item id over a call_id alias.  Providers can reuse a
+		// call_id while regenerating item ids; allowing the later alias match to
+		// overwrite an exact-id item silently swaps output items in the terminal
+		// array (and was the source of #5186-style duplicate/misaligned calls).
+		if item.identity != "" {
+			if index, found := mergedByIdentity[item.identity]; found {
+				merged[index] = item.raw
+				if index >= 0 && index < len(mergedPrimary) {
+					mergedPrimary[index] = item.identity
+				}
+				if item.alternateIdentity != "" {
+					mergedByIdentity[item.alternateIdentity] = index
+				}
+				return
+			}
+		}
+		if item.alternateIdentity != "" {
+			if index, found := mergedByIdentity[item.alternateIdentity]; found {
+				existingPrimary := ""
+				if index >= 0 && index < len(mergedPrimary) {
+					existingPrimary = mergedPrimary[index]
+				}
+				if existingPrimary == "" || item.identity == "" || existingPrimary == item.identity {
+					merged[index] = item.raw
+					if item.identity != "" {
+						mergedByIdentity[item.identity] = index
+						if index >= 0 && index < len(mergedPrimary) {
+							mergedPrimary[index] = item.identity
+						}
+					}
+					return
+				}
+				// The alias belongs to a different exact-id item. Keep this item in
+				// its own slot, but do not register the conflicting call_id so it
+				// cannot overwrite the exact-id entry on a later append.
+				item.alternateIdentity = ""
+			}
+		}
+		index := len(merged)
+		if item.identity != "" {
+			mergedByIdentity[item.identity] = index
+		}
+		if item.alternateIdentity != "" {
+			mergedByIdentity[item.alternateIdentity] = index
+		}
+		merged = append(merged, item.raw)
+		mergedPrimary = append(mergedPrimary, item.identity)
+	}
+	for index := 0; index <= maxPosition; index++ {
+		if item, exists := positioned[index]; exists {
+			appendItem(item)
+		}
+	}
+	for _, entry := range items.withoutIndex {
+		if _, consumed := consumedWithoutIndex[entry]; consumed {
+			continue
+		}
+		appendItem(positionedOutputItem{raw: entry.raw, identity: entry.identity, alternateIdentity: entry.alternateIdentity})
+	}
+	encoded, err := json.Marshal(merged)
+	return encoded, err == nil
+}
+
+type responsesSyntheticItemKey struct {
+	itemType  string
+	primary   string
+	secondary string
+}
+
+func responsesSyntheticItemKeyFor(item gjson.Result) (responsesSyntheticItemKey, bool) {
+	itemType := strings.TrimSpace(item.Get("type").String())
+	switch itemType {
+	case "message":
+		text := responsesItemText(item, "content")
+		if text == "" {
+			return responsesSyntheticItemKey{}, false
+		}
+		return responsesSyntheticItemKey{itemType: itemType, primary: item.Get("role").String(), secondary: text}, true
+	case "reasoning":
+		text := responsesItemText(item, "summary")
+		if text == "" {
+			return responsesSyntheticItemKey{}, false
+		}
+		return responsesSyntheticItemKey{itemType: itemType, primary: text}, true
+	case "image_generation_call":
+		result := item.Get("result").String()
+		if result == "" {
+			return responsesSyntheticItemKey{}, false
+		}
+		return responsesSyntheticItemKey{itemType: itemType, primary: result, secondary: item.Get("output_format").String()}, true
+	default:
+		return responsesSyntheticItemKey{}, false
+	}
+}
+
+func mergeMissingResponsesOutputItemFields(terminal, done json.RawMessage) json.RawMessage {
+	return mergeResponsesJSONFields(terminal, done, false, 0)
+}
+
+const maxResponsesOutputMergeDepth = 32
+
+// mergeResponsesJSONFields recursively fills fields missing from the terminal
+// item (including nested content/summary parts). When doneWins is true, the
+// done payload wins on overlapping scalar fields while terminal-only/vendor
+// fields are still retained. The depth cap keeps malformed deeply nested
+// provider payloads from turning stream normalization into unbounded recursion.
+func mergeResponsesJSONFields(terminal, done json.RawMessage, doneWins bool, depth int) json.RawMessage {
+	terminal = bytes.TrimSpace(terminal)
+	done = bytes.TrimSpace(done)
+	if len(terminal) == 0 || bytes.Equal(terminal, []byte("null")) {
+		return append([]byte(nil), done...)
+	}
+	if len(done) == 0 || bytes.Equal(done, []byte("null")) {
+		return append([]byte(nil), terminal...)
+	}
+	if depth >= maxResponsesOutputMergeDepth {
+		if doneWins {
+			return append([]byte(nil), done...)
+		}
+		return append([]byte(nil), terminal...)
+	}
+
+	var terminalFields, doneFields map[string]json.RawMessage
+	if json.Unmarshal(terminal, &terminalFields) == nil && json.Unmarshal(done, &doneFields) == nil && terminalFields != nil && doneFields != nil {
+		mergedFields := make(map[string]json.RawMessage, len(terminalFields)+len(doneFields))
+		for field, value := range terminalFields {
+			mergedFields[field] = append([]byte(nil), value...)
+		}
+		for field, doneValue := range doneFields {
+			if terminalValue, exists := mergedFields[field]; exists {
+				mergedFields[field] = mergeResponsesJSONFields(terminalValue, doneValue, doneWins, depth+1)
+			} else {
+				mergedFields[field] = append([]byte(nil), doneValue...)
+			}
+		}
+		if encoded, err := json.Marshal(mergedFields); err == nil {
+			return encoded
+		}
+	}
+
+	var terminalItems, doneItems []json.RawMessage
+	if json.Unmarshal(terminal, &terminalItems) == nil && json.Unmarshal(done, &doneItems) == nil && terminalItems != nil && doneItems != nil {
+		length := len(terminalItems)
+		if len(doneItems) > length {
+			length = len(doneItems)
+		}
+		mergedItems := make([]json.RawMessage, length)
+		for i := 0; i < length; i++ {
+			switch {
+			case i >= len(terminalItems):
+				mergedItems[i] = append([]byte(nil), doneItems[i]...)
+			case i >= len(doneItems):
+				mergedItems[i] = append([]byte(nil), terminalItems[i]...)
+			default:
+				mergedItems[i] = mergeResponsesJSONFields(terminalItems[i], doneItems[i], doneWins, depth+1)
+			}
+		}
+		if encoded, err := json.Marshal(mergedItems); err == nil {
+			return encoded
+		}
+	}
+
+	if doneWins {
+		return append([]byte(nil), done...)
+	}
+	return append([]byte(nil), terminal...)
+}
+
+// responsesTerminalOutputItemNeedsRepair reports whether a terminal item is
+// still in a partial lifecycle. A completed item with a different provider id
+// is left authoritative; replacing it solely by output_index can discard
+// vendor fields that are absent from the done event.
+func responsesTerminalOutputItemNeedsRepair(raw json.RawMessage) bool {
+	item := gjson.ParseBytes(raw)
+	if !item.IsObject() {
+		return true
+	}
+	// Responses output items are identified by `id`; a terminal payload that
+	// omits it cannot be safely correlated with the streamed done item even when
+	// its status already says completed.
+	if strings.TrimSpace(item.Get("id").String()) == "" {
+		return true
+	}
+	status := strings.TrimSpace(item.Get("status").String())
+	return status == "" || status != "completed"
+}
+
+// mergeResponsesTerminalOutputItemRepair repairs an incomplete terminal slot
+// while retaining terminal-only/vendor fields. Lifecycle identity fields are
+// taken from the done item so a fabricated/missing terminal id is corrected.
+func mergeResponsesTerminalOutputItemRepair(terminal, done json.RawMessage) json.RawMessage {
+	merged := mergeMissingResponsesOutputItemFields(terminal, done)
+	var mergedFields, doneFields map[string]json.RawMessage
+	if json.Unmarshal(merged, &mergedFields) != nil || json.Unmarshal(done, &doneFields) != nil {
+		return done
+	}
+	for _, field := range []string{"id", "type", "status", "role", "call_id", "name"} {
+		if value, exists := doneFields[field]; exists {
+			mergedFields[field] = value
+		}
+	}
+	encoded, err := json.Marshal(mergedFields)
+	if err != nil {
+		return done
+	}
+	return encoded
+}
+
+// mergeResponsesOutputItemDoneAuthoritative is used when an output item has no
+// reliable output_index. Identity is then the only correlation key, so the
+// latest done payload wins on overlapping fields while terminal-only extension
+// fields remain available to strict clients.
+func mergeResponsesOutputItemDoneAuthoritative(terminal, done json.RawMessage) json.RawMessage {
+	return mergeResponsesJSONFields(terminal, done, true, 0)
+}
+
+func responsesItemText(item gjson.Result, path string) string {
+	var text strings.Builder
+	for _, part := range item.Get(path).Array() {
+		_, _ = text.WriteString(part.Get("text").String())
+	}
+	return text.String()
+}
+
+func responsesOutputItemIdentity(item json.RawMessage) string {
+	return responsesOutputItemIdentityResult(gjson.ParseBytes(item))
+}
+
+func responsesOutputItemIdentityResult(parsed gjson.Result) string {
+	primary, _ := responsesOutputItemIdentitiesResult(parsed)
+	return primary
+}
+
+// responsesOutputItemIdentitiesResult returns the preferred item identity and
+// an optional secondary call_id identity. Providers sometimes regenerate an
+// item's id between output_item.done and the terminal response while retaining
+// call_id; the secondary key lets the merge correlate those records without
+// weakening the exact-id-first rule.
+func responsesOutputItemIdentitiesResult(parsed gjson.Result) (string, string) {
+	callID := ""
+	if rawCallID := strings.TrimSpace(parsed.Get("call_id").String()); rawCallID != "" {
+		callID = "call_id:" + rawCallID
+	}
+	if id := strings.TrimSpace(parsed.Get("id").String()); id != "" {
+		return "id:" + id, callID
+	}
+	if callID != "" {
+		return callID, ""
+	}
+	return "", ""
+}
+
+func appendResponsesOutputItem(output []json.RawMessage, item json.RawMessage) []json.RawMessage {
+	primary, alternate := responsesOutputItemIdentitiesResult(gjson.ParseBytes(item))
+	if primary == "" && alternate == "" {
+		return append(output, item)
+	}
+	for index, candidate := range output {
+		candidatePrimary, candidateAlternate := responsesOutputItemIdentitiesResult(gjson.ParseBytes(candidate))
+		if (primary != "" && (primary == candidatePrimary || primary == candidateAlternate)) ||
+			(alternate != "" && (alternate == candidatePrimary || alternate == candidateAlternate)) {
+			output[index] = item
+			return output
+		}
+	}
+	return append(output, item)
 }
 
 func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.BufferedResponseAccumulator, doneItems *responsesStreamOutputItems, imageOutputs []json.RawMessage) ([]byte, bool) {
@@ -2110,35 +2727,40 @@ func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.Buffe
 	}
 
 	output := gjson.GetBytes(data, "response.output")
-	hasAccumulatedOutput := (acc != nil && acc.HasContent()) || len(imageOutputs) > 0 || doneItems.HasItems()
+	hasAccumulatedOutput := (acc != nil && acc.HasContent()) || doneItems.HasContent() || len(imageOutputs) > 0
 	if output.Exists() && output.IsArray() {
-		terminalCount := len(output.Array())
-		// A terminal output carrying at least as many items as the stream
-		// reported is left untouched. Carrying fewer means the terminal
-		// dropped items the stream already reported as done, and those
-		// reported items are the authoritative record of the turn.
-		if terminalCount > 0 && terminalCount >= doneItems.Count() {
+		if len(output.Array()) > 0 && !doneItems.HasContent() {
 			return data, false
 		}
-		if terminalCount == 0 && !hasAccumulatedOutput {
+		if len(output.Array()) == 0 && !hasAccumulatedOutput {
 			return data, false
 		}
 	}
 
 	outputJSON := []byte("[]")
-	// Same precedence as reconstructResponseOutputFromSSE: the items the stream
-	// actually reported win over anything rebuilt from deltas. Image generation
-	// items arrive as done events too, so imageOutputs would duplicate them here.
-	if reconstructed, ok := doneItems.BuildOutput(); ok {
+	fallback, _ := buildResponsesOutputJSON(acc, imageOutputs)
+	if reconstructed, ok := doneItems.MergeTerminalOutput(output, fallback); ok {
 		outputJSON = reconstructed
-	} else if reconstructed, ok := buildResponsesOutputJSON(acc, imageOutputs); ok {
-		outputJSON = reconstructed
+	} else if len(fallback) > 0 {
+		outputJSON = fallback
+	}
+	if output.Exists() && output.IsArray() && jsonValuesEqual(outputJSON, []byte(output.Raw)) {
+		return data, false
 	}
 	updated, err := sjson.SetRawBytes(data, "response.output", outputJSON)
 	if err != nil {
 		return data, false
 	}
 	return updated, true
+}
+
+func jsonValuesEqual(left, right []byte) bool {
+	var leftValue any
+	var rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func responsesStreamEventMayContributeToOutput(eventType string) bool {

@@ -19,8 +19,49 @@ func setupAccountListRouter() (*gin.Engine, *stubAdminService) {
 	adminSvc := newStubAdminService()
 	handler := NewAccountHandler(adminSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	router.GET("/api/v1/admin/accounts", handler.List)
+	router.GET("/api/v1/admin/accounts/upstream-billing-rates", handler.GetUpstreamBillingRates)
 	router.GET("/api/v1/admin/accounts/health-probe-failures", handler.ListHealthProbeFailures)
 	return router, adminSvc
+}
+
+func TestAccountHandlerUpstreamBillingRatesReturnsCompactETaggedSnapshot(t *testing.T) {
+	router, adminSvc := setupAccountListRouter()
+	adminSvc.accounts = []service.Account{
+		{ID: 11, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey, Extra: map[string]any{
+			service.UpstreamBillingProbeExtraKey: map[string]any{
+				"status": "ok",
+				"data":   map[string]any{"effective_rate_multiplier": 0.065},
+			},
+		}},
+		{ID: 12, Platform: service.PlatformOpenAI, Type: service.AccountTypeOAuth, Credentials: map[string]any{"api_key": "secret"}},
+	}
+
+	first := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/upstream-billing-rates?page=1&page_size=20&platform=openai&sort_by=name&sort_order=asc", nil)
+	router.ServeHTTP(first, request)
+	require.Equal(t, http.StatusOK, first.Code)
+	require.NotEmpty(t, first.Header().Get("ETag"))
+	require.Equal(t, "openai", adminSvc.lastListAccounts.platform)
+
+	var payload struct {
+		Data struct {
+			Items []service.UpstreamBillingRateSnapshotItem `json:"items"`
+			Total int64                                     `json:"total"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(first.Body.Bytes(), &payload))
+	require.Equal(t, int64(2), payload.Data.Total)
+	require.Len(t, payload.Data.Items, 2)
+	require.NotNil(t, payload.Data.Items[0].Snapshot)
+	require.Nil(t, payload.Data.Items[1].Snapshot)
+	require.NotContains(t, first.Body.String(), "secret")
+
+	second := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/upstream-billing-rates?page=1&page_size=20&platform=openai&sort_by=name&sort_order=asc", nil)
+	request.Header.Set("If-None-Match", first.Header().Get("ETag"))
+	router.ServeHTTP(second, request)
+	require.Equal(t, http.StatusNotModified, second.Code)
+	require.Empty(t, second.Body.Bytes())
 }
 
 func TestAccountHandlerListHealthProbeFailuresReturnsAllPersistedFailures(t *testing.T) {

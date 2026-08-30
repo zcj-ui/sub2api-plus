@@ -76,6 +76,12 @@ const (
 	defaultOpenAIHTTP2FallbackErrorThreshold = 2
 	defaultOpenAIHTTP2FallbackWindow         = 60 * time.Second
 	defaultOpenAIHTTP2FallbackTTL            = 10 * time.Minute
+	// A fallback state is tiny, but proxy keys can be supplied by many
+	// accounts over the lifetime of a process.  Cleanup is intentionally
+	// bounded: a new key scans at most this many existing entries for expired
+	// states.  Active cooldowns are never evicted, so this is a soft bound and
+	// cannot change failover semantics under load.
+	openAIHTTP2FallbackCleanupScanLimit = 64
 	// OpenAI HTTP/2 连接健康探测：Codex 上游改走 HTTP/2 后，池化连接被代理/NAT
 	// 静默掐断会成为“死连接”（两端都以为存活），请求落上去会挂到 TCP 重传超时
 	// （分钟级）。Go 的 http2.Transport 默认 ReadIdleTimeout=0（不发健康 PING），
@@ -139,6 +145,11 @@ type openAIHTTP2FallbackState struct {
 	lastFailureAt time.Time
 	errorCount    int
 	fallbackUntil time.Time
+	// generation changes whenever the state is cleared or a new failure is
+	// observed.  Lazy map cleanup uses it as a compare token so an older
+	// expiry observation cannot remove a state that has since become active.
+	generation  uint64
+	lastTouched time.Time
 }
 
 // httpUpstreamService 通用 HTTP 上游服务
@@ -163,7 +174,11 @@ type httpUpstreamService struct {
 	mu      sync.RWMutex                    // 保护 clients map 的读写锁
 	clients map[string]*upstreamClientEntry // 客户端缓存池，key 由隔离策略决定
 	// OpenAI 走 HTTP/HTTPS 代理时的 H2->H1 回退状态（key=标准化 proxyKey）
-	openAIHTTP2Fallbacks sync.Map
+	// The map lock serializes state lookup/removal with failure updates.  This
+	// is deliberately separate from the client-pool lock: protocol selection
+	// must never hold the client lock while touching fallback state.
+	openAIHTTP2FallbackMu sync.Mutex
+	openAIHTTP2Fallbacks  sync.Map
 }
 
 // NewHTTPUpstream 创建通用 HTTP 上游服务
@@ -271,7 +286,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	}
 	proxyInfo := "direct"
 	if proxyURL != "" {
-		proxyInfo = proxyURL
+		proxyInfo = redactProxyURLForLog(proxyURL)
 	}
 	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
 
@@ -287,8 +302,10 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
+	requestStartedAt := time.Now()
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
+		s.recordOpenAIHTTP2Failure(upstreamProfile, entry.protocolMode, entry.proxyKey, err)
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		slog.Debug("tls_fingerprint_request_failed", "account_id", accountID, "error", err)
@@ -297,10 +314,22 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	decompressResponseBody(resp)
 
-	resp.Body = wrapTrackedBody(resp.Body, func() {
-		atomic.AddInt64(&entry.inFlight, -1)
-		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
-	})
+	// TLS-fingerprinted OpenAI requests can still negotiate HTTP/2. Track the
+	// complete body lifecycle just like Do so a mid-stream H2 reset contributes
+	// to the proxy fallback circuit instead of being mistaken for a 2xx success.
+	resp.Body = wrapTrackedBodyWithOutcome(
+		resp.Body,
+		func() {
+			atomic.AddInt64(&entry.inFlight, -1)
+			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+		},
+		func() {
+			s.recordOpenAIHTTP2Success(upstreamProfile, entry.protocolMode, entry.proxyKey, requestStartedAt)
+		},
+		func(bodyErr error) {
+			s.recordOpenAIHTTP2Failure(upstreamProfile, entry.protocolMode, entry.proxyKey, bodyErr)
+		},
+	)
 
 	return resp, nil
 }
@@ -519,7 +548,7 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 			atomic.AddInt64(&entry.inFlight, 1)
 		}
 		s.mu.RUnlock()
-		slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "cache_key", cacheKey)
+		slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "proxy", redactProxyURLForLog(proxyKey))
 		return entry, nil
 	}
 	s.mu.RUnlock()
@@ -533,12 +562,12 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 				atomic.AddInt64(&entry.inFlight, 1)
 			}
 			s.mu.Unlock()
-			slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "cache_key", cacheKey)
+			slog.Debug("tls_fingerprint_reusing_client", "account_id", accountID, "proxy", redactProxyURLForLog(proxyKey))
 			return entry, nil
 		}
 		slog.Debug("tls_fingerprint_evicting_stale_client",
 			"account_id", accountID,
-			"cache_key", cacheKey,
+			"proxy", redactProxyURLForLog(proxyKey),
 			"proxy_changed", entry.proxyKey != proxyKey,
 			"pool_changed", entry.poolKey != poolKey)
 		s.removeClientLocked(cacheKey, entry)
@@ -556,7 +585,10 @@ func (s *httpUpstreamService) getClientEntryWithTLS(proxyURL string, accountID i
 	}
 
 	// 创建带 TLS 指纹的 Transport
-	slog.Debug("tls_fingerprint_creating_new_client", "account_id", accountID, "cache_key", cacheKey, "proxy", proxyKey)
+	// cacheKey contains the credential-bearing proxy identity and must never be
+	// emitted verbatim.  Keep the cache key internal while exposing only a
+	// redacted endpoint for diagnostics.
+	slog.Debug("tls_fingerprint_creating_new_client", "account_id", accountID, "proxy", redactProxyURLForLog(proxyKey))
 	transport, err := buildUpstreamTransportWithTLSFingerprint(settings, parsedProxy, profile)
 	if err != nil {
 		s.mu.Unlock()
@@ -1024,25 +1056,96 @@ func (s *httpUpstreamService) resolveProtocolMode(profile service.HTTPUpstreamPr
 }
 
 func (s *httpUpstreamService) isOpenAIHTTP2FallbackActive(proxyKey string) bool {
+	if s == nil {
+		return false
+	}
+	settings := s.resolveOpenAIHTTP2Settings()
+	now := time.Now()
+	s.openAIHTTP2FallbackMu.Lock()
+	defer s.openAIHTTP2FallbackMu.Unlock()
+
 	raw, ok := s.openAIHTTP2Fallbacks.Load(proxyKey)
 	if !ok {
 		return false
 	}
 	state, ok := raw.(*openAIHTTP2FallbackState)
 	if !ok || state == nil {
+		// Service-owned values are always *openAIHTTP2FallbackState.  Remove a
+		// stale/malformed value rather than allowing it to pin a map key forever.
+		s.openAIHTTP2Fallbacks.Delete(proxyKey)
 		return false
 	}
-	return state.isFallbackActive(time.Now())
+
+	active, empty, generation := state.expireForCleanup(now, settings.fallbackWindow)
+	if !active && empty {
+		state.compareAndDeleteAtGeneration(generation, func() {
+			s.openAIHTTP2Fallbacks.CompareAndDelete(proxyKey, state)
+		})
+	}
+	return active
 }
 
 func (s *httpUpstreamService) getOrCreateOpenAIHTTP2FallbackState(proxyKey string) *openAIHTTP2FallbackState {
-	state := &openAIHTTP2FallbackState{}
-	actual, _ := s.openAIHTTP2Fallbacks.LoadOrStore(proxyKey, state)
-	cached, ok := actual.(*openAIHTTP2FallbackState)
-	if !ok || cached == nil {
-		return state
+	if s == nil {
+		return &openAIHTTP2FallbackState{}
 	}
-	return cached
+	s.openAIHTTP2FallbackMu.Lock()
+	defer s.openAIHTTP2FallbackMu.Unlock()
+	return s.getOrCreateOpenAIHTTP2FallbackStateLocked(proxyKey)
+}
+
+// getOrCreateOpenAIHTTP2FallbackStateLocked is called with
+// openAIHTTP2FallbackMu held.  Keeping lookup and replacement under the same
+// lock as lazy deletion prevents a failure from being recorded on a state that
+// has just been removed and replaced.
+func (s *httpUpstreamService) getOrCreateOpenAIHTTP2FallbackStateLocked(proxyKey string) *openAIHTTP2FallbackState {
+	raw, ok := s.openAIHTTP2Fallbacks.Load(proxyKey)
+	if ok {
+		if cached, valid := raw.(*openAIHTTP2FallbackState); valid && cached != nil {
+			return cached
+		}
+		s.openAIHTTP2Fallbacks.Delete(proxyKey)
+	}
+	state := &openAIHTTP2FallbackState{lastTouched: time.Now()}
+	s.openAIHTTP2Fallbacks.Store(proxyKey, state)
+	return state
+}
+
+// cleanupOpenAIHTTP2FallbacksLocked performs a bounded opportunistic sweep.
+// It is called only when a new proxy key is about to be inserted, keeping the
+// normal protocol-selection path O(1).  Active cooldowns are never removed;
+// the bound therefore remains a soft bound when all entries are in use.
+func (s *httpUpstreamService) cleanupOpenAIHTTP2FallbacksLocked(now time.Time, failureWindow time.Duration) {
+	if s == nil {
+		return
+	}
+	if failureWindow <= 0 {
+		failureWindow = defaultOpenAIHTTP2FallbackWindow
+	}
+	scanned := 0
+	s.openAIHTTP2Fallbacks.Range(func(key, value any) bool {
+		if scanned >= openAIHTTP2FallbackCleanupScanLimit {
+			return false
+		}
+		scanned++
+
+		proxyKey, keyOK := key.(string)
+		state, stateOK := value.(*openAIHTTP2FallbackState)
+		if !keyOK || !stateOK || state == nil {
+			// Values outside the service's type contract are not expected in
+			// production.  Delete under the map lock so they cannot accumulate.
+			s.openAIHTTP2Fallbacks.Delete(key)
+			return true
+		}
+
+		active, empty, generation := state.expireForCleanup(now, failureWindow)
+		if !active && empty {
+			state.compareAndDeleteAtGeneration(generation, func() {
+				s.openAIHTTP2Fallbacks.CompareAndDelete(proxyKey, state)
+			})
+		}
+		return true
+	})
 }
 
 func isHTTPProxyKey(proxyKey string) bool {
@@ -1112,6 +1215,9 @@ func (s *httpUpstreamService) recordOpenAIHTTP2Failure(profile service.HTTPUpstr
 	if profile != service.HTTPUpstreamProfileOpenAI || protocolMode != upstreamProtocolModeOpenAIH2 {
 		return
 	}
+	if s == nil {
+		return
+	}
 	settings := s.resolveOpenAIHTTP2Settings()
 	if !settings.enabled || !settings.allowProxyFallbackToHTTP1 {
 		return
@@ -1119,13 +1225,42 @@ func (s *httpUpstreamService) recordOpenAIHTTP2Failure(profile service.HTTPUpstr
 	if !isHTTPProxyKey(proxyKey) || !isOpenAIHTTP2CompatibilityError(err) {
 		return
 	}
-	state := s.getOrCreateOpenAIHTTP2FallbackState(proxyKey)
-	activated, until := state.recordFailure(time.Now(), settings.fallbackErrorThreshold, settings.fallbackWindow, settings.fallbackTTL)
+
+	now := time.Now()
+	s.openAIHTTP2FallbackMu.Lock()
+	// Only a miss performs the bounded opportunistic sweep.  Existing keys are
+	// handled by the O(1) state operation below, so hot failure paths do not
+	// repeatedly scan unrelated proxies.
+	if _, exists := s.openAIHTTP2Fallbacks.Load(proxyKey); !exists {
+		s.cleanupOpenAIHTTP2FallbacksLocked(now, settings.fallbackWindow)
+	}
+	state := s.getOrCreateOpenAIHTTP2FallbackStateLocked(proxyKey)
+	activated, until := state.recordFailure(now, settings.fallbackErrorThreshold, settings.fallbackWindow, settings.fallbackTTL)
+	s.openAIHTTP2FallbackMu.Unlock()
+
 	if activated {
 		slog.Warn("openai_http2_proxy_fallback_activated",
-			"proxy", proxyKey,
+			"proxy", redactProxyURLForLog(proxyKey),
 			"fallback_until", until.Format(time.RFC3339))
 	}
+}
+
+// redactProxyURLForLog returns a stable endpoint-only representation.  Proxy
+// credentials are intentionally retained in cache keys and transport setup,
+// but must never appear in logs (including H2 fallback diagnostics).
+func redactProxyURLForLog(raw string) string {
+	_, parsed, err := proxyurl.Parse(raw)
+	if err != nil {
+		return "<invalid-proxy>"
+	}
+	if parsed == nil {
+		return directProxyKey
+	}
+	// url.URL.Redacted masks only the password and still leaves the username;
+	// proxy usernames are frequently credentials too.  Drop the entire userinfo
+	// component before rendering diagnostics so neither half can leak.
+	parsed.User = nil
+	return parsed.String()
 }
 
 func (s *httpUpstreamService) recordOpenAIHTTP2Success(
@@ -1140,42 +1275,144 @@ func (s *httpUpstreamService) recordOpenAIHTTP2Success(
 	if !isHTTPProxyKey(proxyKey) {
 		return
 	}
+	if s == nil {
+		return
+	}
+	settings := s.resolveOpenAIHTTP2Settings()
+	s.openAIHTTP2FallbackMu.Lock()
+	defer s.openAIHTTP2FallbackMu.Unlock()
+
 	raw, ok := s.openAIHTTP2Fallbacks.Load(proxyKey)
 	if !ok {
 		return
 	}
 	state, ok := raw.(*openAIHTTP2FallbackState)
 	if !ok || state == nil {
+		s.openAIHTTP2Fallbacks.Delete(proxyKey)
 		return
 	}
 	state.resetErrorWindow(requestStartedAt)
+	_, empty, generation := state.expireForCleanup(time.Now(), settings.fallbackWindow)
+	if empty {
+		state.compareAndDeleteAtGeneration(generation, func() {
+			s.openAIHTTP2Fallbacks.CompareAndDelete(proxyKey, state)
+		})
+	}
+}
+
+// emptyLocked reports whether the state has no information that can affect
+// protocol selection.  The caller must hold s.mu.
+func (s *openAIHTTP2FallbackState) emptyLocked() bool {
+	return s == nil ||
+		(s.windowStart.IsZero() &&
+			s.lastFailureAt.IsZero() &&
+			s.errorCount == 0 &&
+			s.fallbackUntil.IsZero())
+}
+
+// expireForCleanup performs the small, request-path cleanup needed for one
+// proxy key.  It intentionally does not sweep the whole map.  A state in an
+// active cooldown is left untouched; only an expired cooldown or an expired
+// sub-threshold failure window is cleared.  The returned generation is a
+// compare token for a subsequent conditional map delete.
+func (s *openAIHTTP2FallbackState) expireForCleanup(now time.Time, failureWindow time.Duration) (active, empty bool, generation uint64) {
+	if s == nil {
+		return false, true, 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.fallbackUntil.IsZero() && now.Before(s.fallbackUntil) {
+		// Touch active entries so a bounded opportunistic sweep can distinguish
+		// live state from abandoned state without evicting the cooldown.
+		s.lastTouched = now
+		return true, false, s.generation
+	}
+
+	changed := false
+	if !s.fallbackUntil.IsZero() {
+		s.fallbackUntil = time.Time{}
+		changed = true
+	}
+
+	// A state that has not tripped the circuit is useful only inside its
+	// failure window.  Once that window has elapsed, drop all historical
+	// markers so the map entry can be reclaimed.
+	if !s.windowStart.IsZero() && failureWindow > 0 && now.Sub(s.windowStart) > failureWindow {
+		s.windowStart = time.Time{}
+		s.lastFailureAt = time.Time{}
+		s.errorCount = 0
+		changed = true
+	} else if s.windowStart.IsZero() && s.errorCount != 0 {
+		// Defensive repair for partially initialized/legacy state values.
+		s.errorCount = 0
+		changed = true
+	}
+
+	// lastFailureAt is retained while a cooldown is active so an older
+	// successful request cannot erase a newer failure.  After the cooldown (or
+	// an ordinary window) is gone, it is only historical metadata.
+	if s.fallbackUntil.IsZero() && s.windowStart.IsZero() && s.errorCount == 0 && !s.lastFailureAt.IsZero() {
+		s.lastFailureAt = time.Time{}
+		changed = true
+	}
+	if changed {
+		s.generation++
+	}
+	s.lastTouched = now
+	return false, s.emptyLocked(), s.generation
+}
+
+// compareAndDeleteAtGeneration executes deleteFn while holding the state
+// mutex, after checking that the state is still empty and has the generation
+// observed by expireForCleanup.  Keeping the state lock across the conditional
+// map delete closes the small race where a failure could otherwise be recorded
+// between the compare and sync.Map.CompareAndDelete.
+func (s *openAIHTTP2FallbackState) compareAndDeleteAtGeneration(expected uint64, deleteFn func()) bool {
+	if s == nil || deleteFn == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation != expected || !s.emptyLocked() {
+		return false
+	}
+	deleteFn()
+	return true
 }
 
 func (s *openAIHTTP2FallbackState) isFallbackActive(now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.fallbackUntil.IsZero() {
-		return false
-	}
-	if now.Before(s.fallbackUntil) {
-		return true
-	}
-	s.fallbackUntil = time.Time{}
-	return false
+	active, _, _ := s.expireForCleanup(now, 0)
+	return active
 }
 
 func (s *openAIHTTP2FallbackState) resetErrorWindow(requestStartedAt time.Time) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.lastFailureAt.IsZero() && requestStartedAt.Before(s.lastFailureAt) {
 		return
 	}
+	changed := !s.windowStart.IsZero() || !s.lastFailureAt.IsZero() || s.errorCount != 0
 	s.windowStart = time.Time{}
 	s.lastFailureAt = time.Time{}
 	s.errorCount = 0
+	if changed {
+		s.generation++
+	}
+	s.lastTouched = time.Now()
 }
 
 func (s *openAIHTTP2FallbackState) recordFailure(now time.Time, threshold int, window, ttl time.Duration) (bool, time.Time) {
+	if s == nil {
+		return false, time.Time{}
+	}
 	if threshold <= 0 {
 		threshold = defaultOpenAIHTTP2FallbackErrorThreshold
 	}
@@ -1189,6 +1426,10 @@ func (s *openAIHTTP2FallbackState) recordFailure(now time.Time, threshold int, w
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Every accepted failure advances the generation, including failures while
+	// a cooldown is active.  This invalidates an in-flight cleanup observation.
+	s.generation++
+	s.lastTouched = now
 	if !s.fallbackUntil.IsZero() && now.Before(s.fallbackUntil) {
 		return false, s.fallbackUntil
 	}

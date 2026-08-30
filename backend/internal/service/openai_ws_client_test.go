@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,6 +112,74 @@ func TestCoderOpenAIWSClientDialer_ProxyTransportTLSHandshakeTimeout(t *testing.
 	require.True(t, ok)
 	require.NotNil(t, transport)
 	require.Equal(t, 10*time.Second, transport.TLSHandshakeTimeout)
+}
+
+func TestCoderOpenAIWSClientDialer_SOCKS5UsesContextDialer(t *testing.T) {
+	dialer := newDefaultOpenAIWSClientDialer()
+	impl, ok := dialer.(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+
+	client, err := impl.proxyHTTPClient("socks5://127.0.0.1:1080")
+	require.NoError(t, err)
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Nil(t, transport.Proxy, "SOCKS5 must not be assigned to Transport.Proxy")
+	require.NotNil(t, transport.DialContext, "SOCKS5 must use the shared context-aware dialer")
+
+	impl.proxyMu.Lock()
+	_, canonicalExists := impl.proxyClients["socks5h://127.0.0.1:1080"]
+	impl.proxyMu.Unlock()
+	require.True(t, canonicalExists, "socks5 aliases should share a canonical cache key")
+}
+
+func TestCoderOpenAIWSClientDialer_UnsupportedProxySchemeFailsClosed(t *testing.T) {
+	dialer := newDefaultOpenAIWSClientDialer()
+	impl, ok := dialer.(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+
+	_, err := impl.proxyHTTPClient("ftp://127.0.0.1:21")
+	require.Error(t, err)
+	impl.proxyMu.Lock()
+	cacheSize := len(impl.proxyClients)
+	impl.proxyMu.Unlock()
+	require.Zero(t, cacheSize, "invalid proxy must not be cached or downgraded to direct")
+}
+
+func TestCoderOpenAIWSClientDialer_PreservesFailedHandshakeHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-codex-primary-used-percent", "100")
+		w.Header().Set("x-codex-primary-reset-after-seconds", "60")
+		w.Header().Set("x-codex-primary-window-minutes", "300")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer server.Close()
+
+	dialer, ok := newDefaultOpenAIWSClientDialer().(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	_, status, headers, err := dialer.Dial(context.Background(), wsURL, nil, "")
+	require.Error(t, err)
+	require.Equal(t, http.StatusTooManyRequests, status)
+	require.Equal(t, "100", headers.Get("x-codex-primary-used-percent"))
+}
+
+func TestCoderOpenAIWSClientDialer_PreservesFailedHandshakeHeadersThroughHTTPProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-codex-primary-used-percent", "100")
+		w.Header().Set("x-codex-primary-reset-after-seconds", "60")
+		w.Header().Set("x-codex-primary-window-minutes", "300")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer server.Close()
+	dialer, ok := newDefaultOpenAIWSClientDialer().(*coderOpenAIWSClientDialer)
+	require.True(t, ok)
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1)
+	_, status, headers, err := dialer.Dial(context.Background(), wsURL, nil, server.URL)
+	require.Error(t, err)
+	require.Equal(t, http.StatusTooManyRequests, status)
+	require.Equal(t, "100", headers.Get("x-codex-primary-used-percent"))
 }
 
 func TestCoderOpenAIWSClientConn_DoesNotSupportIdlePingWithoutReader(t *testing.T) {

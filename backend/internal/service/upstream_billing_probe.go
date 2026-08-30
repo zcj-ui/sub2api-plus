@@ -128,6 +128,32 @@ type UpstreamBillingProbeResult struct {
 	Error     string                        `json:"error,omitempty"`
 }
 
+// UpstreamBillingRateSnapshotItem is the compact projection used by the
+// account table's background refresh. It intentionally excludes credentials,
+// counters, and the rest of the account row.
+type UpstreamBillingRateSnapshotItem struct {
+	AccountID int64                         `json:"account_id"`
+	Snapshot  *UpstreamBillingProbeSnapshot `json:"snapshot"`
+}
+
+// BuildUpstreamBillingRateSnapshotItems projects account rows into the
+// read-only rate-refresh payload. Persisted snapshots are supported for every
+// API-key platform; OAuth rows have no upstream billing probe snapshot.
+func BuildUpstreamBillingRateSnapshotItems(accounts []Account) []UpstreamBillingRateSnapshotItem {
+	items := make([]UpstreamBillingRateSnapshotItem, 0, len(accounts))
+	for _, account := range accounts {
+		var snapshot *UpstreamBillingProbeSnapshot
+		if account.Type == AccountTypeAPIKey {
+			snapshot = decodeUpstreamBillingProbeSnapshot(account.Extra)
+		}
+		items = append(items, UpstreamBillingRateSnapshotItem{
+			AccountID: account.ID,
+			Snapshot:  snapshot,
+		})
+	}
+	return items
+}
+
 type upstreamBillingProbeResponse struct {
 	Object                  string   `json:"object"`
 	SchemaVersion           int      `json:"schema_version"`
@@ -624,7 +650,14 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		if account.Proxy.ID != *account.ProxyID {
 			return nil, ErrUpstreamBillingProbeIdentityChanged
 		}
-		proxyURL = account.Proxy.URL()
+		if account.Platform == PlatformOpenAI {
+			proxyURL, err = resolveConfiguredProxyURL(account)
+			if err != nil {
+				return s.persistProbeFailure(ctx, account, intervalMinutes, now, 0, "proxy_unavailable", 0)
+			}
+		} else {
+			proxyURL = account.Proxy.URL()
+		}
 	}
 	probeURL := buildOpenAIEndpointURL(normalizedBaseURL, "/v1/sub2api/billing")
 	probeCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)

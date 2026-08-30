@@ -98,6 +98,43 @@ func TestShouldAutoPauseOpenAIAccountByQuota_AutoResetCreditStates(t *testing.T)
 		paused, _ := shouldAutoPauseOpenAIAccountByQuota(context.Background(), account)
 		require.False(t, paused)
 	})
+
+	t.Run("专用 images 端点不受文本窗口自动暂停影响", func(t *testing.T) {
+		extra := cloneOpenAIAutoResetExtra(baseExtra)
+		// Keep the text window at the configured pause threshold while leaving
+		// the independent image capability path eligible.
+		account := &Account{ID: 5, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Extra: extra}
+		paused, _ := shouldAutoPauseOpenAIAccountByQuota(WithOpenAIImagesEndpoint(context.Background()), account)
+		require.False(t, paused)
+	})
+
+	t.Run("Responses 内嵌生图仍执行文本窗口门控", func(t *testing.T) {
+		extra := cloneOpenAIAutoResetExtra(baseExtra)
+		account := &Account{ID: 6, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Extra: extra}
+		paused, _ := shouldAutoPauseOpenAIAccountByQuota(WithOpenAIImageGenerationIntent(context.Background()), account)
+		require.True(t, paused)
+	})
+
+	t.Run("专用 images 端点可越过已持久化的文本阈值暂停", func(t *testing.T) {
+		until := time.Now().Add(time.Hour)
+		account := &Account{
+			ID:                      7,
+			Platform:                PlatformOpenAI,
+			Type:                    AccountTypeOAuth,
+			Status:                  StatusActive,
+			Schedulable:             true,
+			TempUnschedulableUntil:  &until,
+			TempUnschedulableReason: BuildAccountSchedulingThresholdReason("5h quota threshold reached"),
+			Extra:                   map[string]any{},
+		}
+		require.False(t, account.IsSchedulableForModelWithContext(context.Background(), "gpt-image-2"))
+		require.True(t, account.IsSchedulableForModelWithContext(WithOpenAIImagesEndpoint(context.Background()), "gpt-image-2"))
+
+		// A different account-level block must still win over the endpoint carveout.
+		overloadedUntil := time.Now().Add(time.Hour)
+		account.OverloadUntil = &overloadedUntil
+		require.False(t, account.IsSchedulableForModelWithContext(WithOpenAIImagesEndpoint(context.Background()), "gpt-image-2"))
+	})
 }
 
 func TestSelectOpenAIAutoResetCandidate_FailsClosed(t *testing.T) {

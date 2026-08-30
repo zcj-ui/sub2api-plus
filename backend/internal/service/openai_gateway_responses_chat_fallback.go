@@ -14,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"go.uber.org/zap"
 )
@@ -103,9 +104,9 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 		}
 		return nil, err
 	}
-	// 计费兜底 tier = 最终出站 body（policy filter/force 后）里的 tier；最终值由
-	// resolvedOpenAIUpstreamServiceTier 决定（上游回显优先）。filter 删掉字段后
-	// 这里取到 nil，不再按原请求 Fast 计费。
+	// Keep the final outbound tier for usage-time reconciliation. The observed
+	// response tier is recorded separately so private Codex responses that echo
+	// "default" do not erase an effective Fast request.
 	serviceTier := extractOpenAIServiceTierFromBody(chatBody)
 
 	logger.L().Debug("openai responses: forwarding via raw chat completions",
@@ -137,12 +138,12 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 	}
 
 	if compactRequest {
-		return s.bufferCompatCompactAsResponses(c, resp, originalModel, compactClientStream, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		return s.bufferCompatCompactAsResponses(ctx, c, account, resp, originalModel, compactClientStream, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
 	if clientStream {
-		return s.streamChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		return s.streamChatCompletionsAsResponses(ctx, c, account, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
-	return s.bufferChatCompletionsAsResponses(c, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+	return s.bufferChatCompletionsAsResponses(ctx, c, account, resp, originalModel, customTools, functionTools, toolSearch, namespaceTools, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 }
 
 // bufferCompatCompactAsResponses 把 CC 上游的压缩回复收敛成 Codex remote
@@ -150,7 +151,9 @@ func (s *OpenAIGatewayService) forwardResponsesViaRawChatCompletions(
 // 置 stream=false），但客户端可能按 SSE 消费，此时复用 compact SSE 桥合成
 // output_item.done + response.completed 两类事件。
 func (s *OpenAIGatewayService) bufferCompatCompactAsResponses(
+	ctx context.Context,
 	c *gin.Context,
+	account *Account,
 	resp *http.Response,
 	originalModel string,
 	clientWantsStream bool,
@@ -170,6 +173,13 @@ func (s *OpenAIGatewayService) bufferCompatCompactAsResponses(
 	if err != nil {
 		writeOpenAIResponsesFallbackError(c, http.StatusBadGateway, "upstream_error", err.Error())
 		return nil, fmt.Errorf("build compact response: %w", err)
+	}
+	if account != nil && account.Platform == PlatformOpenAI {
+		// The compact bridge synthesizes a Responses id even though the upstream
+		// only speaks Chat Completions. Persist its account/owner binding before
+		// exposing the id so a following previous_response_id continuation can be
+		// routed to the same account.
+		s.bindHTTPResponseAccount(ctx, c, account, compactResp.ID)
 	}
 	encoded, err := json.Marshal(compactResp)
 	if err != nil {
@@ -198,20 +208,23 @@ func (s *OpenAIGatewayService) bufferCompatCompactAsResponses(
 	}
 
 	return &OpenAIForwardResult{
-		RequestID:       requestID,
-		Usage:           usage,
-		Model:           originalModel,
-		BillingModel:    billingModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		ServiceTier:     serviceTier,
-		Stream:          clientWantsStream,
-		Duration:        time.Since(startTime),
+		RequestID:                   requestID,
+		Usage:                       usage,
+		Model:                       originalModel,
+		BillingModel:                billingModel,
+		UpstreamModel:               upstreamModel,
+		ReasoningEffort:             reasoningEffort,
+		UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+		ServiceTier:                 serviceTier,
+		Stream:                      clientWantsStream,
+		Duration:                    time.Since(startTime),
 	}, nil
 }
 
 func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
+	ctx context.Context,
 	c *gin.Context,
+	account *Account,
 	resp *http.Response,
 	originalModel string,
 	customTools map[string]bool,
@@ -230,7 +243,14 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 		return nil, err
 	}
 	responsesResp := apicompat.ChatCompletionsResponseToResponses(ccResp, originalModel, customTools, functionTools, toolSearch, namespaceTools)
+	responsesResp.ID = ensureOpenAIResponsesFallbackID(responsesResp.ID)
 	s.cacheReasoningItemsFromOutput(responsesResp.Output)
+	responseID := strings.TrimSpace(responsesResp.ID)
+	if account != nil && account.Platform == PlatformOpenAI && responseID != "" {
+		// Bind before exposing the generated/translated Responses ID so an
+		// immediate follow-up cannot race the owner/account write.
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+	}
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -238,20 +258,24 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	c.JSON(http.StatusOK, responsesResp)
 
 	return &OpenAIForwardResult{
-		RequestID:       requestID,
-		Usage:           usage,
-		Model:           originalModel,
-		BillingModel:    billingModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		ServiceTier:     resolvedOpenAIUpstreamServiceTier(c, serviceTier),
-		Stream:          false,
-		Duration:        time.Since(startTime),
+		RequestID:                   requestID,
+		ResponseID:                  responseID,
+		Usage:                       usage,
+		Model:                       originalModel,
+		BillingModel:                billingModel,
+		UpstreamModel:               upstreamModel,
+		ReasoningEffort:             reasoningEffort,
+		UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+		ServiceTier:                 resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+		Stream:                      false,
+		Duration:                    time.Since(startTime),
 	}, nil
 }
 
 func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
+	ctx context.Context,
 	c *gin.Context,
+	account *Account,
 	resp *http.Response,
 	originalModel string,
 	customTools map[string]bool,
@@ -273,11 +297,27 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	state.ToolSearchDeclared = toolSearch
 	state.NamespaceTools = namespaceTools
 	clientDisconnected := false
+	boundResponseID := ""
+	bindResponseOwner := func() {
+		if account == nil || account.Platform != PlatformOpenAI {
+			return
+		}
+		responseID := strings.TrimSpace(state.ResponseID)
+		if responseID == "" || responseID == boundResponseID {
+			return
+		}
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+		boundResponseID = responseID
+	}
 
 	writeEvents := func(events []apicompat.ResponsesStreamEvent) {
 		if clientDisconnected || len(events) == 0 {
 			return
 		}
+		// The first converted event contains response.created and therefore the
+		// final response ID. Persist its owner/account relation before any event
+		// reaches the downstream client.
+		bindResponseOwner()
 		writeStreamHeaders()
 		for _, event := range events {
 			sse, err := apicompat.ResponsesEventToSSE(event)
@@ -301,6 +341,15 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	scan := s.scanCCStream(c, resp, "openai responses chat fallback", requestID, startTime, func(chunk *apicompat.ChatCompletionsChunk) {
+		// Chat Completions providers normally return chatcmpl_* IDs, which are
+		// message identifiers rather than valid Responses previous_response_id
+		// values. Keep the bridge's generated resp_* ID unless the provider
+		// explicitly supplied a Responses-compatible id.
+		if chunk != nil && strings.TrimSpace(chunk.ID) != "" && !isOpenAIResponsesFallbackID(chunk.ID) {
+			copyChunk := *chunk
+			copyChunk.ID = ""
+			chunk = &copyChunk
+		}
 		events := apicompat.ChatCompletionsChunkToResponsesEvents(chunk, state)
 		s.cacheReasoningItemsFromEvents(events)
 		writeEvents(events)
@@ -308,35 +357,71 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 
 	if scan.Err != nil {
 		return &OpenAIForwardResult{
-			RequestID:       requestID,
-			Usage:           scan.Usage,
-			Model:           originalModel,
-			BillingModel:    billingModel,
-			UpstreamModel:   upstreamModel,
-			ReasoningEffort: reasoningEffort,
-			ServiceTier:     resolvedOpenAIUpstreamServiceTier(c, serviceTier),
-			Stream:          true,
-			Duration:        time.Since(startTime),
-			FirstTokenMs:    scan.FirstTokenMs,
+			RequestID:                   requestID,
+			ResponseID:                  strings.TrimSpace(state.ResponseID),
+			Usage:                       scan.Usage,
+			Model:                       originalModel,
+			BillingModel:                billingModel,
+			UpstreamModel:               upstreamModel,
+			ReasoningEffort:             reasoningEffort,
+			UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+			ServiceTier:                 resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+			Stream:                      true,
+			Duration:                    time.Since(startTime),
+			FirstTokenMs:                scan.FirstTokenMs,
 		}, fmt.Errorf("stream usage incomplete: %w", scan.Err)
 	}
 	if err := state.ValidateToolCallArguments(); err != nil {
 		return &OpenAIForwardResult{
-			RequestID:       requestID,
-			Usage:           scan.Usage,
-			Model:           originalModel,
-			BillingModel:    billingModel,
-			UpstreamModel:   upstreamModel,
-			ReasoningEffort: reasoningEffort,
-			ServiceTier:     resolvedOpenAIUpstreamServiceTier(c, serviceTier),
-			Stream:          true,
-			Duration:        time.Since(startTime),
-			FirstTokenMs:    scan.FirstTokenMs,
+			RequestID:                   requestID,
+			ResponseID:                  strings.TrimSpace(state.ResponseID),
+			Usage:                       scan.Usage,
+			Model:                       originalModel,
+			BillingModel:                billingModel,
+			UpstreamModel:               upstreamModel,
+			ReasoningEffort:             reasoningEffort,
+			UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+			ServiceTier:                 resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+			Stream:                      true,
+			Duration:                    time.Since(startTime),
+			FirstTokenMs:                scan.FirstTokenMs,
 		}, fmt.Errorf("invalid tool call arguments from upstream: %w", err)
+	}
+	// A clean EOF is only a valid completion when the upstream sent either the
+	// standard [DONE] sentinel or a terminal finish_reason chunk.  Finalizing
+	// an otherwise incomplete stream would synthesize response.completed and let
+	// clients persist a truncated turn as if it were complete.  Keep the error
+	// typed so the HTTP handler can fail over when no semantic output was
+	// committed, or emit a protocol-correct response.failed after partial output.
+	if !scan.SawDone && !scan.SawFinishReason {
+		truncatedErr := s.newOpenAIStreamFailoverError(
+			c,
+			account,
+			false,
+			requestID,
+			nil,
+			"OpenAI Chat Completions stream ended before terminal event",
+			resp.Header,
+		)
+		return &OpenAIForwardResult{
+			RequestID:                   requestID,
+			ResponseID:                  strings.TrimSpace(state.ResponseID),
+			Usage:                       scan.Usage,
+			Model:                       originalModel,
+			BillingModel:                billingModel,
+			UpstreamModel:               upstreamModel,
+			ReasoningEffort:             reasoningEffort,
+			UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+			ServiceTier:                 resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+			Stream:                      true,
+			Duration:                    time.Since(startTime),
+			FirstTokenMs:                scan.FirstTokenMs,
+		}, truncatedErr
 	}
 
 	finalEvents := apicompat.FinalizeChatCompletionsResponsesStream(state)
 	s.cacheReasoningItemsFromEvents(finalEvents)
+	bindResponseOwner()
 	writeEvents(finalEvents)
 	if !clientDisconnected {
 		writeStreamHeaders()
@@ -352,17 +437,31 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	}
 
 	return &OpenAIForwardResult{
-		RequestID:       requestID,
-		Usage:           scan.Usage,
-		Model:           originalModel,
-		BillingModel:    billingModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		ServiceTier:     resolvedOpenAIUpstreamServiceTier(c, serviceTier),
-		Stream:          true,
-		Duration:        time.Since(startTime),
-		FirstTokenMs:    scan.FirstTokenMs,
+		RequestID:                   requestID,
+		ResponseID:                  strings.TrimSpace(state.ResponseID),
+		Usage:                       scan.Usage,
+		Model:                       originalModel,
+		BillingModel:                billingModel,
+		UpstreamModel:               upstreamModel,
+		ReasoningEffort:             reasoningEffort,
+		UpstreamResponseServiceTier: observedUpstreamResponseServiceTier(c),
+		ServiceTier:                 resolvedOpenAIUpstreamServiceTier(c, serviceTier),
+		Stream:                      true,
+		Duration:                    time.Since(startTime),
+		FirstTokenMs:                scan.FirstTokenMs,
 	}, nil
+}
+
+func isOpenAIResponsesFallbackID(id string) bool {
+	id = strings.TrimSpace(id)
+	return strings.HasPrefix(id, "resp_") && len(id) > len("resp_")
+}
+
+func ensureOpenAIResponsesFallbackID(id string) string {
+	if isOpenAIResponsesFallbackID(id) {
+		return strings.TrimSpace(id)
+	}
+	return "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 func chatChunkStartsResponsesOutput(chunk *apicompat.ChatCompletionsChunk) bool {

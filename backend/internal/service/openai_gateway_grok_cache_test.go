@@ -54,6 +54,20 @@ func TestResolveGrokCacheIdentityUsesPreviousResponseIDWhenNoOtherSeed(t *testin
 	require.NotEqual(t, got, cacheID)
 }
 
+func TestResolveGrokCacheIdentitySideCallSharesParentPromptCacheKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mainCtx := newGrokCacheTestContext(304)
+	mainBody := []byte(`{"model":"grok-4.6","prompt_cache_key":"parent-session","input":"main turn"}`)
+	mainIdentity := resolveGrokCacheIdentity(mainCtx, mainBody, "", "grok-4.6")
+	require.NotEmpty(t, mainIdentity)
+
+	sideCtx := newGrokCacheTestContext(304)
+	sideCtx.Request.Header.Set(grokConversationIDHeader, "turn-summary-fresh-label")
+	sideBody := []byte(`{"model":"grok-4.6","prompt_cache_key":"parent-session","input":"summary"}`)
+	sideIdentity := resolveGrokCacheIdentity(sideCtx, sideBody, "", "grok-4.6")
+	require.Equal(t, mainIdentity, sideIdentity, "body prompt_cache_key must outrank per-call X-Grok-Conv-Id")
+}
+
 func TestResolveGrokCacheIdentityStableAcrossAppendOnlyTurns(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newGrokCacheTestContext(101)
@@ -192,8 +206,18 @@ func TestResolveGrokCacheIdentityIDEHeaderPriority(t *testing.T) {
 		got := resolveGrokCacheIdentity(c, body, "explicit-argument", "grok-4.5")
 		onlyCurrent := newGrokCacheTestContext(402)
 		onlyCurrent.Request.Header.Set(header.name, header.value)
-		want := resolveGrokCacheIdentity(onlyCurrent, []byte(`{"model":"grok","input":"unrelated"}`), "", "grok-4.5")
-		require.Equal(t, want, got, header.name)
+		if header.name == grokConversationIDHeader {
+			withOnlyBody := newGrokCacheTestContext(402)
+			want := resolveGrokCacheIdentity(withOnlyBody, body, "", "grok-4.5")
+			require.Equal(t, want, got, header.name)
+			withOnlyConv := newGrokCacheTestContext(402)
+			withOnlyConv.Request.Header.Set(header.name, header.value)
+			convOnly := resolveGrokCacheIdentity(withOnlyConv, []byte(`{"model":"grok","input":"unrelated"}`), "", "grok-4.5")
+			require.NotEqual(t, convOnly, got, "body key must not be shadowed by X-Grok-Conv-Id")
+		} else {
+			want := resolveGrokCacheIdentity(onlyCurrent, []byte(`{"model":"grok","input":"unrelated"}`), "", "grok-4.5")
+			require.Equal(t, want, got, header.name)
+		}
 		c.Request.Header.Del(header.name)
 	}
 }
@@ -220,7 +244,11 @@ func TestExplicitGrokCacheSeedPriority(t *testing.T) {
 
 	body := []byte(`{"model":"grok","prompt_cache_key":"body-key","input":"hi"}`)
 	for _, header := range headers {
-		require.Equal(t, header.value, explicitGrokCacheSeed(c, body, "explicit-argument"), header.name)
+		want := header.value
+		if header.name == grokConversationIDHeader {
+			want = "body-key"
+		}
+		require.Equal(t, want, explicitGrokCacheSeed(c, body, "explicit-argument"), header.name)
 		c.Request.Header.Del(header.name)
 	}
 	require.Equal(t, "body-key", explicitGrokCacheSeed(c, body, "explicit-argument"))

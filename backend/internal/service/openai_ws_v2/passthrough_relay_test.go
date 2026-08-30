@@ -1068,6 +1068,122 @@ func TestRelay_DownstreamPreambleStartsClientReader(t *testing.T) {
 	}
 }
 
+func TestRelay_DownstreamKeepaliveStartsAfterFirstWriteAndPingsOnIdle(t *testing.T) {
+	clientConn := newPassthroughTestFrameConn(nil, false)
+	upstreamConn := newPassthroughTestFrameConn(nil, false)
+	var pingCount atomic.Int32
+	traces := make(chan RelayTraceEvent, 8)
+	resultCh := make(chan *RelayExit, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		_, relayExit := Relay(ctx, clientConn, upstreamConn,
+			[]byte(`{"type":"response.create","model":"gpt-5.1"}`), RelayOptions{
+				StartClientAfterFirstDownstream: true,
+				DownstreamPingInterval:          10 * time.Millisecond,
+				DownstreamPingTimeout:           50 * time.Millisecond,
+				DownstreamPing: func(context.Context) error {
+					pingCount.Add(1)
+					return nil
+				},
+				OnTrace: func(event RelayTraceEvent) {
+					select {
+					case traces <- event:
+					default:
+					}
+				},
+			})
+		resultCh <- relayExit
+	}()
+
+	// No downstream business write yet: the keepalive must remain disarmed.
+	time.Sleep(30 * time.Millisecond)
+	require.Zero(t, pingCount.Load())
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.created","response":{"id":"resp_keepalive"}}`),
+	}
+	require.Eventually(t, func() bool { return pingCount.Load() > 0 }, time.Second, 5*time.Millisecond)
+	select {
+	case event := <-traces:
+		require.NotEqual(t, "downstream_ping_failed", event.Stage)
+	default:
+	}
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.completed","response":{"id":"resp_keepalive"}}`),
+	}
+	_ = upstreamConn.Close()
+	select {
+	case relayExit := <-resultCh:
+		require.Nil(t, relayExit)
+	case <-time.After(time.Second):
+		t.Fatal("relay did not finish after terminal event")
+	}
+}
+
+func TestRelay_DownstreamKeepaliveFailureUsesGracefulDrain(t *testing.T) {
+	clientConn := newPassthroughTestFrameConn(nil, false)
+	upstreamConn := newPassthroughTestFrameConn(nil, false)
+	var pingCount atomic.Int32
+	completed := make(chan struct{}, 1)
+	var failedTrace atomic.Bool
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resultCh := make(chan *RelayExit, 1)
+	go func() {
+		_, relayExit := Relay(ctx, clientConn, upstreamConn,
+			[]byte(`{"type":"response.create","model":"gpt-5.1"}`), RelayOptions{
+				FirstMessageSent:                true,
+				StartClientAfterFirstDownstream: true,
+				DownstreamPingInterval:          10 * time.Millisecond,
+				DownstreamPingTimeout:           50 * time.Millisecond,
+				DownstreamPing: func(context.Context) error {
+					pingCount.Add(1)
+					return errors.New("pong timeout")
+				},
+				OnTurnComplete: func(turn RelayTurnResult) {
+					if turn.TerminalEventType == "response.completed" {
+						completed <- struct{}{}
+					}
+				},
+				OnTrace: func(event RelayTraceEvent) {
+					if event.Stage == "downstream_ping_failed" {
+						failedTrace.Store(true)
+					}
+				},
+			})
+		resultCh <- relayExit
+	}()
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.created","response":{"id":"resp_drain"}}`),
+	}
+	require.Eventually(t, func() bool { return pingCount.Load() > 0 }, time.Second, 5*time.Millisecond)
+	// The failed downstream ping switches to the existing drain path; terminal
+	// usage must still be observed even though its frame is not written out.
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.completed","response":{"id":"resp_drain","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	_ = upstreamConn.Close()
+	select {
+	case relayExit := <-resultCh:
+		require.Nil(t, relayExit, "FirstMessageSent graceful drain should finish without a client error")
+	case <-time.After(time.Second):
+		t.Fatal("relay did not finish after graceful keepalive failure")
+	}
+	require.True(t, failedTrace.Load())
+	select {
+	case <-completed:
+	default:
+		t.Fatal("drain did not observe response.completed")
+	}
+}
+
 func TestRelay_TraceEvents_ContainsLifecycleStages(t *testing.T) {
 	t.Parallel()
 

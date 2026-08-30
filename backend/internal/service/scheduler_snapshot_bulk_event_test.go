@@ -6,10 +6,37 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/stretchr/testify/require"
 )
+
+type bulkRuntimeBlockObserver struct {
+	mu         sync.Mutex
+	accountIDs []int64
+	observedAt []time.Time
+}
+
+func (o *bulkRuntimeBlockObserver) ReconcileOpenAIAccountRuntimeBlock(account *Account, observedAt time.Time) {
+	if o == nil || account == nil {
+		return
+	}
+	o.mu.Lock()
+	o.accountIDs = append(o.accountIDs, account.ID)
+	o.observedAt = append(o.observedAt, observedAt)
+	o.mu.Unlock()
+}
+
+func (o *bulkRuntimeBlockObserver) ReconcileOpenAIAccountRuntimeBlockEvent(account *Account, observedAt time.Time, _ map[string]any) {
+	o.ReconcileOpenAIAccountRuntimeBlock(account, observedAt)
+}
+
+func (o *bulkRuntimeBlockObserver) calls() (ids []int64, observed []time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]int64(nil), o.accountIDs...), append([]time.Time(nil), o.observedAt...)
+}
 
 type bulkEventAccountRepo struct {
 	*batchAccountQueryRepo
@@ -112,6 +139,47 @@ func TestSchedulerBulkAccountEventScopesOpenAIRebuildToFreshPlatform(t *testing.
 	set, deleted := cache.accountWrites()
 	require.Equal(t, []int64{1}, set)
 	require.Empty(t, deleted)
+}
+
+func TestSchedulerBulkAccountEventNotifiesRuntimeBlockObserverForEveryFreshAccount(t *testing.T) {
+	cache := newBulkEventSnapshotCache()
+	repo := newBulkEventAccountRepo(
+		&Account{ID: 101, Platform: PlatformOpenAI, GroupIDs: []int64{12}},
+		&Account{ID: 102, Platform: PlatformGrok, GroupIDs: []int64{13}},
+	)
+	svc := newBulkEventTestService(cache, repo)
+	observer := &bulkRuntimeBlockObserver{}
+	svc.SetAccountRuntimeBlockObserver(observer)
+
+	err := svc.handleBulkAccountEvent(context.Background(), bulkEventPayload([]int64{101, 102}, nil), make(map[batchSeenKey]struct{}))
+
+	require.NoError(t, err)
+	ids, observed := observer.calls()
+	require.ElementsMatch(t, []int64{101, 102}, ids)
+	require.Len(t, observed, 2)
+	for _, at := range observed {
+		require.False(t, at.IsZero())
+	}
+}
+
+func TestSchedulerOutboxAccountEventUsesCreatedAtAsObserverLowerBound(t *testing.T) {
+	cache := newBulkEventSnapshotCache()
+	repo := newBulkEventAccountRepo(&Account{ID: 103, Platform: PlatformOpenAI, GroupIDs: []int64{14}})
+	svc := newBulkEventTestService(cache, repo)
+	observer := &bulkRuntimeBlockObserver{}
+	svc.SetAccountRuntimeBlockObserver(observer)
+	eventCreatedAt := time.Now().Add(-time.Minute).UTC()
+
+	err := svc.handleOutboxEvent(context.Background(), SchedulerOutboxEvent{
+		ID:        9001,
+		EventType: SchedulerOutboxEventAccountBulkChanged,
+		Payload:   bulkEventPayload([]int64{103}, nil),
+		CreatedAt: eventCreatedAt,
+	}, make(map[batchSeenKey]struct{}))
+	require.NoError(t, err)
+	_, observed := observer.calls()
+	require.Len(t, observed, 1)
+	require.Equal(t, eventCreatedAt, observed[0])
 }
 
 func TestSchedulerBulkAccountEventScopesCNRebuildToFreshPlatform(t *testing.T) {

@@ -89,7 +89,7 @@ func IsExplicitImageGenerationIntent(endpoint string, requestedModel string, bod
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return false
 	}
-	var modelSeen, toolsSeen, toolChoiceSeen bool
+	var modelSeen, toolsSeen, inputSeen, toolChoiceSeen bool
 	imageIntent := false
 	parseRawJSONView(body).ForEach(func(key, value gjson.Result) bool {
 		switch key.Str {
@@ -103,13 +103,20 @@ func IsExplicitImageGenerationIntent(endpoint string, requestedModel string, bod
 				toolsSeen = true
 				imageIntent = openAIJSONToolsContainNativeImageGeneration(value)
 			}
+		case "input":
+			if !inputSeen {
+				inputSeen = true
+				// Responses Lite carries native tools inside input[].additional_tools;
+				// those are explicit just like a top-level image_generation tool.
+				imageIntent = openAIJSONInputContainsNativeImageGeneration(value)
+			}
 		case "tool_choice":
 			if !toolChoiceSeen {
 				toolChoiceSeen = true
 				imageIntent = openAIJSONToolChoiceSelectsExplicitImageGeneration(value)
 			}
 		}
-		return !imageIntent && (!modelSeen || !toolsSeen || !toolChoiceSeen)
+		return !imageIntent && (!modelSeen || !toolsSeen || !inputSeen || !toolChoiceSeen)
 	})
 	return imageIntent
 }
@@ -182,6 +189,27 @@ func IsImageGenerationIntentMap(endpoint string, requestedModel string, reqBody 
 		return true
 	}
 	return openAIAnyToolChoiceSelectsImageGeneration(reqBody["tool_choice"])
+}
+
+// IsExplicitImageGenerationIntentMap is the allocation-free counterpart of
+// IsExplicitImageGenerationIntent for already-decoded request bodies.  The
+// Codex transform runs on a map in a hot path; re-marshalling a large input just
+// to inspect image intent can add a full request-sized allocation.
+func IsExplicitImageGenerationIntentMap(endpoint string, requestedModel string, reqBody map[string]any) bool {
+	if IsImageGenerationEndpoint(endpoint) || isOpenAIImageGenerationModel(requestedModel) {
+		return true
+	}
+	if reqBody == nil {
+		return false
+	}
+	if isOpenAIImageGenerationModel(firstNonEmptyString(reqBody["model"])) {
+		return true
+	}
+	if openAIAnyToolsContainNativeImageGeneration(reqBody["tools"]) ||
+		openAIAnyInputContainsNativeImageGeneration(reqBody["input"]) {
+		return true
+	}
+	return openAIAnyToolChoiceSelectsExplicitImageGeneration(reqBody["tool_choice"])
 }
 
 // IsImageGenerationEndpoint identifies dedicated generated-image endpoints.
@@ -266,6 +294,25 @@ func openAIJSONInputContainsImageGenTool(input gjson.Result) bool {
 			return true
 		}
 		found = openAIJSONToolsContainImageGeneration(item.Get("tools"))
+		return !found
+	})
+	return found
+}
+
+// openAIJSONInputContainsNativeImageGeneration is the explicit-intent variant
+// for Responses Lite input[].additional_tools.  A passive image_gen namespace
+// remains deliberately excluded; only the hosted image_generation tool should
+// force image capability routing and suppress synthetic context injection.
+func openAIJSONInputContainsNativeImageGeneration(input gjson.Result) bool {
+	if !input.IsArray() {
+		return false
+	}
+	found := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if openAIJSONString(item.Get("type")) != "additional_tools" {
+			return true
+		}
+		found = openAIJSONToolsContainNativeImageGeneration(item.Get("tools"))
 		return !found
 	})
 	return found
@@ -395,6 +442,75 @@ func openAIAnyToolChoiceSelectsImageGeneration(choice any) bool {
 		if fn, ok := v["function"].(map[string]any); ok && isOpenAIImageGenerationType(firstNonEmptyString(fn["name"])) {
 			return true
 		}
+	}
+	return false
+}
+
+func openAIAnyToolsContainNativeImageGeneration(raw any) bool {
+	switch tools := raw.(type) {
+	case []any:
+		for _, item := range tools {
+			if tool, ok := item.(map[string]any); ok &&
+				isOpenAIImageGenerationType(firstNonEmptyString(tool["type"])) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, tool := range tools {
+			if isOpenAIImageGenerationType(firstNonEmptyString(tool["type"])) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAIAnyInputContainsNativeImageGeneration(raw any) bool {
+	switch input := raw.(type) {
+	case []any:
+		for _, item := range input {
+			if itemMap, ok := item.(map[string]any); ok &&
+				strings.TrimSpace(firstNonEmptyString(itemMap["type"])) == "additional_tools" &&
+				openAIAnyToolsContainNativeImageGeneration(itemMap["tools"]) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range input {
+			if strings.TrimSpace(firstNonEmptyString(item["type"])) == "additional_tools" &&
+				openAIAnyToolsContainNativeImageGeneration(item["tools"]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAIAnyToolChoiceSelectsExplicitImageGeneration(choice any) bool {
+	if choice == nil {
+		return false
+	}
+	if value, ok := choice.(string); ok {
+		return isOpenAIImageGenerationType(value)
+	}
+	obj, ok := choice.(map[string]any)
+	if !ok {
+		return false
+	}
+	if isOpenAIImageGenerationType(firstNonEmptyString(obj["type"])) {
+		return true
+	}
+	if tool, ok := obj["tool"].(map[string]any); ok && openAIAnyToolChoiceSelectsExplicitImageGeneration(tool) {
+		return true
+	}
+	if isOpenAIImageGenFunctionReference(firstNonEmptyString(obj["namespace"]), firstNonEmptyString(obj["name"])) {
+		return true
+	}
+	if fn, ok := obj["function"].(map[string]any); ok {
+		if isOpenAIImageGenerationType(firstNonEmptyString(fn["name"])) {
+			return true
+		}
+		return isOpenAIImageGenFunctionReference(firstNonEmptyString(fn["namespace"]), firstNonEmptyString(fn["name"]))
 	}
 	return false
 }

@@ -31,7 +31,6 @@ import (
 // with the list in openai_gateway_service.go:2034 used by the /v1/responses
 // passthrough path.
 var cursorResponsesUnsupportedFields = []string{
-	"prompt_cache_retention",
 	"safety_identifier",
 	"metadata",
 	"stream_options",
@@ -196,6 +195,13 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 			if stripped, derr := sjson.DeleteBytes(responsesBody, field); derr == nil {
 				responsesBody = stripped
 			}
+		}
+		if normalized, changed, normalizeErr := normalizeOpenAIPromptCacheFieldsForEgressWithModel(
+			responsesBody, account, "", upstreamModel, "",
+		); normalizeErr != nil {
+			return nil, fmt.Errorf("normalize prompt-cache fields in Responses-shaped chat request: %w", normalizeErr)
+		} else if changed {
+			responsesBody = normalized
 		}
 		if isOpenAICodexSamplingUnsupportedModel(upstreamModel) {
 			for _, field := range []string{"temperature", "top_p"} {
@@ -416,7 +422,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	// 排除 spark 影子:其 codex_* 仅由 QueryUsage(/wham/usage bengalfox)更新(外审第7轮 P1)。
 	if handleErr == nil && account.Type == AccountTypeOAuth && !account.IsShadow() {
 		if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
-			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
+			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot, account)
 		}
 	} else if handleErr == nil && account.IsShadow() && account.ParentAccountID != nil {
 		notifyOpenAIAutoReset(*account.ParentAccountID)
@@ -494,7 +500,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 
 	finalResponse, usage, acc, err := s.readOpenAICompatBufferedTerminal(resp, c, "openai chat_completions buffered", requestID)
 	if err != nil {
-		return nil, s.newOpenAICompatBufferedReadFailoverError(c, account, resp, requestID, err)
+		return nil, s.newOpenAICompatBufferedReadFailoverError(c, account, resp, requestID, err, upstreamModel)
 	}
 
 	if finalResponse == nil {
@@ -529,7 +535,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
 		if openAIStreamFailedEventShouldFailover(payload, message) {
-			return nil, s.newOpenAIStreamFailoverError(c, account, false, requestID, payload, message, resp.Header)
+			return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, upstreamModel, resp.Header)
 		}
 		message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payload, message)
 		// response.failed 到达在 HTTP 200 SSE 流上，无真实 HTTP 错误码；统一走语义
@@ -601,6 +607,7 @@ func (s *OpenAIGatewayService) newOpenAICompatBufferedReadFailoverError(
 	resp *http.Response,
 	requestID string,
 	err error,
+	canonicalModel ...string,
 ) error {
 	var readErr *openAICompatBufferedReadError
 	if !errors.As(err, &readErr) || readErr == nil || errors.Is(readErr.cause, bufio.ErrTooLong) {
@@ -630,7 +637,7 @@ func (s *OpenAIGatewayService) newOpenAICompatBufferedReadFailoverError(
 	if resp != nil {
 		responseHeaders = resp.Header
 	}
-	failoverErr := s.newOpenAIStreamFailoverError(c, account, false, requestID, payload, message, responseHeaders)
+	failoverErr := s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, firstNonEmpty(canonicalModel...), responseHeaders)
 	// 保留稳定错误码，确保重试耗尽后客户端和错误透传规则仍能识别传输故障。
 	failoverErr.ResponseBody = payload
 	return failoverErr
@@ -663,6 +670,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	clientDisconnected := false
 	clientOutputStarted := false
 	pendingSSE := make([]string, 0, 4)
+	var pendingSSEBytes int64
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var streamFailoverErr *UpstreamFailoverError
 	var streamNonFailoverErr error
@@ -784,7 +792,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 				shouldFailover = openAIStreamErrorEventShouldFailover(payloadBytes, message)
 			}
 			if !clientOutputStarted && shouldFailover {
-				streamFailoverErr = s.newOpenAIStreamFailoverError(c, account, false, requestID, payloadBytes, message, resp.Header)
+				streamFailoverErr = s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payloadBytes, message, upstreamModel, resp.Header)
 				return true
 			}
 			message = s.recordOpenAIStreamUpstreamError(c, account, false, requestID, "http_error", payloadBytes, message)
@@ -837,7 +845,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 					continue
 				}
 				if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
-					pendingSSE = append(pendingSSE, sse)
+					if err := appendOpenAIPendingSSELine(&pendingSSE, &pendingSSEBytes, sse, openAIFirstOutputStageMaxBytes); err != nil {
+						streamFailoverErr = newOpenAIPreOutputBufferFailoverError(c, account, false, requestID, resp.Header)
+						return true
+					}
 					continue
 				}
 				if !clientOutputStarted {
@@ -851,7 +862,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 							break
 						}
 					}
-					pendingSSE = pendingSSE[:0]
+					clearOpenAIPendingSSELines(&pendingSSE, &pendingSSEBytes)
 					clientOutputStarted = !clientDisconnected
 					if clientDisconnected {
 						break
@@ -890,7 +901,10 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 					continue
 				}
 				if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
-					pendingSSE = append(pendingSSE, sse)
+					if err := appendOpenAIPendingSSELine(&pendingSSE, &pendingSSEBytes, sse, openAIFirstOutputStageMaxBytes); err != nil {
+						streamFailoverErr = newOpenAIPreOutputBufferFailoverError(c, account, false, requestID, resp.Header)
+						return resultWithUsage(), streamFailoverErr
+					}
 					continue
 				}
 				if !clientOutputStarted {
@@ -904,7 +918,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 							break
 						}
 					}
-					pendingSSE = pendingSSE[:0]
+					clearOpenAIPendingSSELines(&pendingSSE, &pendingSSEBytes)
 					clientOutputStarted = !clientDisconnected
 					if clientDisconnected {
 						break
@@ -934,7 +948,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 						break
 					}
 				}
-				pendingSSE = pendingSSE[:0]
+				clearOpenAIPendingSSELines(&pendingSSE, &pendingSSEBytes)
 				clientOutputStarted = !clientDisconnected
 			}
 		}

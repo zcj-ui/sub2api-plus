@@ -1,6 +1,6 @@
 # Sub2API Plus 更新日志
 
-当前准备版本：`0.2.8`
+当前准备版本：`0.2.8`（本轮源码工具链 Go `1.27.0`；文中早期版本条目保留为历史记录）
 
 ## 0.2.8 官方问题/PR 同步与 OpenAI/Codex 兼容性修复（准备中）
 
@@ -8,10 +8,18 @@
 - 修复多实例账号运行时阻断的过期清理竞态、HTTP/2 响应体失败识别、透传首输出 SSE 保活、配额 singleflight 重查，以及批量编辑关闭 Codex 指纹时的空更新问题。
 - 增加智谱团队版 GLM Coding Plan 额度查询：可选组织/项目 ID、`?type=2` 团队端点、请求头校验和账号代理强制复用；个人版会清理团队头并继续走个人端点。
 - 增加 OpenAI OAuth 生图工具不可用冷却配置接口，默认 30 分钟、允许 1–120 分钟；设置读取失败时使用默认值，不阻塞请求。
+- 同步官方 `#6358` Spark 429 模型级限流与 `#6370/#6372` 修复：关闭 429 默认回避时，瞬时 OAuth 429 不再建立本地 cooldown；明确耗尽窗口仍按上游 reset 时间处理，普通 OpenAI/Codex OAuth 继续两次明确 429 才冻结。
+- 同步官方 `b5827cfd54` DeepSeek V4 峰谷价卡和 `#6364` Codex 默认配置：默认模型为 `gpt-5.6-sol`、支持时默认 medium reasoning；DeepSeek 工作日 UTC 高峰按 2x、未知 `deepseek-*` 以 Flash 价兜底，分组/渠道自定义售价保持不变。
+- 加固 Responses/WS 兼容边界：previous_response_id 原始控制字符拒绝、终态 output 的精确 `id` 优先于 `call_id` 别名、WS 握手 429 保留配额响应头；配额和 reset-credit 响应增加 1MiB/64 项上限，代理凭据日志彻底去除 userinfo。
+- 同步官方 #5469：WS v2 passthrough 超大首帧只在合法、无续传的首个 `response.create` 上使用 HTTP bridge；重复字段、续传和畸形帧继续走 WS。额度卡片对 live `credits:null` / `spend_control:null` 清除旧缓存，账户类型筛选补齐 `service_account` 与 `upstream`。
+- 同步官方 #6062/#5866/#6367：长 Responses 会话遇到 reasoning 内容长度拒绝时单轮清理全部 reasoning content；Channel Monitor v2 对非管理员强制执行 API Key 可用组交集并对空权限 fail-closed；管理端 cache tooltip 隐藏时不再制造移动端横向滚动。前端全量现为 262 个测试文件、1938 个用例。
+- 同步官方 #6378：OpenAI/Codex 计费分离最终出站 service tier 与上游观测 tier；OAuth/SetupToken 私有端点回显 `default` 时保留实际 Fast 档，公开 API Key 仍按明确回显降档。
+- 同步官方 Issue #6377：账户批量编辑明确区分勾选目标与筛选全量目标；筛选更新显示命中数量并强制二次确认，防止误改未勾选账号。
+- 同步官方 #6245：智谱仅信用额度响应按 unit 正确映射 5h/weekly，避免周窗口临界期被 reset 时间排序反置；TOKENS_LIMIT 仍优先于 CREDIT_LIMIT。
 - 纳入 OpenAI/Codex GPT-5.6 采样参数兼容补丁：按最终映射模型决定是否保留 `temperature`/`top_p`，只有上游明确拒绝顶层字段时才做有界单字段重试，嵌套工具参数不被误删；compact 端点仍会剥离采样字段。
-- 当前版本不会自动覆盖 `main`/`dev`，也不会携带构建缓存或数据库文件；发布前需在本分支完成后端、前端和嵌入式构建复核。
+- 当前版本不会自动覆盖 `main`/`dev`，也不会携带构建缓存或数据库文件；发布前需在本分支完成后端、前端和嵌入式构建复核。本轮全仓 Go、前端 262 个文件/1938 个用例、typecheck、lint、Vite build 和嵌入式构建均已复核。
 
-发布日期：2026-08-26
+发布日期：2026-08-30（准备中）
 
 > 发布状态：`0.2.x` 是技术预览和验收版本，不代表生产认证。请勿直接接入真实付费用户、高价值凭据或不可替代数据；部署前阅读[完整风险声明](../legal/admin-compliance.zh.md)并完成独立审计、压测、备份恢复和回滚演练。
 
@@ -101,7 +109,7 @@
 
 本轮审查了官方仓近期 OpenAI/Codex、Responses、429、调度、代理和安全相关 Issues/PR。Anthropic/Claude Code 专属改动、支付/国产供应商新功能、OpenAI Team 联动熔断及大范围流式 failover 重构未纳入本版本，避免扩大回归面。
 
-验证结果：Go 1.26.6 下 `internal/service` 全量测试、其余后端包测试、`go vet -tags=unit ./...`、middleware 测试程序单独编译、前端 `vue-tsc --noEmit`、完整 Vitest 和 Vite 生产构建均通过。Windows 本机策略会阻止执行临时目录中的 `internal/middleware` 测试程序；该包已成功编译，完整执行继续由 Linux CI 覆盖。
+验证结果：Go 1.27.0 下 `internal/service` 全量测试、其余后端包测试、`go vet -tags=unit ./...`、middleware 测试程序单独编译、前端 `vue-tsc --noEmit`、完整 Vitest 和 Vite 生产构建均通过。Windows 本机策略会阻止执行临时目录中的 `internal/middleware` 测试程序；该包已成功编译，完整执行继续由 Linux CI 覆盖。
 
 ## 2026-08-15 仓库与发布流程更新
 
@@ -210,7 +218,7 @@
 
 ### 依赖与验证链加固
 
-- 构建基线升级到 Go `1.26.6`，并同步根目录、后端和部署镜像以及三语源码构建文档。
+- 构建基线升级到 Go `1.27.0`，并同步根目录、后端和部署镜像以及三语源码构建文档。
 - 升级 gRPC `1.82.1`、OpenTelemetry `1.43.0` 和 Protobuf `1.36.11`，消除对应的 Critical/High 依赖告警。
 - 前端升级到 Vite `6.4.3`、Vitest `3.2.7`、DOMPurify `3.4.13`，并通过精确 override 修补 Mermaid、Rollup、ws、yaml、lodash、minimatch 等间接依赖。
 - 修正 Vitest 3 覆盖率阈值配置，启用可执行的全局基线棘轮；当前阈值为语句/行 `69%`、分支 `70%`、函数 `45%`，后续覆盖率只能逐步提高。
@@ -222,7 +230,7 @@
 
 ## 验证记录
 
-- Go 1.26.6 下除本机执行受限包外的 105 个后端包强制单元测试通过，包含 `internal/service`、`internal/repository`、handler、server 与 OpenAI WS。
+- Go 1.27.0 下除本机执行受限包外的后端包强制单元测试通过，包含 `internal/service`、`internal/repository`、handler、server 与 OpenAI WS。
 - Go handler、server 及 OpenAI WS 定向测试通过；本机 Defender 会隔离 Windows `internal/middleware` 测试二进制，该包保留给 Linux CI 执行。
 - OpenAI 429、额度探针缓存和账户调度定向 `-race` 测试通过。
 - 前端 Vitest：228 个测试文件、1587 个测试通过。

@@ -103,6 +103,107 @@ func TestSyntheticAgentContextPairRecognizesNormalizedFCID(t *testing.T) {
 	}))
 }
 
+func TestApplyCodexOAuthTransform_SyntheticPairRemainsIdempotentAfterCTCIDNormalization(t *testing.T) {
+	// The normal Codex filter rewrites custom call IDs from call_* to ctc_*.
+	// A subsequent turn that replays that history must still recognize the
+	// synthetic pair and must not classify it as a real tool continuation.
+	reqBody := map[string]any{
+		"model": "gpt-5.4",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "first"},
+		},
+	}
+	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
+	firstInput := requireCodexTestSlice(t, reqBody["input"])
+	require.Len(t, firstInput, 3)
+
+	// Simulate the next client turn carrying the gateway-injected history.
+	reqBody["input"] = append(firstInput, map[string]any{
+		"type": "message", "role": "user", "content": "follow up",
+	})
+	applyCodexOAuthTransformWithOptions(reqBody, codexOAuthTransformOptions{Codex429GuardEnabled: true})
+
+	secondInput := requireCodexTestSlice(t, reqBody["input"])
+	require.Len(t, secondInput, 4, "the existing pair must not be duplicated")
+	syntheticCalls := 0
+	syntheticOutputs := 0
+	for _, raw := range secondInput {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch firstNonEmptyString(item["type"]) {
+		case "custom_tool_call":
+			if isCodexSyntheticAgentContextCall(item) {
+				syntheticCalls++
+				callID := firstNonEmptyString(item["call_id"])
+				require.True(t, strings.HasPrefix(callID, "ctc_"), "custom call ID should be normalized to ctc_: %s", callID)
+			}
+		case "custom_tool_call_output":
+			if isCodexSyntheticAgentContextOutput(item) {
+				syntheticOutputs++
+			}
+		}
+	}
+	require.Equal(t, 1, syntheticCalls)
+	require.Equal(t, 1, syntheticOutputs)
+	require.False(t, NeedsToolContinuation(reqBody), "synthetic history must not trigger a real tool continuation")
+}
+
+func TestAppendCodexSyntheticAgentContextPair_DoesNotHideMessageWithoutRole(t *testing.T) {
+	reqBody := map[string]any{
+		"input": []any{map[string]any{
+			"type":    "message",
+			"content": "malformed message",
+		}},
+	}
+	require.False(t, appendCodexSyntheticAgentContextPair(reqBody))
+	require.Len(t, requireCodexTestSlice(t, reqBody["input"]), 1)
+
+	raw := []byte(`{"input":[{"type":"message","content":"malformed message"}]}`)
+	updated, changed, err := appendCodexSyntheticAgentContextPairToBody(raw)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, string(raw), string(updated))
+}
+
+func TestAppendCodexSyntheticAgentContextPair_SkipsExplicitImageGeneration(t *testing.T) {
+	nativeTool := map[string]any{
+		"type": "image_generation",
+	}
+	textTail := map[string]any{
+		"type": "message", "role": "user", "content": "draw a sunset",
+	}
+
+	// Map-backed Responses transform: a native image tool is an explicit image
+	// request and must not receive the ordinary-text checkpoint.
+	mapBody := map[string]any{
+		"model": "gpt-5.4",
+		"tools": []any{nativeTool},
+		"input": []any{textTail},
+	}
+	require.False(t, appendCodexSyntheticAgentContextPair(mapBody))
+	require.Len(t, requireCodexTestSlice(t, mapBody["input"]), 1)
+
+	// Raw body shape is the path used by HTTP passthrough and WS v2.  Keep the
+	// same explicit-image exclusion there.
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","tools":[{"type":"image_generation"}],"input":[{"type":"message","role":"user","content":"draw a sunset"}]}`)
+	updated, changed, err := appendCodexSyntheticAgentContextPairToBody(raw)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, string(raw), string(updated))
+
+	// The built-in image_gen namespace is a passive Codex advertisement, not an
+	// explicit image request; ordinary text requests remain eligible.
+	passive := map[string]any{
+		"model": "gpt-5.4",
+		"tools": []any{map[string]any{"type": "namespace", "name": "image_gen"}},
+		"input": []any{map[string]any{"type": "message", "role": "user", "content": "hello"}},
+	}
+	require.True(t, appendCodexSyntheticAgentContextPair(passive))
+	require.Len(t, requireCodexTestSlice(t, passive["input"]), 3)
+}
+
 func TestAppendCodexSyntheticAgentContextPair_DoesNotReinjectEarlierHistoryPair(t *testing.T) {
 	reqBody := map[string]any{
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "first"}},
@@ -2052,6 +2153,27 @@ func TestApplyCodexOAuthTransform_StripsChatGPTInternalUnsupportedFields(t *test
 	for _, field := range openAIChatGPTInternalUnsupportedFields {
 		require.NotContains(t, reqBody, field)
 	}
+	// The current internal endpoint accepts the normal automatic policy.
+	require.Equal(t, "auto", reqBody["truncation"])
+}
+
+func TestApplyCodexOAuthTransform_StripsOnlyDisabledTruncation(t *testing.T) {
+	disabled := map[string]any{
+		"model":      "gpt-5.4",
+		"truncation": "disabled",
+		"input":      []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	result := applyCodexOAuthTransform(disabled, false, false)
+	require.True(t, result.Modified)
+	require.NotContains(t, disabled, "truncation")
+
+	auto := map[string]any{
+		"model":      "gpt-5.4",
+		"truncation": "auto",
+		"input":      []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	applyCodexOAuthTransform(auto, false, false)
+	require.Equal(t, "auto", auto["truncation"])
 }
 
 func TestApplyCodexOAuthTransform_PreservesGPT56SamplingParameters(t *testing.T) {

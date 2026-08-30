@@ -115,7 +115,7 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 	}
 
 	if !account.IsShadow() {
-		s.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, resp.Header)
+		s.UpdateCodexUsageSnapshotFromHeadersForAccount(ctx, account, resp.Header)
 	}
 	writeOpenAIPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := resp.Header.Get("Content-Type")
@@ -203,7 +203,7 @@ func (s *OpenAIGatewayService) forwardAlphaSearchViaResponsesWebSearch(
 	}
 
 	if !account.IsShadow() {
-		s.UpdateCodexUsageSnapshotFromHeaders(ctx, account.ID, resp.Header)
+		s.UpdateCodexUsageSnapshotFromHeadersForAccount(ctx, account, resp.Header)
 	}
 	alphaRespBody, err := openAIAlphaSearchResponseFromResponsesSSE(respBody)
 	if err != nil {

@@ -87,13 +87,53 @@ describe('HomeView compact mode', () => {
     expect(wrapper.find('[data-testid="compact-home"]').exists()).toBe(false)
   })
 
+  it('sanitizes custom HTML before rendering it', () => {
+    const wrapper = mountHome({
+      compact_home_enabled: true,
+      home_content: [
+        '<section id="custom-home" data-owned="no">Custom home</section>',
+        '<script>window.__xss = true</script>',
+        '<img src="https://cdn.example/logo.png" onerror="window.__xss = true">',
+        '<a href="javascript:alert(1)" onclick="alert(1)">unsafe link</a>',
+        '<iframe src="https://evil.example"></iframe>',
+        '<style>body { display: none }</style>',
+      ].join(''),
+    })
+
+    expect(wrapper.get('#custom-home').text()).toBe('Custom home')
+    expect(wrapper.find('script').exists()).toBe(false)
+    expect(wrapper.find('iframe').exists()).toBe(false)
+    expect(wrapper.find('style').exists()).toBe(false)
+    expect(wrapper.find('[data-owned]').exists()).toBe(false)
+    expect(wrapper.find('[onclick]').exists()).toBe(false)
+    expect(wrapper.find('a').attributes('href')).toBeUndefined()
+  })
+
   it('renders custom URL content ahead of compact mode', () => {
     const wrapper = mountHome({
       compact_home_enabled: true,
       home_content: ' https://example.com/home ',
     })
 
-    expect(wrapper.get('iframe').attributes('src')).toBe('https://example.com/home')
+    const iframe = wrapper.get('iframe')
+    expect(iframe.attributes('src')).toBe('https://example.com/home')
+    expect(iframe.attributes('sandbox')).toBe(
+      'allow-scripts allow-forms allow-modals allow-popups allow-presentation',
+    )
+    expect(iframe.attributes('referrerpolicy')).toBe('no-referrer')
+    expect(wrapper.find('[data-testid="compact-home"]').exists()).toBe(false)
+  })
+
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'https://user:password@example.com/home',
+    'http://127.0.0.1:8080/admin',
+    'http://169.254.169.254/latest/meta-data',
+  ])('does not embed an unsafe home URL: %s', (homeContent) => {
+    const wrapper = mountHome({ compact_home_enabled: true, home_content: homeContent })
+
+    expect(wrapper.find('iframe').exists()).toBe(false)
     expect(wrapper.find('[data-testid="compact-home"]').exists()).toBe(false)
   })
 

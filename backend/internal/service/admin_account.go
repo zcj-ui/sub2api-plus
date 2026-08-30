@@ -200,6 +200,9 @@ func cloneAccountJSONMap(value map[string]any) (map[string]any, error) {
 var duplicateAccountDiscardedExtraKeys = map[string]struct{}{
 	// A retry identity belongs to the operation that created one copy, not to later copies.
 	duplicateAccountOperationIDExtraKey: {},
+	// This is a transient scheduler-recovery marker owned by the source account
+	// and must never be copied to a duplicate.
+	AccountErrorRestoreSchedulableExtraKey: {},
 	// A duplicate must never inherit the source account's Codex device identity.
 	codexFingerprintSeedExtraKey: {},
 	// External sync identity belongs to one local account only.
@@ -239,6 +242,7 @@ var duplicateAccountDiscardedExtraKeys = map[string]struct{}{
 	"drive_storage_usage":                        {},
 	"drive_tier_updated_at":                      {},
 	"codex_primary_used_percent":                 {},
+	OpenAIQuotaSpendControlExtraKey:              {},
 	"codex_primary_reset_after_seconds":          {},
 	"codex_primary_window_minutes":               {},
 	"codex_secondary_used_percent":               {},
@@ -246,6 +250,7 @@ var duplicateAccountDiscardedExtraKeys = map[string]struct{}{
 	"codex_secondary_window_minutes":             {},
 	"codex_primary_over_secondary_percent":       {},
 	"codex_usage_updated_at":                     {},
+	OpenAICodexUsageObservedAtUnixNanoExtraKey:   {},
 	"codex_5h_used_percent":                      {},
 	"codex_5h_reset_after_seconds":               {},
 	"codex_5h_window_minutes":                    {},
@@ -668,6 +673,9 @@ func (s *adminServiceImpl) CreateAccount(ctx context.Context, input *CreateAccou
 	}
 
 	// 校验并规范化请求头覆写配置（header 名小写化、格式检查）
+	if err := NormalizeOpenAIUserAgentCredentials(input.Platform, input.Type, input.Credentials); err != nil {
+		return nil, err
+	}
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}
@@ -827,6 +835,15 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	} else if len(input.Credentials) > 0 {
 		// 敏感子键采用"incoming 没提供就保留"的合并语义：前端响应已脱敏，
 		// 全对象 PUT 编辑时不会再带回 token，避免覆盖时清空已有凭证。
+		// Normalize before merging so an explicit blank value is interpreted as a
+		// clear operation rather than leaving whitespace in the merged map.
+		effectiveCredentialType := account.Type
+		if input.Type != "" {
+			effectiveCredentialType = input.Type
+		}
+		if err := NormalizeOpenAIUserAgentCredentials(account.Platform, effectiveCredentialType, input.Credentials); err != nil {
+			return nil, err
+		}
 		account.Credentials = MergePreservingSensitiveCreds(account.Credentials, input.Credentials)
 		// 校验并规范化请求头覆写配置（header 名小写化、格式检查）
 		if err := NormalizeHeaderOverrideCredentials(account.Credentials); err != nil {
@@ -1386,6 +1403,30 @@ func (s *adminServiceImpl) BulkUpdateAccounts(ctx context.Context, input *BulkUp
 	}
 
 	// 校验并规范化请求头覆写配置（批量路径为 JSONB 顶层 key 合并，直接校验增量即可）
+	if _, hasUserAgent := input.Credentials["user_agent"]; hasUserAgent {
+		for _, account := range cachedTargets {
+			if account == nil {
+				return nil, ErrAccountNotFound
+			}
+			// A JSONB bulk patch applies to every selected row. Reject mixed
+			// selections instead of leaking an OpenAI-only override to Claude,
+			// API-key, or shadow accounts.
+			if !account.IsOpenAIOAuth() || account.IsCredentialShadow() {
+				return nil, infraerrors.BadRequest(
+					"OPENAI_USER_AGENT_ACCOUNT_INVALID",
+					"custom User-Agent overrides only apply to OpenAI OAuth accounts",
+				)
+			}
+		}
+		for _, account := range cachedTargets {
+			if account != nil {
+				if err := NormalizeOpenAIUserAgentCredentials(account.Platform, account.Type, input.Credentials); err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
 	if err := NormalizeHeaderOverrideCredentials(input.Credentials); err != nil {
 		return nil, err
 	}

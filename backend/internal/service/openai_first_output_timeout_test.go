@@ -32,6 +32,16 @@ type firstOutputCloseTrackingBody struct {
 	once   sync.Once
 }
 
+func TestAppendOpenAIPendingSSELineEnforcesByteLimit(t *testing.T) {
+	lines := make([]string, 0, 2)
+	var total int64
+	require.NoError(t, appendOpenAIPendingSSELine(&lines, &total, "abc", 8)) // 3 bytes + newline
+	require.Equal(t, int64(4), total)
+	require.ErrorIs(t, appendOpenAIPendingSSELine(&lines, &total, "12345", 8), errOpenAIPendingSSELinesLimit)
+	require.Empty(t, lines, "overflow must clear the pending buffer")
+	require.Zero(t, total)
+}
+
 func (b *firstOutputCloseTrackingBody) Close() error {
 	b.once.Do(func() { close(b.closed) })
 	return b.ReadCloser.Close()

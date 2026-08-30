@@ -4,6 +4,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -73,10 +74,11 @@ func TestCalculateOpenAI429ResetTime_5hExhausted(t *testing.T) {
 	}
 }
 
-func TestCalculateOpenAI429ResetTime_NeitherExhausted_UsesMax(t *testing.T) {
+func TestCalculateOpenAI429ResetTime_NeitherExhausted_UsesShortFallback(t *testing.T) {
 	svc := &RateLimitService{}
 
-	// Neither limit at 100%, should use the longer reset time
+	// Neither limit at 100%: quota-window resets must not be used for a burst
+	// 429; the caller should apply its bounded short fallback instead.
 	headers := http.Header{}
 	headers.Set("x-codex-primary-used-percent", "80")
 	headers.Set("x-codex-primary-reset-after-seconds", "100000")
@@ -85,21 +87,9 @@ func TestCalculateOpenAI429ResetTime_NeitherExhausted_UsesMax(t *testing.T) {
 	headers.Set("x-codex-secondary-reset-after-seconds", "5000")
 	headers.Set("x-codex-secondary-window-minutes", "300")
 
-	before := time.Now()
 	resetAt := svc.calculateOpenAI429ResetTime(headers)
-	after := time.Now()
-
-	if resetAt == nil {
-		t.Fatal("expected non-nil resetAt")
-	}
-
-	// Should use the max (100000 seconds from 7d window)
-	expectedDuration := 100000 * time.Second
-	minExpected := before.Add(expectedDuration)
-	maxExpected := after.Add(expectedDuration)
-
-	if resetAt.Before(minExpected) || resetAt.After(maxExpected) {
-		t.Errorf("resetAt %v not in expected range [%v, %v]", resetAt, minExpected, maxExpected)
+	if resetAt != nil {
+		t.Fatalf("expected nil for non-exhausted windows, got %v", resetAt)
 	}
 }
 
@@ -157,6 +147,68 @@ func TestParseOpenAIRateLimitResetTime_OpenCodeGoUsageLimit(t *testing.T) {
 func TestParseOpenAIRateLimitResetTime_DoesNotParseUnknownErrorMessage(t *testing.T) {
 	body := []byte(`{"error":{"type":"rate_limit_error","message":"Resets in 2 days."}}`)
 
+	require.Nil(t, parseOpenAIRateLimitResetTime(body))
+}
+
+func TestParseOpenAIRateLimitResetTime_BoundsUntrustedFutureTimestamp(t *testing.T) {
+	now := time.Now()
+	far := now.Add(30 * 24 * time.Hour).Unix()
+
+	// A transient rate_limit_exceeded must never inherit a month-long account
+	// cooldown from an upstream reset timestamp; it falls through to the
+	// service's short, configurable 429 fallback instead.
+	require.Nil(t, parseOpenAIRateLimitResetTime([]byte(fmt.Sprintf(
+		`{"error":{"type":"rate_limit_exceeded","resets_at":%d}}`, far,
+	))))
+
+	// A weekly usage limit is allowed up to the documented seven-day window,
+	// with one day of clock/relay skew.  Anything beyond that is discarded.
+	weekly := now.Add(7*24*time.Hour + time.Hour).Unix()
+	got := parseOpenAIRateLimitResetTime([]byte(fmt.Sprintf(
+		`{"error":{"type":"usage_limit_reached","resets_at":%d}}`, weekly,
+	)))
+	require.NotNil(t, got)
+	require.InDelta(t, weekly, *got, 1)
+
+	tooFar := now.Add(9 * 24 * time.Hour).Unix()
+	require.Nil(t, parseOpenAIRateLimitResetTime([]byte(fmt.Sprintf(
+		`{"error":{"type":"usage_limit_reached","resets_at":%d}}`, tooFar,
+	))))
+}
+
+func TestParseOpenAIRateLimitResetTime_RejectsMalformedAndNegativeValues(t *testing.T) {
+	cases := []string{
+		`{"error":{"type":"usage_limit_reached","resets_at":-1}}`,
+		`{"error":{"type":"usage_limit_reached","resets_at":1.5}}`,
+		`{"error":{"type":"usage_limit_reached","resets_at":1e20}}`,
+		`{"error":{"type":"usage_limit_reached","resets_in_seconds":-10}}`,
+		`{"error":{"type":"usage_limit_reached","resets_in_seconds":999999999}}`,
+	}
+	for _, body := range cases {
+		require.Nil(t, parseOpenAIRateLimitResetTime([]byte(body)), "body=%s", body)
+	}
+}
+
+func TestParseOpenAIRateLimitResetTime_AcceptsMillisecondsAndBoundedSeconds(t *testing.T) {
+	now := time.Now()
+	reset := now.Add(90 * time.Minute).Unix()
+	resetMillis := reset * 1000
+	got := parseOpenAIRateLimitResetTime([]byte(fmt.Sprintf(
+		`{"error":{"type":"rate_limit_exceeded","resets_at":"%d"}}`, resetMillis,
+	)))
+	require.NotNil(t, got)
+	require.Equal(t, reset, *got)
+
+	seconds := int64(45 * 60)
+	got = parseOpenAIRateLimitResetTime([]byte(fmt.Sprintf(
+		`{"error":{"type":"rate_limit_exceeded","resets_in_seconds":"%d"}}`, seconds,
+	)))
+	require.NotNil(t, got)
+	require.InDelta(t, now.Add(time.Duration(seconds)*time.Second).Unix(), *got, 1)
+}
+
+func TestParseOpenAIRateLimitResetTime_RejectsConcatenatedJSON(t *testing.T) {
+	body := []byte(`{"error":{"type":"rate_limit_exceeded","resets_in_seconds":30}} {"resets_in_seconds":999999}`)
 	require.Nil(t, parseOpenAIRateLimitResetTime(body))
 }
 

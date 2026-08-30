@@ -1,8 +1,11 @@
 package service
 
 import (
+	"net/http"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestCodexSnapshotBaseTime(t *testing.T) {
@@ -58,16 +61,44 @@ func TestCodexResetAtRFC3339(t *testing.T) {
 		}
 	})
 
-	t.Run("negative seconds clamp to base", func(t *testing.T) {
+	t.Run("negative seconds are discarded", func(t *testing.T) {
 		sec := -3
 		got := codexResetAtRFC3339(base, &sec)
-		if got == nil {
-			t.Fatal("expected non-nil")
-		}
-		if *got != "2026-02-16T10:00:00Z" {
-			t.Fatalf("got %s, want %s", *got, "2026-02-16T10:00:00Z")
+		if got != nil {
+			t.Fatalf("expected nil for negative reset, got %v", *got)
 		}
 	})
+
+	t.Run("implausibly large seconds are ignored", func(t *testing.T) {
+		sec := int(1 << 62)
+		if got := codexResetAtRFC3339(base, &sec); got != nil {
+			t.Fatalf("expected nil for oversized reset, got %v", *got)
+		}
+	})
+}
+
+func TestParseCodexRateLimitHeadersRejectsUntrustedResetValues(t *testing.T) {
+	headers := map[string]string{
+		"x-codex-primary-used-percent":                 "100",
+		"x-codex-primary-reset-after-seconds":          "9223372036854775807",
+		"x-codex-secondary-used-percent":               "NaN",
+		"x-codex-secondary-reset-after-seconds":        "-1",
+		"x-codex-primary-over-secondary-limit-percent": "+Inf",
+	}
+	input := make(http.Header)
+	for key, value := range headers {
+		input.Set(key, value)
+	}
+	snapshot := ParseCodexRateLimitHeaders(input)
+	if snapshot == nil {
+		t.Fatal("expected finite used-percent data to keep a snapshot")
+	}
+	if snapshot.PrimaryResetAfterSeconds != nil || snapshot.SecondaryResetAfterSeconds != nil {
+		t.Fatalf("oversized/negative reset values must be discarded: %+v", snapshot)
+	}
+	if snapshot.SecondaryUsedPercent != nil || snapshot.PrimaryOverSecondaryPercent != nil {
+		t.Fatalf("non-finite percentages must be discarded: %+v", snapshot)
+	}
 }
 
 func TestBuildCodexUsageExtraUpdates_UsesSnapshotUpdatedAt(t *testing.T) {
@@ -95,6 +126,9 @@ func TestBuildCodexUsageExtraUpdates_UsesSnapshotUpdatedAt(t *testing.T) {
 
 	if got := updates["codex_usage_updated_at"]; got != "2026-02-16T10:00:00Z" {
 		t.Fatalf("codex_usage_updated_at = %v, want %s", got, "2026-02-16T10:00:00Z")
+	}
+	if got := updates[OpenAICodexUsageObservedAtUnixNanoExtraKey]; got != time.Date(2026, 2, 16, 10, 0, 0, 0, time.UTC).UnixNano() {
+		t.Fatalf("%s = %v, want snapshot observation time", OpenAICodexUsageObservedAtUnixNanoExtraKey, got)
 	}
 	if got := updates["codex_5h_reset_at"]; got != "2026-02-16T11:00:00Z" {
 		t.Fatalf("codex_5h_reset_at = %v, want %s", got, "2026-02-16T11:00:00Z")
@@ -163,7 +197,7 @@ func TestBuildCodexUsageExtraUpdates_FallbackToNowWhenUpdatedAtInvalid(t *testin
 	}
 }
 
-func TestBuildCodexUsageExtraUpdates_ClampNegativeResetSeconds(t *testing.T) {
+func TestBuildCodexUsageExtraUpdates_DiscardNegativeResetSeconds(t *testing.T) {
 	primaryUsed := 90.0
 	primaryReset := 7200
 	primaryWindow := 10080
@@ -186,11 +220,11 @@ func TestBuildCodexUsageExtraUpdates_ClampNegativeResetSeconds(t *testing.T) {
 		t.Fatal("expected non-nil updates")
 	}
 
-	if got := updates["codex_5h_reset_after_seconds"]; got != -15 {
-		t.Fatalf("codex_5h_reset_after_seconds = %v, want %d", got, -15)
+	if got := updates["codex_5h_reset_after_seconds"]; got != nil {
+		t.Fatalf("codex_5h_reset_after_seconds = %v, want absent", got)
 	}
-	if got := updates["codex_5h_reset_at"]; got != "2026-02-16T10:00:00Z" {
-		t.Fatalf("codex_5h_reset_at = %v, want %s", got, "2026-02-16T10:00:00Z")
+	if got := updates["codex_5h_reset_at"]; got != nil {
+		t.Fatalf("codex_5h_reset_at = %v, want absent", got)
 	}
 }
 
@@ -222,4 +256,33 @@ func TestBuildCodexUsageExtraUpdates_WithoutNormalizedWindowFields(t *testing.T)
 	if _, ok := updates["codex_7d_reset_at"]; ok {
 		t.Fatalf("did not expect codex_7d_reset_at in updates: %v", updates["codex_7d_reset_at"])
 	}
+}
+
+func TestBuildCodexUsageExtraUpdates_ClearsStaleWindowWhenUpstreamIsWeeklyOnly(t *testing.T) {
+	primaryUsed := 24.0
+	primaryReset := 3600
+	primaryWindow := 10080
+	snapshot := &OpenAICodexUsageSnapshot{
+		PrimaryUsedPercent:       &primaryUsed,
+		PrimaryResetAfterSeconds: &primaryReset,
+		PrimaryWindowMinutes:     &primaryWindow,
+		UpdatedAt:                "2026-02-20T08:00:00Z",
+	}
+
+	updates := buildCodexUsageExtraUpdates(snapshot, time.Time{})
+	for _, key := range []string{
+		"codex_secondary_used_percent",
+		"codex_secondary_reset_after_seconds",
+		"codex_secondary_window_minutes",
+		"codex_5h_used_percent",
+		"codex_5h_reset_after_seconds",
+		"codex_5h_window_minutes",
+		"codex_5h_reset_at",
+	} {
+		value, ok := updates[key]
+		if !ok || value != nil {
+			t.Fatalf("weekly-only snapshot must tombstone %s, got present=%v value=%v", key, ok, value)
+		}
+	}
+	require.Equal(t, 24.0, updates["codex_7d_used_percent"])
 }

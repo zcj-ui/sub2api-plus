@@ -321,3 +321,42 @@ func TestAnalyzeToolCallOutputContextCoverageBytes(t *testing.T) {
 		})
 	}
 }
+
+func TestCanRebuildOpenAIHTTPContinuationFromInput(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "complete_function_call_context",
+			body: `{"input":[{"type":"function_call","call_id":"call_1"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`,
+			want: true,
+		},
+		{
+			name: "complete_item_reference_context",
+			body: `{"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"item_reference","id":"call_1"}]}`,
+			want: true,
+		},
+		{
+			name: "plain_follow_up_cannot_rebuild_server_chain",
+			body: `{"input":[{"type":"input_text","text":"continue"}]}`,
+			want: false,
+		},
+		{
+			name: "partial_tool_context_cannot_rebuild",
+			body: `{"input":[{"type":"function_call","call_id":"call_1"},{"type":"function_call_output","call_id":"call_1","output":"ok"},{"type":"function_call_output","call_id":"call_2","output":"missing"}]}`,
+			want: false,
+		},
+		{
+			name: "empty_or_invalid_body",
+			body: `{`,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, CanRebuildOpenAIHTTPContinuationFromInput([]byte(tt.body)))
+		})
+	}
+}

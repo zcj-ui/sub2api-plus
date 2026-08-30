@@ -34,7 +34,7 @@ const (
 	claudeAPIURL            = "https://api.anthropic.com/v1/messages?beta=true"
 	claudeAPICountTokensURL = "https://api.anthropic.com/v1/messages/count_tokens?beta=true"
 	stickySessionTTL        = time.Hour // 粘性会话TTL
-	defaultMaxLineSize      = 500 * 1024 * 1024
+	defaultMaxLineSize      = config.DefaultMaxLineSize
 	// Canonical Claude Code banner. Keep it EXACT (no trailing whitespace/newlines)
 	// to match real Claude CLI traffic as closely as possible. When we need a visual
 	// separator between system blocks, we add "\n\n" at concatenation time.
@@ -568,6 +568,16 @@ func shouldClearStickySession(account *Account, requestedModel string) bool {
 	return false
 }
 
+// shouldClearStickySessionForOpenAIRequest keeps legacy compact bindings alive
+// across ordinary account-wide quota/429 windows while retaining all compact
+// lifecycle and model-scoped checks.
+func shouldClearStickySessionForOpenAIRequest(ctx context.Context, account *Account, requestedModel string, requireCompact bool) bool {
+	if !requireCompact {
+		return shouldClearStickySession(account, requestedModel)
+	}
+	return account == nil || !account.IsSchedulableForCompactModelWithContext(ctx, requestedModel)
+}
+
 type AccountWaitPlan struct {
 	AccountID      int64
 	MaxConcurrency int
@@ -725,6 +735,9 @@ func (e *UpstreamFailoverError) IsCredentialFailure() bool {
 // and inference failures retain their existing scheduler-health behavior.
 func (e *UpstreamFailoverError) ShouldReportAccountScheduleFailure() bool {
 	if e == nil {
+		return false
+	}
+	if e.RequestScopedTransient {
 		return false
 	}
 	return !e.IsCredentialFailure() || e.Scope == GatewayFailureScopeAccount
