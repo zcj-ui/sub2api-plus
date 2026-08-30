@@ -296,6 +296,12 @@ func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyI
 			updated_at = NOW()
 		WHERE proxy_id = $1
 			AND deleted_at IS NULL
+			AND (
+				(extra ? 'upstream_billing_probe'
+					AND jsonb_typeof(extra -> 'upstream_billing_probe') <> 'null')
+				OR (extra ? 'ollama_cloud_usage_snapshot'
+					AND jsonb_typeof(extra -> 'ollama_cloud_usage_snapshot') <> 'null')
+			)
 		RETURNING id
 	`, proxyID)
 	if err != nil {

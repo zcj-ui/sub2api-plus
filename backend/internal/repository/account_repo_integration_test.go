@@ -1453,6 +1453,13 @@ func (s *AccountRepoSuite) TestErrorRecoveryRestoresOnlySystemOwnedSchedulabilit
 				Status:      service.StatusActive,
 				Schedulable: tc.initialSchedulable,
 			})
+			// The fixture helper defaults the zero-value bool to true so callers
+			// that omit Schedulable get the normal active-account behavior. Set
+			// the explicit manual-pause case after creation to preserve the
+			// scenario under test.
+			if !tc.initialSchedulable {
+				s.Require().NoError(s.client.Account.UpdateOneID(account.ID).SetSchedulable(false).Exec(s.ctx))
+			}
 			s.Require().NoError(s.repo.SetError(s.ctx, account.ID, "temporary error"))
 			if tc.pauseDuringError {
 				s.Require().NoError(s.repo.SetSchedulable(s.ctx, account.ID, false))
