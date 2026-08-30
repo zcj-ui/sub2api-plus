@@ -223,6 +223,7 @@ func (f *ChannelMonitorQuotaFetcher) cachedSnapshot(accountID int64, now time.Ti
 	return entry.snapshot, true
 }
 
+//nolint:unused // Kept as a small lock-owning helper for package-level cache tests.
 func (f *ChannelMonitorQuotaFetcher) storeSnapshot(accountID int64, snapshot *domain.MonitorQuotaSnapshot, expiry time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

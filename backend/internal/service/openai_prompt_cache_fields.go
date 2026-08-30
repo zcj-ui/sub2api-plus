@@ -180,10 +180,6 @@ func normalizeOpenAIPromptCacheFieldsForEgressWithModel(body []byte, account *Ac
 	return normalizeOpenAIPromptCacheFieldsRawWithSessionModel(body, account, strings.TrimSpace(upstreamModel), strings.TrimSpace(sessionUpstreamModel))
 }
 
-func normalizeOpenAIPromptCacheFieldsRaw(body []byte, account *Account, upstreamModel string) ([]byte, bool, error) {
-	return normalizeOpenAIPromptCacheFieldsRawWithSessionModel(body, account, upstreamModel, "")
-}
-
 func normalizeOpenAIPromptCacheFieldsRawWithSessionModel(body []byte, account *Account, upstreamModel, sessionUpstreamModel string) ([]byte, bool, error) {
 	var decoded map[string]any
 	if err := json.Unmarshal(body, &decoded); err != nil {
@@ -211,14 +207,6 @@ func normalizeOpenAIPromptCacheFieldsRawWithSessionModel(body []byte, account *A
 
 func applyOpenAIPromptCacheFieldsForEgress(account *Account, targetURL string, body []byte) []byte {
 	normalized, changed, err := normalizeOpenAIPromptCacheFieldsForEgress(body, account, targetURL)
-	if err != nil || !changed {
-		return body
-	}
-	return normalized
-}
-
-func applyOpenAIPromptCacheFieldsForEgressWithModel(account *Account, targetURL string, body []byte, upstreamModel, sessionUpstreamModel string) []byte {
-	normalized, changed, err := normalizeOpenAIPromptCacheFieldsForEgressWithModel(body, account, targetURL, upstreamModel, sessionUpstreamModel)
 	if err != nil || !changed {
 		return body
 	}

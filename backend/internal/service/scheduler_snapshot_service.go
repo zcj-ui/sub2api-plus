@@ -545,6 +545,7 @@ func (s *SchedulerSnapshotService) handleLastUsedEvent(ctx context.Context, payl
 	return s.cache.UpdateLastUsed(ctx, updates)
 }
 
+//nolint:unused // Kept as a compatibility wrapper for package-level event tests.
 func (s *SchedulerSnapshotService) handleBulkAccountEvent(ctx context.Context, payload map[string]any, seen map[batchSeenKey]struct{}) error {
 	return s.handleBulkAccountEventAt(ctx, payload, seen, time.Now().UTC())
 }
@@ -700,6 +701,7 @@ func (s *SchedulerSnapshotService) handleBulkAccountEventAt(ctx context.Context,
 	return s.rebuildBuckets(ctx, buckets, "account_bulk_change")
 }
 
+//nolint:unused // Kept as a compatibility wrapper for package-level event tests.
 func (s *SchedulerSnapshotService) handleAccountEvent(ctx context.Context, accountID *int64, payload map[string]any, seen map[batchSeenKey]struct{}) error {
 	return s.handleAccountEventAt(ctx, accountID, payload, seen, time.Now().UTC())
 }

@@ -98,7 +98,7 @@ func openAIImagesCanBypassThresholdPause(ctx context.Context, account *Account) 
 	if account.RateLimitResetAt != nil && now.Before(*account.RateLimitResetAt) {
 		return false
 	}
-	return !(account.IsAPIKeyOrBedrock() && account.IsQuotaExceeded())
+	return !account.IsAPIKeyOrBedrock() || !account.IsQuotaExceeded()
 }
 
 // GetRateLimitRemainingTime 获取限流剩余时间（模型级限流）

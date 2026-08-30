@@ -184,21 +184,22 @@ func TestOpenAIQuotaServiceRejectsOversizedResetBody(t *testing.T) {
 }
 
 func TestOpenAIQuotaServiceNilContextAndInvalidIDGuards(t *testing.T) {
+	ctx := context.TODO()
 	var svc *OpenAIQuotaService
-	_, err := svc.QueryUsage(nil, 0)
+	_, err := svc.QueryUsage(ctx, 0)
 	require.ErrorIs(t, err, ErrOpenAIQuotaInvalidAccountID)
-	_, err = svc.ResetCredit(nil, 0)
+	_, err = svc.ResetCredit(ctx, 0)
 	require.ErrorIs(t, err, ErrOpenAIQuotaInvalidAccountID)
 
 	var nilCacheService *OpenAIQuotaService
-	err = nilCacheService.CacheResetCreditsSnapshot(nil, 1, &OpenAIRateLimitResetCredits{})
+	err = nilCacheService.CacheResetCreditsSnapshot(ctx, 1, &OpenAIRateLimitResetCredits{})
 	require.Error(t, err)
 	require.Equal(t, "OPENAI_QUOTA_CACHE_WRITE_FAILED", infraerrors.Reason(err))
 
 	// A configured service also normalizes a nil context before touching the
 	// repository; the invalid ID guard must win without a panic.
 	svc = &OpenAIQuotaService{}
-	_, err = svc.QueryUsage(nil, -1)
+	_, err = svc.QueryUsage(ctx, -1)
 	require.ErrorIs(t, err, ErrOpenAIQuotaInvalidAccountID)
 }
 

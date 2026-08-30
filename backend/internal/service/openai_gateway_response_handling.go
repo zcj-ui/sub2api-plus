@@ -2066,8 +2066,6 @@ type responsesStreamOutputItem struct {
 	hasOutputIndex       bool
 }
 
-type responsesDoneOutputItem = responsesStreamOutputItem
-
 const (
 	maxResponsesOutputIndex     = 4096
 	maxResponsesDoneOutputItems = 1024
@@ -2674,15 +2672,6 @@ func responsesItemText(item gjson.Result, path string) string {
 	return text.String()
 }
 
-func responsesOutputItemIdentity(item json.RawMessage) string {
-	return responsesOutputItemIdentityResult(gjson.ParseBytes(item))
-}
-
-func responsesOutputItemIdentityResult(parsed gjson.Result) string {
-	primary, _ := responsesOutputItemIdentitiesResult(parsed)
-	return primary
-}
-
 // responsesOutputItemIdentitiesResult returns the preferred item identity and
 // an optional secondary call_id identity. Providers sometimes regenerate an
 // item's id between output_item.done and the terminal response while retaining
@@ -2700,22 +2689,6 @@ func responsesOutputItemIdentitiesResult(parsed gjson.Result) (string, string) {
 		return callID, ""
 	}
 	return "", ""
-}
-
-func appendResponsesOutputItem(output []json.RawMessage, item json.RawMessage) []json.RawMessage {
-	primary, alternate := responsesOutputItemIdentitiesResult(gjson.ParseBytes(item))
-	if primary == "" && alternate == "" {
-		return append(output, item)
-	}
-	for index, candidate := range output {
-		candidatePrimary, candidateAlternate := responsesOutputItemIdentitiesResult(gjson.ParseBytes(candidate))
-		if (primary != "" && (primary == candidatePrimary || primary == candidateAlternate)) ||
-			(alternate != "" && (alternate == candidatePrimary || alternate == candidateAlternate)) {
-			output[index] = item
-			return output
-		}
-	}
-	return append(output, item)
 }
 
 func normalizeResponsesStreamingTerminalOutput(data []byte, acc *apicompat.BufferedResponseAccumulator, doneItems *responsesStreamOutputItems, imageOutputs []json.RawMessage) ([]byte, bool) {

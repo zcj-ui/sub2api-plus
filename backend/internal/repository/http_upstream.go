@@ -1085,15 +1085,6 @@ func (s *httpUpstreamService) isOpenAIHTTP2FallbackActive(proxyKey string) bool 
 	return active
 }
 
-func (s *httpUpstreamService) getOrCreateOpenAIHTTP2FallbackState(proxyKey string) *openAIHTTP2FallbackState {
-	if s == nil {
-		return &openAIHTTP2FallbackState{}
-	}
-	s.openAIHTTP2FallbackMu.Lock()
-	defer s.openAIHTTP2FallbackMu.Unlock()
-	return s.getOrCreateOpenAIHTTP2FallbackStateLocked(proxyKey)
-}
-
 // getOrCreateOpenAIHTTP2FallbackStateLocked is called with
 // openAIHTTP2FallbackMu held.  Keeping lookup and replacement under the same
 // lock as lazy deletion prevents a failure from being recorded on a state that
@@ -1723,19 +1714,6 @@ func (b *trackedBody) recordReadError(err error) {
 	if b.onReadError != nil {
 		b.outcomeOnce.Do(func() { b.onReadError(err) })
 	}
-}
-
-// wrapTrackedBody 包装响应体以跟踪关闭事件
-// 用于在响应体关闭时更新 inFlight 计数
-//
-// 参数:
-//   - body: 原始响应体
-//   - onClose: 关闭时的回调函数
-//
-// 返回:
-//   - io.ReadCloser: 包装后的响应体
-func wrapTrackedBody(body io.ReadCloser, onClose func()) io.ReadCloser {
-	return wrapTrackedBodyWithOutcome(body, onClose, nil, nil)
 }
 
 func wrapTrackedBodyWithOutcome(

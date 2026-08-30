@@ -465,18 +465,9 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
-// isReasoningModel reports whether a model belongs to the broad GPT-5
-// reasoning family. It intentionally remains broader than
-// rejectsSamplingParameters because GPT-5.6 is reasoning-capable while also
-// accepting temperature/top_p.
-func isReasoningModel(model string) bool {
-	return strings.HasPrefix(model, "gpt-5")
-}
-
 // rejectsSamplingParameters reports GPT-5 families that reject temperature
 // and top_p on the Responses API. GPT-5.6 (including Sol/Terra/Luna and
-// dated/Cyber variants) accepts both fields. Keep isReasoningModel above for
-// callers that only need the broad reasoning-family classification.
+// dated/Cyber variants) accepts both fields.
 func rejectsSamplingParameters(model string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	if slash := strings.LastIndex(normalized, "/"); slash >= 0 {
