@@ -122,8 +122,7 @@ func deleteOpenAIResponsesNoneReasoningEffortFromObject(account *Account, body m
 // 强制 store=false 并清除 previous_response_id（官方 /responses 不支持服务端
 // 状态存储，携带这些字段会被拒绝）。非 deepseek responses 协议账号原样返回。
 func normalizeDeepSeekResponsesRequestBody(account *Account, body []byte) []byte {
-	if account == nil || account.Platform != PlatformDeepseek ||
-		(account.GetAPIProtocol() != APIProtocolResponses && !account.IsAdaptiveAPIProtocol()) {
+	if account == nil || !account.UsesNativeCNResponses() {
 		return body
 	}
 	normalized, err := sjson.SetBytes(body, "store", false)
@@ -1680,6 +1679,17 @@ func openAIFastPolicySettingsFromContext(ctx context.Context) *OpenAIFastPolicyS
 	return nil
 }
 
+// openAIGroupForcesFast reports whether a trusted OpenAI group snapshot asks
+// the gateway to send service_tier=priority before evaluating the global Fast
+// policy. The scope is intentionally limited to the OpenAI platform.
+func openAIGroupForcesFast(ctx context.Context, account *Account) bool {
+	if ctx == nil || account == nil || account.Platform != PlatformOpenAI {
+		return false
+	}
+	group, _ := ctx.Value(ctxkey.Group).(*Group)
+	return IsGroupContextValid(group) && groupSupportsOpenAIFast(group.Platform) && group.ForceOpenAIFast
+}
+
 // applyOpenAIFastPolicyToBody applies the OpenAI fast policy to a raw request
 // body. When action=filter it removes the service_tier field; when
 // action=block it returns (body, *OpenAIFastBlockedError). On pass it
@@ -1694,6 +1704,13 @@ func openAIFastPolicySettingsFromContext(ctx context.Context) *OpenAIFastPolicyS
 func (s *OpenAIGatewayService) applyOpenAIFastPolicyToBody(ctx context.Context, account *Account, model string, body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
+	}
+	if openAIGroupForcesFast(ctx, account) {
+		updated, err := sjson.SetBytes(body, "service_tier", OpenAIFastTierPriority)
+		if err != nil {
+			return body, fmt.Errorf("force group service_tier priority on body: %w", err)
+		}
+		body = updated
 	}
 	tierResult := gjson.GetBytes(body, "service_tier")
 	rawTier := tierResult.String()
@@ -1824,6 +1841,13 @@ func (s *OpenAIGatewayService) applyOpenAIFastPolicyToWSResponseCreate(
 	// upstream reject it rather than guessing at our layer.
 	if frameType != "response.create" {
 		return frame, nil, nil
+	}
+	if openAIGroupForcesFast(ctx, account) {
+		updated, err := sjson.SetBytes(frame, "service_tier", OpenAIFastTierPriority)
+		if err != nil {
+			return frame, nil, fmt.Errorf("force group service_tier priority on ws frame: %w", err)
+		}
+		frame = updated
 	}
 	rawTier := gjson.GetBytes(frame, "service_tier").String()
 	if rawTier == "" {

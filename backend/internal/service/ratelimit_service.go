@@ -279,6 +279,7 @@ func (s *RateLimitService) ApplyAccountSchedulingThreshold(ctx context.Context, 
 	thresholds := s.settingService.GetAccountSchedulingThresholds(ctx)
 	decision := EvaluateAccountSchedulingThreshold(account, thresholds, now)
 	if !decision.ShouldPause || decision.Until == nil || !decision.Until.After(now) {
+		s.applyAnthropicFableSchedulingThreshold(ctx, account, thresholds, now)
 		return false
 	}
 
@@ -330,6 +331,38 @@ func (s *RateLimitService) ApplyAccountSchedulingThreshold(ctx context.Context, 
 		"used_percent", decision.UsedPercent,
 		"until", decision.Until.UTC())
 	return true
+}
+
+// applyAnthropicFableSchedulingThreshold parks only the Fable model family
+// when Anthropic's dedicated 7d_oi window crosses the configured threshold;
+// other Claude models remain schedulable.
+func (s *RateLimitService) applyAnthropicFableSchedulingThreshold(ctx context.Context, account *Account, thresholds map[string]int, now time.Time) {
+	decision := evaluateAnthropicFableSchedulingThreshold(account, thresholds, now)
+	if !decision.ShouldPause || decision.Until == nil || !decision.Until.After(now) {
+		return
+	}
+	if account.isRateLimitActiveForKey(anthropicFableRateLimitKey) {
+		return
+	}
+	reason := BuildDetailedAccountSchedulingThresholdReason(AccountSchedulingThresholdReasonInput{
+		Platform:         decision.Platform,
+		Window:           decision.Window,
+		Scope:            decision.Scope,
+		ThresholdPercent: decision.ThresholdPercent,
+		UsedPercent:      decision.UsedPercent,
+		Until:            *decision.Until,
+		Now:              now,
+	})
+	setAccountModelRateLimitSnapshot(account, anthropicFableRateLimitKey, *decision.Until, reason, now)
+	if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, anthropicFableRateLimitKey, *decision.Until, reason); err != nil {
+		slog.Warn("anthropic_fable_scheduling_threshold_set_model_limit_failed",
+			"account_id", account.ID, "threshold_percent", decision.ThresholdPercent,
+			"used_percent", decision.UsedPercent, "until", decision.Until.UTC(), "error", err)
+		return
+	}
+	slog.Info("anthropic_fable_scheduling_threshold_model_rate_limited",
+		"account_id", account.ID, "threshold_percent", decision.ThresholdPercent,
+		"used_percent", decision.UsedPercent, "until", decision.Until.UTC())
 }
 
 func accountHasSameSchedulingThresholdPause(account *Account, until time.Time, reason string) bool {

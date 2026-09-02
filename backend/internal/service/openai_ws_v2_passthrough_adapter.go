@@ -932,10 +932,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughAttempt(
 	if err := validateOpenAIWSBearerToken(account, token); err != nil {
 		return err
 	}
-	if strings.TrimSpace(gjson.GetBytes(firstClientMessage, "type").String()) != "response.create" {
+	firstEventType := strings.TrimSpace(gjson.GetBytes(firstClientMessage, "type").String())
+	// A genuine Responses WebSocket may begin with session.update before the
+	// first response.create. Forward that prelude unchanged; only unsupported
+	// event types are rejected at this boundary.
+	if firstEventType != "response.create" && firstEventType != "session.update" {
 		return NewOpenAIWSClientCloseError(
 			coderws.StatusPolicyViolation,
-			"first relay frame must be response.create after prelude buffering",
+			"first relay frame must be response.create or session.update",
 			nil,
 		)
 	}
@@ -960,7 +964,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughAttempt(
 	}
 	originalFirstClientMessage := firstClientMessage
 	if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-		if capped, changed := ApplyOpenAIReasoningEffortPolicy(firstClientMessage, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+		capped, changed, policyErr := ApplyOpenAIReasoningEffortPolicy(firstClientMessage, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings, hooks.MaxReasoningEffortOverLimit)
+		if policyErr != nil {
+			return NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid reasoning effort policy", policyErr)
+		}
+		if changed {
 			firstClientMessage = capped
 		}
 	}
@@ -1410,7 +1418,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2PassthroughAttempt(
 				}
 				originalResponseCreate := payload
 				if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-					if capped, changed := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+					capped, changed, policyErr := ApplyOpenAIReasoningEffortPolicy(payload, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings, hooks.MaxReasoningEffortOverLimit)
+					if policyErr != nil {
+						return payload, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid reasoning effort policy", policyErr)
+					}
+					if changed {
 						payload = capped
 					}
 				}

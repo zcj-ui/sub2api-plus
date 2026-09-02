@@ -1,6 +1,37 @@
 # Sub2API Plus 更新日志
 
-当前版本：`0.2.9`（本轮源码工具链 Go `1.27.0`；文中早期版本条目保留为历史记录）
+当前版本：`0.2.10`（本轮源码工具链 Go `1.27.0`；文中早期版本条目保留为历史记录）
+
+## 0.2.10 官方最新同步说明（2026-09-01）
+
+本版本紧跟 `Wei-Shaw/sub2api` 官方 `upstream/main` 最新提交 `3510aa22b5`，在 `0.2.9` 的 Plus 定制基础上同步官方近期协议、模型、计费和管理端更新。同步范围覆盖官方 `v0.1.184`、`v0.1.185` 之后的主线提交，Plus 的代理强制绑定、Credits、卡 429、指纹四档和账户调度规则继续保留。
+
+### 已同步的官方能力
+
+- OpenAI/Codex：同步官方 reasoning effort 分组范围控制、Fast/priority 分组策略、OpenAI API Key Chat Cache 身份保持、Responses 模型找不到与限流区分、WS 缺少终态处理、自动化 bootstrap 和 delegation bootstrap 兼容。
+- WebSocket：同步首帧/续帧生命周期、超大帧 HTTP bridge 边界、终态关闭处理、容量降载事件改写和会话模型切换；Plus 的两次明确 429 确认与“奸商模式”长连接粘性继续只作用于 OpenAI/Codex。
+- 国产供应商：同步 Kimi 原生 Responses、DeepSeek/Kimi 自适应端点选择、Fable 5.1 模型识别、智谱/DeepSeek/Kimi 账户模式和配额处理。Kimi/DeepSeek 的原生 Responses 端点不再误走 Chat Completions 基址。
+- 计费与价卡：同步 GPT-5.6、Fable 5.1、缓存写入 1 小时价、OpenAI Fast 免费/强制策略和 reasoning effort 上限；长上下文阶梯继续优先使用目录/override 的显式字段，显式零值可关闭阶梯，xAI 阈值按官方“达到即应用”口径处理。
+- 管理端与前端：同步分组 Fast/Reasoning 控件、用量/支付/兑换页面、账户状态与额度组件、筛选批量编辑、模型目录和新的日期输入格式；保留 Plus 的一键盘点、测活失败池、Credits/美元参考值和代理状态展示。
+- 数据库迁移：纳入官方 usage log native compaction v2、频道 1 小时缓存价、分组 Fast/Reasoning 控制和未分组访问限制迁移；现有 Plus 指纹 seed 修复迁移保持不可变并与新迁移共存。
+
+### 同步期间的兼容修复
+
+- 自适应国产协议路由统一使用 `UsesNativeCNResponses`：DeepSeek 与 Kimi 在有原生端点时发送 `/responses`，GLM 等无原生端点的账号继续发送 `/chat/completions`。
+- OpenAI Responses 的默认 instructions 只注入 OAuth/Codex 请求，API Key 的大输入原样保留，避免第三方兼容上游收到不属于客户端的系统指令。
+- Fast 强制分组在 HTTP、OAuth 透传、原生 Responses 和 WebSocket `response.create` 四条路径都先写入 `service_tier=priority`，再执行全局过滤规则。
+- 认证缓存快照升级到 v22，完整保存 `force_openai_fast`、`free_openai_fast` 和 reasoning effort 超限策略；旧快照会自动回源刷新。
+- WS 容量降载事件采用“先观察、后决定”：若只有一个 pre-output `error` 随即断开，返回请求级 failover；若后续有 `response.failed`，则向客户端改写为可重试的 `server_error`，保留正常长连接体验。
+- Agent Identity 的 Chat 恢复重试复用同一 UUID 形态的 session_id；TTFT 默认按 semantic output 计时，可通过 `openai_ttft_mode` 选择 visible 口径。
+- 定价解析支持显式 override 零阈值、缺失倍率按 1、GPT-5.5 Fast 2.5x、GPT-5.6 Fast 2x 和 Fable 专属 7d_oi 模型限流，避免少计费或把 Fable 误伤为整组 Claude 限流。
+
+### 验证记录
+
+- 完整后端回归：`go test -tags=unit -p 1 -count=1 ./internal/service ./internal/handler ./internal/repository ./migrations` 全部通过。
+- 本地验证使用 Go `1.27.0`，service、handler、repository、migrations 均为 `ok`；`git diff --check` 干净。
+- 之前 `main` 的 CI 和安全扫描均通过；本次同步提交后会重新触发同一套 shell、frontend、golangci-lint、unit、integration 和 security jobs。
+
+> 本版本继续遵循 `LGPL-3.0-or-later`、NOTICE、免责声明和源码构建要求。官方同步不代表生产认证；升级前保留数据库、配置、代理和账户凭据备份，并先用少量账户执行测活与一键盘点。
 
 ## 0.2.9 小版本发布说明（2026-08-30）
 

@@ -312,7 +312,11 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		}
 		requestedReasoningEffort := CanonicalRequestedReasoningEffort(normalized, strings.TrimSpace(values[1].String()))
 		if hooks != nil && (hooks.MaxReasoningEffort != "" || len(hooks.ReasoningEffortMappings) > 0) {
-			if capped, changed := ApplyOpenAIReasoningEffortPolicy(normalized, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings); changed {
+			capped, changed, policyErr := ApplyOpenAIReasoningEffortPolicy(normalized, hooks.MaxReasoningEffort, hooks.ReasoningEffortMappings, hooks.MaxReasoningEffortOverLimit)
+			if policyErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid reasoning effort policy", policyErr)
+			}
+			if changed {
 				normalized = capped
 			}
 		}
@@ -1217,36 +1221,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			}
 			return true
 		}
-		// Capacity-shed frames are request/model-scoped (not account health).
-		// Before semantic output is committed, surface them as a typed failover
-		// so ctx_pool can retry or select another account.  Leaving the original
-		// server_is_overloaded/slow_down code on the wire makes Codex treat the
-		// session as a fatal capacity error and stops its own retry loop (official
-		// issue #5840).  Once semantic output exists, the write path below only
-		// rewrites the client-facing code and preserves the partial turn.
-		capacityShedFailover := func(upstreamMessage []byte, upstreamStatus int, errMsg string) error {
-			if clientDisconnected || wroteSemanticDownstream {
-				return nil
-			}
-			transientStatus := openAIWSPayloadTransientStatus(upstreamMessage)
-			if upstreamStatus >= http.StatusInternalServerError {
-				transientStatus = upstreamStatus
-			}
-			if transientStatus < http.StatusBadRequest || transientStatus == http.StatusTooManyRequests ||
-				!isOpenAIRequestScopedCapacityShed(errMsg, upstreamMessage) {
-				return nil
-			}
-			lease.MarkBroken()
-			return s.newOpenAIAccountFailoverError(
-				account,
-				transientStatus,
-				lease.HandshakeHeaders(),
-				upstreamMessage,
-				strings.TrimSpace(errMsg),
-				false,
-				true,
-			)
-		}
+		var pendingCapacityShedError []byte
 		var pendingJSONDocuments [][]byte
 		for {
 			var upstreamMessage []byte
@@ -1271,6 +1246,20 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 			}
 			if readErr != nil {
+				// A lone pre-output capacity error is held briefly so a following
+				// response.failed can be rewritten for the client. If the upstream
+				// closes immediately, retain the historical request-scoped failover.
+				if len(pendingCapacityShedError) > 0 && !wroteSemanticDownstream && !wroteDownstream {
+					lease.MarkBroken()
+					status := openAIWSPayloadTransientStatus(pendingCapacityShedError)
+					if status < http.StatusInternalServerError {
+						status = http.StatusServiceUnavailable
+					}
+					return nil, s.newOpenAIAccountFailoverError(
+						account, status, lease.HandshakeHeaders(), pendingCapacityShedError,
+						extractOpenAISSEErrorMessage(pendingCapacityShedError), false, true,
+					)
+				}
 				lease.MarkBroken()
 				if clientDisconnected {
 					return nil, NewOpenAIWSClientCloseError(
@@ -1315,11 +1304,27 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				lastEventType = eventType
 			}
+			if len(pendingCapacityShedError) > 0 {
+				clientMessage := pendingCapacityShedError
+				if rewritten, changed := sanitizeOpenAICapacityShedErrorCodeForClient(clientMessage); changed {
+					clientMessage = rewritten
+				}
+				replayCollector.AddEvent("error", pendingCapacityShedError)
+				if err := writeClientMessage(clientMessage); err != nil {
+					return nil, wrapOpenAIWSIngressTurnErrorWithSemantic("write_client", err, wroteDownstream, wroteSemanticDownstream)
+				}
+				wroteDownstream = true
+				pendingCapacityShedError = nil
+			}
 			if eventType == "error" {
+				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
+				if !wroteDownstream && !wroteSemanticDownstream && isOpenAIRequestScopedCapacityShed(errMsgRaw, upstreamMessage) {
+					pendingCapacityShedError = append([]byte(nil), upstreamMessage...)
+					continue
+				}
 				guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
 				canonicalModel := canonicalOpenAIAccountSchedulingModel(account, originalModel)
 				s.handleOpenAIWSErrorEventTransientFailure(ctx, account, canonicalModel, lease.HandshakeHeaders(), upstreamMessage)
-				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
 				statusCode := openAIWSRejectedFieldRetryHTTPStatus(upstreamMessage)
 				if !wroteDownstream && statusCode == http.StatusBadRequest && rejectedFieldRetryState != nil {
 					retryBody, retryReason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(
@@ -1346,11 +1351,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				}
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
-				if !isRateLimit {
-					if capacityErr := capacityShedFailover(upstreamMessage, upstreamStatus, errMsgRaw); capacityErr != nil {
-						return nil, capacityErr
-					}
-				}
 				guardConnectionAtEvent := guardRateLimitedConnectionActive()
 				if guardAccountActiveAtEvent && !guardConnectionAtEvent && !isRateLimit {
 					failedStatus, _ := openAIWS429GuardErrorEventFailureStatus(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw)
@@ -1491,11 +1491,6 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(upstreamMessage)
 				upstreamStatus := openAIWSPayloadUpstreamStatus(upstreamMessage)
 				isRateLimit := recordRateLimitSignal(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, upstreamMessage)
-				if !isRateLimit {
-					if capacityErr := capacityShedFailover(upstreamMessage, upstreamStatus, errMsgRaw); capacityErr != nil {
-						return nil, capacityErr
-					}
-				}
 				// Re-evaluate after recording: this event may be the confirming
 				// 429 that proves and pins this exact lease.
 				guardConnectionAtEvent := guardRateLimitedConnectionActive()

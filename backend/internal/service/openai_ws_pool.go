@@ -23,8 +23,11 @@ const (
 	// The upstream Responses WebSocket has an observed hard lifetime of about
 	// 60 minutes. Retire pooled sockets five minutes earlier so a long-lived
 	// ingress session never starts a turn on a socket at that boundary.
-	openAIWSConnMaxAge             = 55 * time.Minute
-	openAIWSConnHealthCheckIdle    = 90 * time.Second
+	openAIWSConnMaxAge          = 55 * time.Minute
+	openAIWSConnHealthCheckIdle = 90 * time.Second
+	// Deprecated compatibility alias retained for existing pool tests and
+	// integrations that used the previous name for the idle recycle threshold.
+	openAIWSConnIdleRecycleAfter   = openAIWSConnHealthCheckIdle
 	openAIWSConnHealthCheckTO      = 2 * time.Second
 	openAIWSConnPrewarmExtraDelay  = 2 * time.Second
 	openAIWSAcquireCleanupInterval = 3 * time.Second

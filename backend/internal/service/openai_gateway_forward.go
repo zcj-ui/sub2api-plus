@@ -158,8 +158,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 	}
 
-	nativeDeepSeekResponses := account.Platform == PlatformDeepseek &&
-		(account.GetAPIProtocol() == APIProtocolResponses || account.IsAdaptiveAPIProtocol())
+	nativeCNResponses := account.UsesNativeCNResponses()
+	nativeDeepSeekResponses := account.Platform == PlatformDeepseek && nativeCNResponses
 	if nativeDeepSeekResponses && account.Type == AccountTypeAPIKey && !compactPath &&
 		needsOpenAIResponsesClientToolAdaptation(body) {
 		adaptedBody, mapping, adaptErr := adaptOpenAIResponsesClientTools(body)
@@ -386,7 +386,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	instructions := gjson.GetBytes(body, "instructions")
 	instructionsEmpty := !instructions.Exists() || instructions.Type != gjson.String || strings.TrimSpace(instructions.String()) == ""
-	if instructionsEmpty && !compatMessagesBridge && !nativeDeepSeekResponses {
+	if instructionsEmpty && account.UsesOpenAICodexProtocol() && !compatMessagesBridge && !nativeCNResponses {
 		markPatchSet("instructions", defaultCodexSynthInstructions(reqModel))
 	}
 
@@ -673,7 +673,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	// policy helpers already use that interpretation; keeping the request-view
 	// fast path aligned prevents a null value from bypassing a configured
 	// `service_tier=missing` rule.
-	if rawTier := requestView.ServiceTier; openAIFastPolicyTierNeedsEvaluation(body, rawTier) {
+	rawTier := requestView.ServiceTier
+	if openAIGroupForcesFast(ctx, account) {
+		rawTier = OpenAIFastTierPriority
+		if requestView.ServiceTier != OpenAIFastTierPriority {
+			markPatchSet("service_tier", OpenAIFastTierPriority)
+		}
+	}
+	if openAIFastPolicyTierNeedsEvaluation(body, rawTier) {
 		normTier := normalizedOpenAIServiceTierValue(rawTier)
 		if rawTier == "" {
 			normTier = OpenAIFastTierMissing
@@ -1363,13 +1370,13 @@ func shouldForwardOpenAIResponsesViaRawChatCompletions(account *Account) bool {
 		return false
 	}
 	if account.IsCNProvider() {
-		// CN 的显式协议配置优先于异步探针 Extra；adaptive 仅 DeepSeek 有原生
-		// Responses，Kimi/GLM 回退 Chat Completions。
+		// CN 的显式协议配置优先于异步探针 Extra；adaptive 对提供原生
+		// Responses 的 DeepSeek/Kimi 走 Responses，GLM 回退 Chat Completions。
 		switch account.GetAPIProtocol() {
 		case APIProtocolChatCompletions:
 			return true
 		case APIProtocolAdaptive:
-			return account.Platform != PlatformDeepseek
+			return !account.SupportsNativeCNResponses()
 		default:
 			return false
 		}
@@ -1393,7 +1400,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 	case AccountTypeAPIKey:
 		// API Key accounts use Platform API or custom base URL
 		baseURL := account.GetOpenAIBaseURL()
-		if account.Platform == PlatformDeepseek && account.IsAdaptiveAPIProtocol() {
+		if account.UsesNativeCNResponses() && account.IsAdaptiveAPIProtocol() {
 			baseURL = account.GetCNProtocolBaseURL(APIProtocolResponses)
 		}
 		if baseURL == "" {
@@ -1502,6 +1509,12 @@ func (s *OpenAIGatewayService) buildUpstreamRequest(ctx context.Context, c *gin.
 		preserveSession := shouldPreserveOutboundCodexClientSession(c, account)
 		if promptCacheKey != "" && !preserveSession {
 			isolated := isolateOpenAIOAuthSessionValue(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey)
+			// Agent Identity uses the same UUID-shaped session carrier as the
+			// official ChatGPT client; keep the derived value stable across the
+			// one-time task re-registration retry.
+			if account.IsOpenAIAgentIdentity() {
+				isolated = generateSessionUUID(isolated)
+			}
 			req.Header.Set("session_id", isolated)
 			if !compatMessagesBridge || clientConversationID != "" {
 				req.Header.Set("conversation_id", isolated)

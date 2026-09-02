@@ -67,7 +67,7 @@ func TestOpenAIImagesOAuthUnavailableCooldownSettings_SetEnforcesStrictRange(t *
 	require.Equal(t, openAIImagesOAuthUnavailableMaxCooldownMinutes, persisted.CooldownMinutes)
 }
 
-func TestOpenAIGatewayService_CoolOpenAIImagesOAuthToolUsesConfiguredCooldown(t *testing.T) {
+func TestOpenAIGatewayService_CoolOpenAIImagesOAuthToolUsesConfiguredCooldownCustom(t *testing.T) {
 	accountRepo := &modelNotFoundAccountRepoStub{}
 	settingRepo := newMockSettingRepo()
 	settingRepo.data[SettingKeyOpenAIImagesOAuthUnavailableCooldownSettings] = `{"cooldown_minutes":7}`
