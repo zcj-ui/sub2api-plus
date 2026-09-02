@@ -11,12 +11,12 @@ describe('defaultCNAdaptiveBaseUrls', () => {
     expect(defaultCNAdaptiveBaseUrls('kimi', 'payg')).toEqual({
       chat_completions: 'https://api.moonshot.cn/v1',
       anthropic: 'https://api.moonshot.cn/anthropic',
-      responses: ''
+      responses: 'https://api.moonshot.cn/v1'
     })
     expect(defaultCNAdaptiveBaseUrls('kimi', 'coding')).toEqual({
       chat_completions: 'https://api.kimi.com/coding/v1',
       anthropic: 'https://api.kimi.com/coding',
-      responses: ''
+      responses: 'https://api.kimi.com/coding/v1'
     })
   })
 

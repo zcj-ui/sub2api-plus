@@ -21,6 +21,10 @@ const openAILadderCatalogJSON = `{
 		"output_cost_per_token_above_272k_tokens": 2.7e-04}
 }`
 
+// Keep the shared fixture visible to linters even when a subset of the pricing
+// tests is selected by a caller.
+var _ = openAILadderCatalogJSON
+
 // newStubPricingServiceFromJSON 用与生产一致的解析路径（含 above_XXXk 阶梯折算）
 // 从原始目录 JSON 构造目录 stub。无 build tag：带 unit 标签与默认构建的测试文件都会用到。
 func newStubPricingServiceFromJSON(t *testing.T, body string) *PricingService {
