@@ -997,7 +997,7 @@
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintMode') }}</label>
           <input
-            id="bulk-edit-codex-fingerprint-mode-enabled"
+            id="bulk-edit-openai-codex-fingerprint-mode-enabled"
             v-model="enableCodexFingerprintMode"
             type="checkbox"
             data-testid="bulk-codex-fingerprint-mode-enabled"

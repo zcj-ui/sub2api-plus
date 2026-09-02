@@ -788,22 +788,19 @@ function generateAnthropicFiles(baseUrl: string, apiKey: string): FileConfig[] {
       path = 'Terminal'
       content = `export ANTHROPIC_BASE_URL=${quoteUnixShellValue(baseUrl)}
 export ANTHROPIC_AUTH_TOKEN=${quoteUnixShellValue(apiKey)}
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
       break
     case 'cmd':
       path = 'Command Prompt'
       content = `${formatCmdEnvironmentAssignment('ANTHROPIC_BASE_URL', baseUrl)}
 ${formatCmdEnvironmentAssignment('ANTHROPIC_AUTH_TOKEN', apiKey)}
-set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-set CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
       break
     case 'powershell':
       path = 'PowerShell'
       content = `$env:ANTHROPIC_BASE_URL=${quotePowerShellValue(baseUrl)}
 $env:ANTHROPIC_AUTH_TOKEN=${quotePowerShellValue(apiKey)}
-$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-$env:CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
       break
     default:
       path = 'Terminal'
@@ -820,7 +817,6 @@ $env:CLAUDE_CODE_ATTRIBUTION_HEADER=0`
       ANTHROPIC_BASE_URL: baseUrl,
       ANTHROPIC_AUTH_TOKEN: apiKey,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      CLAUDE_CODE_ATTRIBUTION_HEADER: '0'
     }
   }, null, 2)
 
@@ -845,7 +841,6 @@ function generateGrokClaudeFiles(baseUrl: string, apiKey: string): FileConfig[] 
     ANTHROPIC_DEFAULT_FABLE_MODEL: 'grok-4.5',
     CLAUDE_CODE_SUBAGENT_MODEL: 'grok-4.5',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-    CLAUDE_CODE_ATTRIBUTION_HEADER: '0'
   }
   let path: string
   let content: string
@@ -1779,6 +1774,22 @@ function generateOpenCodeConfig(platform: string, baseUrl: string, apiKey: strin
     }
   }
   const claudeModels = {
+    'claude-fable-5-1': {
+      name: 'Claude Fable 5.1',
+      limit: {
+        context: 1048576,
+        output: 128000
+      },
+      modalities: {
+        input: ['text', 'image', 'pdf'],
+        output: ['text']
+      },
+      options: {
+        thinking: {
+          type: 'adaptive'
+        }
+      }
+    },
     'claude-fable-5': {
       name: 'Claude Fable 5',
       limit: {

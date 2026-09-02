@@ -3126,7 +3126,7 @@ const cnProtocolOptions = computed<Array<{ value: CnApiProtocol; labelKey: strin
     { value: 'chat_completions', labelKey: 'chatCompletions' },
     { value: 'anthropic', labelKey: 'anthropic' }
   ]
-  if (props.account?.platform === 'deepseek') {
+  if (props.account?.platform === 'deepseek' || props.account?.platform === 'kimi') {
     opts.push({ value: 'responses', labelKey: 'responses' })
   }
   return opts
@@ -3136,7 +3136,7 @@ const editAdaptiveProtocolOptions = computed<Array<{ value: CnNativeApiProtocol;
     { value: 'chat_completions', labelKey: 'chatCompletions' },
     { value: 'anthropic', labelKey: 'anthropic' }
   ]
-  if (props.account?.platform === 'deepseek') opts.push({ value: 'responses', labelKey: 'responses' })
+  if (props.account?.platform === 'deepseek' || props.account?.platform === 'kimi') opts.push({ value: 'responses', labelKey: 'responses' })
   return opts
 })
 watch(editApiProtocol, (protocol, previousProtocol) => {
@@ -4070,7 +4070,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
         storedProtocol === 'responses'
           ? storedProtocol
           : 'chat_completions'
-      if (newAccount.platform !== 'deepseek' && editApiProtocol.value === 'responses') {
+      if (newAccount.platform !== 'deepseek' && newAccount.platform !== 'kimi' && editApiProtocol.value === 'responses') {
         editApiProtocol.value = 'chat_completions'
       }
       const adaptiveDefaults = defaultCNAdaptiveBaseUrls(newAccount.platform, editAccountMode.value)

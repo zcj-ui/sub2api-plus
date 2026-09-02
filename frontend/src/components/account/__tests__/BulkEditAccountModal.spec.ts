@@ -486,7 +486,7 @@ describe('BulkEditAccountModal', () => {
       selectedTypes: ['oauth']
     })
 
-    await wrapper.get('#bulk-edit-codex-fingerprint-mode-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-openai-codex-fingerprint-mode-enabled').setValue(true)
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()
 
@@ -505,7 +505,7 @@ describe('BulkEditAccountModal', () => {
     })
 
     const select = wrapper.get('[data-testid="bulk-codex-fingerprint-mode-select"]')
-    await wrapper.get('#bulk-edit-codex-fingerprint-mode-enabled').setValue(true)
+    await wrapper.get('#bulk-edit-openai-codex-fingerprint-mode-enabled').setValue(true)
     await select.setValue('session')
     await wrapper.get('#bulk-edit-account-form').trigger('submit.prevent')
     await flushPromises()

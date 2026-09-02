@@ -305,7 +305,7 @@ export function validateZhipuTeamIDs(
   return null
 }
 
-/** 仅 deepseek 支持原生 responses；adaptive 会按入站协议选择原生端点。 */
+/** DeepSeek 与 Kimi 支持原生 responses；adaptive 会按入站协议选择原生端点。 */
 export type CnApiProtocol = 'adaptive' | 'chat_completions' | 'anthropic' | 'responses'
 export type CnNativeApiProtocol = Exclude<CnApiProtocol, 'adaptive'>
 
@@ -379,7 +379,7 @@ export function defaultCNAdaptiveBaseUrls(
   return {
     chat_completions: defaultCNBaseUrl(platform, mode, 'chat_completions'),
     anthropic: defaultCNBaseUrl(platform, mode, 'anthropic'),
-    responses: platform === 'deepseek' ? defaultCNBaseUrl(platform, mode, 'responses') : ''
+    responses: platform === 'deepseek' || platform === 'kimi' ? defaultCNBaseUrl(platform, mode, 'responses') : ''
   }
 }
 
