@@ -13,11 +13,11 @@
 
 ```bash
 docker build \
-  --build-arg VERSION=0.2.10 \
+  --build-arg VERSION=0.2.11 \
   --build-arg BUILD_TYPE=release \
   --build-arg UPDATE_REPO=zcj-ui/sub2api-plus \
   --build-arg REPOSITORY_URL=https://github.com/zcj-ui/sub2api-plus \
-  -t ghcr.io/zcj-ui/sub2api-plus:0.2.10 .
+  -t ghcr.io/zcj-ui/sub2api-plus:0.2.11 .
 ```
 
 开发镜像把 `VERSION` 换成 `0.2.11-dev.1.local`、`BUILD_TYPE` 换成 `dev`。
@@ -37,7 +37,7 @@ pnpm build
 ```bash
 cd ../backend
 go build -tags embed -trimpath \
-  -ldflags="-s -w -X main.Version=0.2.10 -X main.BuildType=release -X main.UpdateRepo=zcj-ui/sub2api-plus" \
+  -ldflags="-s -w -X main.Version=0.2.11 -X main.BuildType=release -X main.UpdateRepo=zcj-ui/sub2api-plus" \
   -o bin/sub2api ./cmd/server
 ```
 
