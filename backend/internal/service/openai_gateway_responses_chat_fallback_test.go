@@ -20,6 +20,22 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestBufferCompatCompactAsResponses_PreservesUpstreamRequestHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "X-Upstream-Request-Id": []string{"compact-relay-id"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"chatcmpl_compact","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)),
+	}
+	defer func() { _ = resp.Body.Close() }()
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig()}
+	result, err := svc.bufferCompatCompactAsResponses(context.Background(), c, nil, resp, "gpt-5.4", false, "gpt-5.4", "gpt-5.4", nil, nil, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, "compact-relay-id", result.UpstreamHeaders.Get("X-Upstream-Request-Id"))
+}
+
 func TestForwardResponses_ForceChatCompletionsRoutesNonStreamingToChatCompletions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -116,7 +132,7 @@ func TestForwardResponses_PassthroughFlagWithUnsupportedResponsesUsesAccountMapp
 
 			upstream := &httpUpstreamRecorder{resp: &http.Response{
 				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Header:     http.Header{"Content-Type": []string{"application/json"}, "X-Upstream-Request-Id": []string{"relay-compact-request"}},
 				Body: io.NopCloser(strings.NewReader(
 					`{"id":"chatcmpl_mapping","object":"chat.completion","model":"gpt-5.4-account","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
 				)),
@@ -142,6 +158,7 @@ func TestForwardResponses_PassthroughFlagWithUnsupportedResponsesUsesAccountMapp
 			require.NotNil(t, result)
 			require.Equal(t, "http://upstream.example/v1/chat/completions", upstream.lastReq.URL.String())
 			require.Equal(t, "gpt-5.4-account", gjson.GetBytes(upstream.lastBody, "model").String())
+			require.Equal(t, "relay-compact-request", result.UpstreamHeaders.Get("X-Upstream-Request-Id"))
 		})
 	}
 }

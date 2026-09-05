@@ -209,6 +209,7 @@ func (s *OpenAIGatewayService) bufferCompatCompactAsResponses(
 
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
+		UpstreamHeaders:             resp.Header,
 		Usage:                       usage,
 		Model:                       originalModel,
 		BillingModel:                billingModel,
@@ -260,6 +261,7 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsResponses(
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
 		ResponseID:                  responseID,
+		UpstreamHeaders:             resp.Header,
 		Usage:                       usage,
 		Model:                       originalModel,
 		BillingModel:                billingModel,
@@ -359,6 +361,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
 			ResponseID:                  strings.TrimSpace(state.ResponseID),
+			UpstreamHeaders:             resp.Header,
 			Usage:                       scan.Usage,
 			Model:                       originalModel,
 			BillingModel:                billingModel,
@@ -375,6 +378,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 		return &OpenAIForwardResult{
 			RequestID:                   requestID,
 			ResponseID:                  strings.TrimSpace(state.ResponseID),
+			UpstreamHeaders:             resp.Header,
 			Usage:                       scan.Usage,
 			Model:                       originalModel,
 			BillingModel:                billingModel,
@@ -439,6 +443,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsResponses(
 	return &OpenAIForwardResult{
 		RequestID:                   requestID,
 		ResponseID:                  strings.TrimSpace(state.ResponseID),
+		UpstreamHeaders:             resp.Header,
 		Usage:                       scan.Usage,
 		Model:                       originalModel,
 		BillingModel:                billingModel,

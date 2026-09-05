@@ -710,6 +710,15 @@ func TestOpenAIWS429GuardErrorEventFailureStatus(t *testing.T) {
 }
 
 func TestOpenAIGatewayService_Forward_WSv2_GuardErrorEventNon429FailsOver(t *testing.T) {
+	testGuardErrorEventNon429(t, `{"type":"error","error":{"status_code":403,"code":"forbidden","message":"upstream rejected"}}`, http.StatusForbidden, false)
+}
+
+func TestOpenAIGatewayService_Forward_WSv2_GuardRecordsRejectedEncryptedContent(t *testing.T) {
+	testGuardErrorEventNon429(t, `{"type":"error","error":{"status_code":400,"code":"invalid_encrypted_content","message":"The encrypted content could not be verified"}}`, http.StatusBadRequest, true)
+}
+
+func testGuardErrorEventNon429(t *testing.T, errorEvent string, wantStatus int, checkLineage bool) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	cfg := newOpenAIWSV2TestConfig()
 	cfg.Security.URLAllowlist.Enabled = false
@@ -721,7 +730,7 @@ func TestOpenAIGatewayService_Forward_WSv2_GuardErrorEventNon429FailsOver(t *tes
 
 	captureConn := &openAIWSCaptureConn{events: [][]byte{
 		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_error_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
-		[]byte(`{"type":"error","error":{"status_code":403,"code":"forbidden","message":"upstream rejected"}}`),
+		[]byte(errorEvent),
 	}}
 	pool := newOpenAIWSConnPool(cfg)
 	pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: captureConn})
@@ -752,7 +761,7 @@ func TestOpenAIGatewayService_Forward_WSv2_GuardErrorEventNon429FailsOver(t *tes
 	seedCtx, _ := gin.CreateTestContext(seedRec)
 	seedCtx.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
 	seedCtx.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
-	seedResult, seedErr := svc.Forward(context.Background(), seedCtx, account, []byte(`{"model":"gpt-5.1","stream":false,"input":"seed"}`))
+	seedResult, seedErr := svc.Forward(context.Background(), seedCtx, account, []byte(`{"model":"gpt-5.1","stream":false,"prompt_cache_key":"anthropic-cache-lineage","input":"seed"}`))
 	require.NoError(t, seedErr)
 	require.NotNil(t, seedResult)
 	ap, ok := pool.getAccountPool(account.ID)
@@ -772,16 +781,35 @@ func TestOpenAIGatewayService_Forward_WSv2_GuardErrorEventNon429FailsOver(t *tes
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
-	result, err := svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5.1","stream":false,"previous_response_id":"resp_guard_error_seed","input":"hello"}`))
+	body := []byte(`{"model":"gpt-5.1","stream":false,"prompt_cache_key":"anthropic-cache-lineage","previous_response_id":"resp_guard_error_seed","input":[{"type":"reasoning","encrypted_content":"rejected-cipher","summary":[]},{"role":"user","content":"hello"}]}`)
+	result, err := svc.Forward(context.Background(), c, account, body)
 	require.Error(t, err)
 	require.Nil(t, result)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
-	require.Equal(t, http.StatusForbidden, failoverErr.StatusCode)
+	require.Equal(t, wantStatus, failoverErr.StatusCode)
 	ap.mu.Lock()
 	_, stillPooled := ap.conns[oldConnID]
 	ap.mu.Unlock()
 	require.False(t, stillPooled, "a guard socket with a non-429 error event must be evicted")
+	if checkLineage {
+		nextConn := &openAIWSCaptureConn{events: [][]byte{[]byte(`{"type":"response.completed","response":{"id":"resp_lineage_next","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`)}}
+		pool.setClientDialerForTest(&openAIWSCaptureDialer{conn: nextConn})
+		nextAccount := *account
+		nextAccount.ID++
+		nextCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		nextCtx.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		nextCtx.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		nextResult, nextErr := svc.Forward(context.Background(), nextCtx, &nextAccount, body)
+		require.NoError(t, nextErr)
+		require.NotNil(t, nextResult)
+		nextConn.mu.Lock()
+		defer nextConn.mu.Unlock()
+		require.Len(t, nextConn.writes, 1)
+		wire := requestToJSONString(nextConn.writes[0])
+		require.NotContains(t, wire, "rejected-cipher", "the next ordinary HTTP request must strip the rejected ciphertext")
+		require.Contains(t, wire, "hello")
+	}
 }
 
 func TestOpenAIWSPayloadString_OnlyAcceptsStringValues(t *testing.T) {

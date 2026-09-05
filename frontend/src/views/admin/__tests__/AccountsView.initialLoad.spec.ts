@@ -131,23 +131,22 @@ describe('admin AccountsView initial page load', () => {
     listHealthProbeFailures.mockResolvedValue([])
   })
 
-  it('首次列表加载不使用 lite 精简响应，保证整表字段完整', async () => {
+  it('首次列表使用 compact DTO 并保留状态和 Plus 指纹字段', async () => {
     listAccounts.mockResolvedValue(page([fullAccount(1), fullAccount(2)]))
 
     const wrapper = mountView()
     await flushPromises()
 
     expect(listAccounts).toHaveBeenCalled()
-    // 精简响应只含 id/name/platform/type/健康快照，会让状态、额度、指纹等列渲染损坏；
-    // 首屏必须走完整列表（lite 仅保留给全选元数据这类只读 ID 的场景）。
+    // 官方 compact DTO 保留 status/extra/runtime，只省略重复分组和秘密字段。
     const pageLoadCalls = listAccounts.mock.calls.filter(([_page, size]) => size !== 1000)
     expect(pageLoadCalls.length).toBeGreaterThan(0)
     for (const call of pageLoadCalls) {
       const requestParams = (call[2] ?? {}) as Record<string, unknown>
-      expect(requestParams.lite).toBeUndefined()
+      expect(requestParams.lite).toBe('1')
     }
 
-    // 完整响应的 status / extra 必须原样进入表格渲染
+    // compact 响应的 status / extra 必须原样进入表格渲染
     const rows = wrapper.findAll('.test-row')
     expect(rows.length).toBe(2)
     expect(rows[0].text()).toBe('active|session')

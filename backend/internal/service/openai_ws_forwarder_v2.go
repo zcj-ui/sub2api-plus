@@ -720,6 +720,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 		}
 		imageCounter.AddSSEData(message)
 
+		if eventType == "error" || eventType == "response.failed" {
+			markOpenAICyberPolicyEvent(c, message, http.StatusOK, usage)
+		}
 		if eventType == "response.failed" {
 			guardAccountActiveAtEvent := s.isOpenAIWS429GuardAccountActiveForLease(account, lease)
 			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(message)
@@ -730,16 +733,6 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
 			// signal is retained, while a non-429 failure on an unproven fresh
 			// socket is never allowed to return to the pool.
 			guardConnectionAtEvent := guardRateLimitedConnectionActive()
-			if hit, code, msg := detectOpenAICyberPolicy(message); hit {
-				MarkOpsCyberPolicy(c, CyberPolicyMark{
-					Code:           code,
-					Message:        msg,
-					Body:           truncateString(string(message), 4096),
-					UpstreamStatus: http.StatusOK,
-					UpstreamInTok:  usage.InputTokens,
-					UpstreamOutTok: usage.OutputTokens,
-				})
-			}
 			if guardAccountActiveAtEvent && !guardConnectionAtEvent && !isRateLimit {
 				failedStatus, _ := openAIWS429GuardErrorEventFailureStatus(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw)
 				lease.MarkBroken()

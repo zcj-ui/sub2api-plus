@@ -15,7 +15,7 @@
 | 开发版 | 推送 `dev` | 多平台归档、SHA256、GHCR `dev` 和不可变版本标签 | 联调、测试和验收 |
 | 正式版 | 推送 `vX.Y.Z` | GitHub Release、多平台归档、SHA256、GHCR 多架构镜像和 `latest` | 固定版本验收、在线更新和回滚验证，不代表可直接生产部署 |
 
-开发版 Actions Artifact 保留 14 天，不覆盖稳定版。正式工作流只接受三段式标签，例如 `v0.2.11`。
+开发版 Actions Artifact 保留 14 天，不覆盖稳定版。正式工作流只接受三段式标签，例如 `v0.2.12`。
 
 新仓库首次只推送 `main`/`dev` 源码时不会生成 `latest`；`dev` 工作流只发布开发镜像。首个经过审查的 `vX.Y.Z` 标签工作流成功后，Compose 默认的 `ghcr.io/zcj-ui/sub2api-plus:latest` 才可使用。
 
@@ -52,7 +52,7 @@ git pull --ff-only origin dev
 git push origin dev
 ```
 
-开发工作流从 `backend/cmd/server/VERSION` 推导下一个补丁版本，例如 `0.2.11-dev.42.1a2b3c4d`，构建 Linux、Windows、macOS 的 amd64/arm64 归档（Windows arm64 除外），并发布 `ghcr.io/zcj-ui/sub2api-plus:dev`。
+开发工作流从 `backend/cmd/server/VERSION` 推导下一个补丁版本，例如文件为 `0.2.12` 时产物为 `0.2.13-dev.42.1a2b3c4d`。它构建 Linux、Windows、macOS 的 amd64/arm64 归档（Windows arm64 除外），并发布 `ghcr.io/zcj-ui/sub2api-plus:dev`。这个开发预览号不表示下一正式版已发布。
 
 ## 正式版
 
@@ -61,15 +61,15 @@ git push origin dev
 ```bash
 git switch main
 git pull --ff-only origin main
-printf '0.2.11\n' > backend/cmd/server/VERSION
+printf '0.2.12\n' > backend/cmd/server/VERSION
 git add backend/cmd/server/VERSION docs/releases/
-git commit -m "chore: prepare v0.2.11"
-git tag -a v0.2.11 -m "Sub2API Plus v0.2.11"
+git commit -m "chore: prepare v0.2.12"
+git tag -a v0.2.12 -m "Sub2API Plus v0.2.12"
 git push origin main
-git push origin v0.2.11
+git push origin v0.2.12
 ```
 
-正式工作流从同一标签构建前后端，不向 `main` 自动写回版本文件。构建会注入版本、提交、时间、`release` 类型和更新仓库。
+上述版本号是示例，执行前必须选择尚未发布的新版本；不得覆盖或强制移动既有标签。先让相同源码提交的 dev CI 和开发构建通过，再合入 main 并推送正式标签。正式工作流从同一标签构建前后端，不向 `main` 自动写回版本文件。构建会注入版本、提交、时间、`release` 类型和更新仓库。
 
 ## 在线更新与回滚
 
