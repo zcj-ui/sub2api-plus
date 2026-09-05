@@ -251,8 +251,14 @@ func TestAccountHandlerListLitePreservesPlusMetadata(t *testing.T) {
 	require.Contains(t, item, "current_concurrency")
 	credentials, _ := item["credentials"].(map[string]any)
 	require.NotContains(t, credentials, "access_token")
-	require.Equal(t, true, item["credentials_status"].(map[string]any)["has_access_token"])
-	require.Equal(t, service.AccountHealthProbeStatusFailed, item["extra"].(map[string]any)[service.AccountHealthProbeExtraKey].(map[string]any)["status"])
+	credentialsStatus, ok := item["credentials_status"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, true, credentialsStatus["has_access_token"])
+	extra, ok := item["extra"].(map[string]any)
+	require.True(t, ok)
+	health, ok := extra[service.AccountHealthProbeExtraKey].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, service.AccountHealthProbeStatusFailed, health["status"])
 }
 
 func TestAccountHandlerListReturnsSchedulerScoresPerGroup(t *testing.T) {
