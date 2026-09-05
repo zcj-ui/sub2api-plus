@@ -340,6 +340,8 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
+	proxyID *int64,
+	proxyName string,
 	startTime time.Time,
 	originalModel string,
 	reasoningEffort string,
@@ -355,8 +357,8 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 	)
 	requestID := strings.TrimSpace(responseHeaders.Get("x-request-id"))
 	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
-		ProxyID:   opsUpstreamProxyID(account),
-		ProxyName: opsUpstreamProxyName(account),
+		ProxyID:   proxyID,
+		ProxyName: proxyName,
 		Platform:  account.Platform, AccountID: account.ID, AccountName: account.Name,
 		UpstreamStatusCode: http.StatusGatewayTimeout, UpstreamRequestID: requestID,
 		Kind: "first_output_timeout", Message: "OpenAI upstream produced no semantic output before the deadline",

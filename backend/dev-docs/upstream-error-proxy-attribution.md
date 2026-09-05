@@ -30,6 +30,12 @@ The two sentinel names have strict meanings:
   legacy events, pre-transport credential failures, and OpenAI WebSocket use of
   the default HTTP client.
 
+Invariant: `proxy_id` is `null` if and only if `proxy_name` is one of the two
+sentinels. A managed proxy with a blank name (defensive only; `proxies.name` is
+non-empty) is labeled `proxy`. Both the struct normalizer used at append time
+and the JSON normalizer used on detail reads enforce this, so an event can never
+carry `proxy_id=null` together with a real proxy name.
+
 ## Why the account snapshot is event-time evidence
 
 Account selection loads `ProxyID` and `Proxy` into one in-memory snapshot. HTTP,
@@ -59,6 +65,10 @@ handling.
 For WebSocket errors without a usable account proxy, the event stores
 `proxy_id=null` and `proxy_name=unknown`. It does not infer whether the default
 client selected an environment proxy or a direct connection after the fact.
+This applies to every event produced while a request is on the WebSocket
+transport, including WS handshake/fallback errors and the first-output timeout
+raised by the WS passthrough relay; `opsUpstreamWSProxyAttribution` is the
+accessor for those sites and never returns `direct/no_proxy`.
 
 Credential acquisition failures that occur before the inference transport is
 opened are also recorded as unknown. The account's proxy binding is not treated
@@ -68,22 +78,40 @@ Each failure site constructs a complete `OpsUpstreamErrorEvent`. Its literal
 sets `proxy_id` and `proxy_name` from the same route input used by the attempt.
 Credential-free accessors copy only the managed proxy ID and name. A fallback
 proxy needs no special event flag: its event-time ID and name are the historical
-route evidence.
+route evidence. Shared helpers that assemble the event on behalf of a caller
+(`handleUpstreamTransportError`, `handleOpenAIUpstreamTransportError`,
+`appendOpenAICompactFallbackRetryOps`, `recordOpenAIRawStreamTruncation`,
+`newOpenAIFirstOutputTimeoutError`) stamp attribution themselves, so a caller
+cannot forget it. Every non-test `OpsUpstreamErrorEvent{` literal in
+`backend/internal/service` must either set `ProxyName` or be passed to one of
+those helpers; grep for literals missing `ProxyName` before merging changes
+that add a failure site.
 
 `appendOpsUpstreamError` accepts only the completed event. It does not receive
 an `Account`, query current account state, or infer proxy attribution while
 appending. Once appended, the event contains only scalar snapshot values, so
 later account mutation or failover cannot change an earlier event.
 
-Queue sanitization preserves every non-nil attempt event. To bound asynchronous
-queue memory, only the last 16 attempts retain the larger `detail` and
-`upstream_response_body` values; older attempts keep their timestamps, account,
-proxy, status, kind, message, and other scalar metadata.
+Queue sanitization keeps attempt events newest-first under hard bounds:
+
+- the newest 16 attempts retain `detail` and `upstream_response_body` (each
+  capped at the queue body limit) plus `upstream_url`/`message` up to 2048
+  bytes;
+- older attempts keep timestamps, account, proxy, status, kind, stage, scope,
+  reason and a `upstream_url`/`message` trimmed to 512 bytes; an attempt whose
+  only payload was a cleared `detail` is still retained;
+- at most 256 attempts and roughly 512 KiB of serialized JSON are kept per
+  request. When either bound drops attempts, the oldest retained event carries
+  `dropped_earlier_attempts` with the number of discarded earlier attempts. The
+  newest attempt is always retained because it decides the request outcome.
 
 ## Legacy events and analytics
 
-Legacy JSON is not rewritten in the database. Detail reads and the shared parser
-materialize missing attribution as:
+Legacy JSON is not rewritten in the database. Detail reads edit only the
+`proxy_id`/`proxy_name` keys of events that lack valid attribution, so keys
+written by older struct versions and the stored key order are preserved. The
+shared parser applies the same rule to the decoded structs. Both materialize
+missing attribution as:
 
 ```json
 {

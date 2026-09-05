@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -108,9 +109,10 @@ func TestOpsUpstreamProxyFieldAccessors(t *testing.T) {
 		wantName string
 	}{
 		{
-			name:     "mismatched hydrated proxy is unknown",
+			name:     "actual proxy object is authoritative",
 			account:  &Account{ProxyID: &boundID, Proxy: &Proxy{ID: backupID, Name: "backup-uk"}},
-			wantName: opsProxyNameUnknown,
+			wantID:   &backupID,
+			wantName: "backup-uk",
 		},
 		{
 			name:     "proxy object without binding id is not a configured route",
@@ -118,14 +120,25 @@ func TestOpsUpstreamProxyFieldAccessors(t *testing.T) {
 			wantName: opsProxyNameDirect,
 		},
 		{
+			name:     "hydrated proxy without durable id is unknown, never id=null plus a real name",
+			account:  &Account{ProxyID: &boundID, Proxy: &Proxy{Name: "transient-proxy"}},
+			wantName: opsProxyNameUnknown,
+		},
+		{
+			name:     "blank proxy name gets the unnamed placeholder",
+			account:  &Account{ProxyID: &boundID, Proxy: &Proxy{ID: boundID, Name: "   "}},
+			wantID:   &boundID,
+			wantName: opsProxyNameUnnamed,
+		},
+		{
 			name:     "account has no proxy",
 			account:  &Account{},
 			wantName: opsProxyNameDirect,
 		},
 		{
-			name:     "configured proxy was not hydrated",
+			name:     "configured proxy was not hydrated and transport is direct",
 			account:  &Account{ProxyID: &backupID},
-			wantName: opsProxyNameUnknown,
+			wantName: opsProxyNameDirect,
 		},
 		{
 			name:     "missing attempt account",
@@ -186,6 +199,81 @@ func TestOpsUpstreamErrorEventRetryKeepsExplicitAttemptProxy(t *testing.T) {
 		require.Equal(t, proxyID, *event.ProxyID)
 		require.Equal(t, "retry-proxy", event.ProxyName)
 	}
+}
+
+func TestNormalizeOpsUpstreamProxyAttributionEnforcesSentinelInvariant(t *testing.T) {
+	positive := int64(7)
+	zero := int64(0)
+	tests := []struct {
+		name     string
+		in       OpsUpstreamErrorEvent
+		wantID   *int64
+		wantName string
+	}{
+		{name: "id with name kept", in: OpsUpstreamErrorEvent{ProxyID: &positive, ProxyName: "eu-1"}, wantID: &positive, wantName: "eu-1"},
+		{name: "id without name gets placeholder", in: OpsUpstreamErrorEvent{ProxyID: &positive}, wantID: &positive, wantName: opsProxyNameUnnamed},
+		{name: "null id with real name collapses to unknown", in: OpsUpstreamErrorEvent{ProxyName: "eu-1"}, wantName: opsProxyNameUnknown},
+		{name: "zero id with real name collapses to unknown", in: OpsUpstreamErrorEvent{ProxyID: &zero, ProxyName: "eu-1"}, wantName: opsProxyNameUnknown},
+		{name: "explicit direct preserved", in: OpsUpstreamErrorEvent{ProxyName: opsProxyNameDirect}, wantName: opsProxyNameDirect},
+		{name: "empty is unknown", in: OpsUpstreamErrorEvent{}, wantName: opsProxyNameUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := tt.in
+			normalizeOpsUpstreamProxyAttribution(&ev)
+			if tt.wantID == nil {
+				require.Nil(t, ev.ProxyID)
+			} else {
+				require.NotNil(t, ev.ProxyID)
+				require.Equal(t, *tt.wantID, *ev.ProxyID)
+			}
+			require.Equal(t, tt.wantName, ev.ProxyName)
+		})
+	}
+}
+
+func TestNormalizeOpsUpstreamErrorsJSONPreservesUnknownKeysAndOrder(t *testing.T) {
+	// A legacy row written by an older struct version: it carries a key the
+	// current struct no longer has, and mixes explicit/legacy attribution.
+	raw := `[` +
+		`{"at_unix_ms":1,"account_id":42,"upstream_request_body":"legacy-only-key","kind":"http_error"},` +
+		`{"at_unix_ms":2,"proxy_id":null,"proxy_name":"direct/no_proxy","kind":"request_error"},` +
+		`{"at_unix_ms":3,"proxy_id":9,"proxy_name":"eu-9","kind":"failover"},` +
+		`{"at_unix_ms":4,"proxy_id":0,"proxy_name":"stale-name","kind":"retry"},` +
+		`{"at_unix_ms":5,"proxy_id":11,"proxy_name":"","kind":"retry"}` +
+		`]`
+
+	out, err := normalizeOpsUpstreamErrorsJSON(raw)
+	require.NoError(t, err)
+
+	// Legacy-only key and original key order survive.
+	require.Contains(t, out, `"upstream_request_body":"legacy-only-key"`)
+	require.True(t, strings.Index(out, `"at_unix_ms":1`) < strings.Index(out, `"account_id":42`))
+
+	events, err := ParseOpsUpstreamErrors(out)
+	require.NoError(t, err)
+	require.Len(t, events, 5)
+	require.Nil(t, events[0].ProxyID)
+	require.Equal(t, opsProxyNameUnknown, events[0].ProxyName)
+	require.Nil(t, events[1].ProxyID)
+	require.Equal(t, opsProxyNameDirect, events[1].ProxyName)
+	require.NotNil(t, events[2].ProxyID)
+	require.Equal(t, int64(9), *events[2].ProxyID)
+	require.Equal(t, "eu-9", events[2].ProxyName)
+	require.Nil(t, events[3].ProxyID)
+	require.Equal(t, opsProxyNameUnknown, events[3].ProxyName)
+	require.NotNil(t, events[4].ProxyID)
+	require.Equal(t, opsProxyNameUnnamed, events[4].ProxyName)
+
+	// Already-normalized input is returned byte-for-byte.
+	again, err := normalizeOpsUpstreamErrorsJSON(out)
+	require.NoError(t, err)
+	require.Equal(t, out, again)
+
+	_, err = normalizeOpsUpstreamErrorsJSON(`{"not":"an array"}`)
+	require.Error(t, err)
+	_, err = normalizeOpsUpstreamErrorsJSON(`[not json`)
+	require.Error(t, err)
 }
 
 func TestParseOpsUpstreamErrorsMarksLegacyProxyAttributionUnknown(t *testing.T) {

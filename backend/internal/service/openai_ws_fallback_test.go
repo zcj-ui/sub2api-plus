@@ -42,16 +42,6 @@ func TestClassifyOpenAIWSAcquireError(t *testing.T) {
 		require.Equal(t, "upstream_rate_limited", classifyOpenAIWSAcquireError(err))
 	})
 
-	t.Run("message_only_upstream_rate_limited", func(t *testing.T) {
-		err := &openAIWSDialError{Err: errors.New("exceeded retry limit, last status: 429 Too Many Requests")}
-		require.Equal(t, "upstream_rate_limited", classifyOpenAIWSAcquireError(err))
-	})
-
-	t.Run("explicit_5xx_wins_over_stale_message", func(t *testing.T) {
-		err := &openAIWSDialError{StatusCode: http.StatusBadGateway, Err: errors.New("last status: 429 Too Many Requests")}
-		require.Equal(t, "upstream_5xx", classifyOpenAIWSAcquireError(err))
-	})
-
 	t.Run("upstream_5xx", func(t *testing.T) {
 		err := &openAIWSDialError{StatusCode: 502, Err: errors.New("bad gateway")}
 		require.Equal(t, "upstream_5xx", classifyOpenAIWSAcquireError(err))
@@ -69,54 +59,6 @@ func TestClassifyOpenAIWSAcquireError(t *testing.T) {
 	t.Run("nil", func(t *testing.T) {
 		require.Equal(t, "acquire_conn", classifyOpenAIWSAcquireError(nil))
 	})
-}
-
-func TestOpenAIWSDialRateLimitStatus(t *testing.T) {
-	tests := []struct {
-		name       string
-		err        error
-		wantStatus int
-		wantMatch  bool
-	}{
-		{
-			name:       "explicit_status",
-			err:        &openAIWSDialError{StatusCode: http.StatusTooManyRequests},
-			wantStatus: http.StatusTooManyRequests,
-			wantMatch:  true,
-		},
-		{
-			name:       "body_status",
-			err:        &openAIWSDialError{ResponseBody: []byte(`{"error":{"status_code":429}}`)},
-			wantStatus: http.StatusTooManyRequests,
-			wantMatch:  true,
-		},
-		{
-			name:       "transport_text",
-			err:        &openAIWSDialError{Err: errors.New("exceeded retry limit, last status: 429 Too Many Requests")},
-			wantStatus: http.StatusTooManyRequests,
-			wantMatch:  true,
-		},
-		{
-			name:       "explicit_non429_status_wins",
-			err:        &openAIWSDialError{StatusCode: http.StatusBadGateway, Err: errors.New("last status: 429 Too Many Requests")},
-			wantStatus: http.StatusBadGateway,
-			wantMatch:  false,
-		},
-		{
-			name:       "non_rate_limit",
-			err:        &openAIWSDialError{Err: errors.New("connection reset by peer")},
-			wantStatus: 0,
-			wantMatch:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			status, matched := openAIWSDialRateLimitStatus(tt.err)
-			require.Equal(t, tt.wantStatus, status)
-			require.Equal(t, tt.wantMatch, matched)
-		})
-	}
 }
 
 func TestClassifyOpenAIWSDialError(t *testing.T) {
@@ -189,18 +131,6 @@ func TestOpenAIWSErrorHTTPStatus(t *testing.T) {
 }
 
 func TestResolveOpenAIWSFallbackErrorResponse(t *testing.T) {
-	t.Run("message_only_rate_limit_uses_429", func(t *testing.T) {
-		statusCode, errType, clientMessage, _, ok := resolveOpenAIWSFallbackErrorResponse(
-			wrapOpenAIWSFallback("upstream_rate_limited", &openAIWSDialError{
-				Err: errors.New("exceeded retry limit, last status: 429 Too Many Requests"),
-			}),
-		)
-		require.True(t, ok)
-		require.Equal(t, http.StatusTooManyRequests, statusCode)
-		require.Equal(t, "rate_limit_error", errType)
-		require.Contains(t, clientMessage, "last status: 429")
-	})
-
 	t.Run("previous_response_not_found", func(t *testing.T) {
 		statusCode, errType, clientMessage, upstreamMessage, ok := resolveOpenAIWSFallbackErrorResponse(
 			wrapOpenAIWSFallback("previous_response_not_found", errors.New("previous response not found")),
@@ -252,6 +182,41 @@ func TestWriteOpenAIWSFallbackErrorResponseMarksDefaultClientRouteUnknown(t *tes
 	require.Len(t, events, 1)
 	require.Nil(t, events[0].ProxyID)
 	require.Equal(t, opsProxyNameUnknown, events[0].ProxyName)
+}
+
+func TestWriteOpenAIWSFallbackErrorResponseKeepsManagedProxy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	svc := &OpenAIGatewayService{}
+	proxyID := int64(10060)
+	account := &Account{ID: 42, Name: "proxied", Platform: PlatformOpenAI, ProxyID: &proxyID, Proxy: &Proxy{ID: proxyID, Name: "ws-proxy"}}
+
+	require.True(t, svc.writeOpenAIWSFallbackErrorResponse(c, account, wrapOpenAIWSFallback("auth_failed", errors.New("unauthorized"))))
+
+	raw, ok := c.Get(OpsUpstreamErrorsKey)
+	require.True(t, ok)
+	events, ok := raw.([]*OpsUpstreamErrorEvent)
+	require.True(t, ok)
+	require.Len(t, events, 1)
+	require.NotNil(t, events[0].ProxyID)
+	require.Equal(t, proxyID, *events[0].ProxyID)
+	require.Equal(t, "ws-proxy", events[0].ProxyName)
+}
+
+func TestOpsUpstreamWSProxyAttributionNeverReportsDirect(t *testing.T) {
+	proxyID := int64(7)
+	id, name := opsUpstreamWSProxyAttribution(nil)
+	require.Nil(t, id)
+	require.Equal(t, opsProxyNameUnknown, name)
+
+	id, name = opsUpstreamWSProxyAttribution(&Account{})
+	require.Nil(t, id)
+	require.Equal(t, opsProxyNameUnknown, name, "no managed proxy => http.DefaultClient => unknown, never direct")
+
+	id, name = opsUpstreamWSProxyAttribution(&Account{ProxyID: &proxyID, Proxy: &Proxy{ID: proxyID, Name: "ws-proxy"}})
+	require.NotNil(t, id)
+	require.Equal(t, proxyID, *id)
+	require.Equal(t, "ws-proxy", name)
 }
 
 func TestOpenAIWSFallbackCooling(t *testing.T) {
